@@ -21,6 +21,7 @@ const LOCAL_OS = detectOs();
 let ws = null;
 let pingTimer = null;
 let reconnectTimer = null;
+let reconnectDelay = 3000;
 let wsStatus = 'disconnected';
 let cachedDevices = [];
 const notifUrls = new Map();
@@ -293,9 +294,26 @@ function stopSocket() {
   }
 }
 
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+  const delay = reconnectDelay;
+  reconnectDelay = Math.min(reconnectDelay * 2, 60000);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, delay);
+}
+
 async function connect() {
   const { serverUrl, keyB64, deviceId, deviceName, deviceOs } = await getConfig();
   if (!serverUrl || !keyB64) {
+    stopSocket();
+    setStatus('disconnected');
+    return;
+  }
+
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) {
     stopSocket();
     setStatus('disconnected');
     return;
@@ -317,6 +335,7 @@ async function connect() {
     ws = new WebSocket(wsUrl);
 
     ws.onopen = async () => {
+      reconnectDelay = 3000;
       setStatus('connected');
       await registerDeviceRecord(deviceId, deviceName, deviceOs);
       await refreshDevices();
@@ -384,7 +403,7 @@ async function connect() {
       }
       ws = null;
       setStatus('disconnected');
-      reconnectTimer = setTimeout(connect, 3000);
+      scheduleReconnect();
     };
 
     ws.onerror = () => {
@@ -392,7 +411,7 @@ async function connect() {
     };
   } catch {
     setStatus('disconnected');
-    reconnectTimer = setTimeout(connect, 5000);
+    scheduleReconnect();
   }
 }
 
@@ -715,6 +734,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: false, error: err instanceof Error ? err.message : String(err) });
   });
   return true;
+});
+
+self.addEventListener('online', () => {
+  reconnectDelay = 3000;
+  connect();
+});
+
+self.addEventListener('offline', () => {
+  stopSocket();
+  setStatus('disconnected');
 });
 
 connect();
