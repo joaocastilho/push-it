@@ -1,3 +1,4 @@
+import type { PayloadType } from './crypto';
 import type { DeviceOs } from './device';
 
 export interface StoredMessage {
@@ -7,14 +8,27 @@ export interface StoredMessage {
   senderOs?: DeviceOs;
   targetNames?: string[];
   ts: number;
-  type: 'link' | 'text';
+  type: PayloadType;
   content: string;
   title?: string;
   direction: 'in' | 'out';
+  status?: 'queued' | 'delivered';
+  blobId?: string;
+  blobIv?: string;
+  fileName?: string;
+  mimeType?: string;
+  fileSize?: number;
+}
+
+export interface StoredBlob {
+  id: string;
+  data: ArrayBuffer;
+  mimeType: string;
+  fileName: string;
 }
 
 const DB_NAME = 'push-it-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -26,6 +40,9 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains('messages')) {
         db.createObjectStore('messages', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('blobs')) {
+        db.createObjectStore('blobs', { keyPath: 'id' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -63,6 +80,26 @@ export async function saveMessage(msg: StoredMessage): Promise<void> {
   });
 }
 
+export async function markMessagesDelivered(ids: string[]): Promise<void> {
+  if (!ids.length) return;
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('messages', 'readwrite');
+    const store = tx.objectStore('messages');
+    for (const id of ids) {
+      const req = store.get(id);
+      req.onsuccess = () => {
+        const msg = req.result as StoredMessage | undefined;
+        if (msg && msg.status !== 'delivered') {
+          store.put({ ...msg, status: 'delivered' });
+        }
+      };
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function listMessages(limit = 60): Promise<StoredMessage[]> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
@@ -70,7 +107,6 @@ export async function listMessages(limit = 60): Promise<StoredMessage[]> {
     const req = tx.objectStore('messages').getAll();
     req.onsuccess = () => {
       const all = (req.result as StoredMessage[]) || [];
-      // Chronological chat order: oldest -> newest
       all.sort((a, b) => a.ts - b.ts);
       resolve(all.slice(-limit));
     };
@@ -78,11 +114,32 @@ export async function listMessages(limit = 60): Promise<StoredMessage[]> {
   });
 }
 
+export async function saveBlob(blob: StoredBlob): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('blobs', 'readwrite');
+    tx.objectStore('blobs').put(blob);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getBlob(id: string): Promise<StoredBlob | undefined> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('blobs', 'readonly');
+    const req = tx.objectStore('blobs').get(id);
+    req.onsuccess = () => resolve(req.result as StoredBlob | undefined);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 export async function clearMessages(): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction('messages', 'readwrite');
+    const tx = db.transaction(['messages', 'blobs'], 'readwrite');
     tx.objectStore('messages').clear();
+    tx.objectStore('blobs').clear();
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

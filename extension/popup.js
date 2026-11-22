@@ -1,4 +1,11 @@
-import { defaultDeviceName, isSafeHttpUrl, isValidKeyB64 } from './crypto.js';
+import {
+  decryptBytes,
+  defaultDeviceName,
+  deriveRoomId,
+  formatFileSize,
+  isSafeHttpUrl,
+  isValidKeyB64,
+} from './crypto.js';
 
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
@@ -16,6 +23,8 @@ const savePairBtn = document.getElementById('savePair');
 const autoOpenEl = document.getElementById('autoOpen');
 const targetBar = document.getElementById('targetBar');
 const sendTabBtn = document.getElementById('sendTab');
+const fileInput = document.getElementById('fileInput');
+const attachBtn = document.getElementById('attachBtn');
 const draftEl = document.getElementById('draft');
 const sendDraftBtn = document.getElementById('sendDraft');
 const clearBtn = document.getElementById('clearBtn');
@@ -24,6 +33,8 @@ const historyList = document.getElementById('historyList');
 let myDeviceId = '';
 let currentDeviceOs = 'windows';
 let currentDeviceName = 'Windows';
+let currentServerUrl = '';
+let currentKeyB64 = '';
 let pairedDevices = [];
 let selectedTargetIds = [];
 let showingSettings = false;
@@ -202,11 +213,39 @@ function renderDeviceList() {
   }
 }
 
+async function downloadFileItem(item) {
+  if (!item.blobId || !item.blobIv || !currentServerUrl || !currentKeyB64) return;
+  try {
+    const roomId = await deriveRoomId(currentKeyB64);
+    const base = new URL(currentServerUrl);
+    const res = await fetch(
+      `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(item.blobId)}?deviceId=${encodeURIComponent(myDeviceId)}`,
+    );
+    if (!res.ok) {
+      showToast('File already expired or downloaded');
+      return;
+    }
+    const cipher = new Uint8Array(await res.arrayBuffer());
+    const plain = await decryptBytes(currentKeyB64, item.blobIv, cipher);
+    const blob = new Blob([plain], { type: item.mimeType || 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = item.fileName || 'file';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch {
+    showToast('Could not download file');
+  }
+}
+
 async function refresh() {
   const state = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
   myDeviceId = state.deviceId || '';
   currentDeviceOs = state.deviceOs || 'windows';
   currentDeviceName = state.deviceName || defaultDeviceName(currentDeviceOs);
+  currentServerUrl = state.serverUrl || '';
+  currentKeyB64 = state.keyB64 || '';
   pairedDevices = Array.isArray(state.devices) ? state.devices : [];
   renderDevicePill();
   renderDeviceList();
@@ -265,23 +304,44 @@ function renderHistory(items) {
     sender.appendChild(nameSpan);
     head.appendChild(sender);
 
+    const metaRight = document.createElement('span');
+    metaRight.className = 'meta-right';
     const time = document.createElement('time');
     time.textContent = new Date(item.ts).toLocaleTimeString([], {
       hour: '2-digit',
       minute: '2-digit',
     });
-    head.appendChild(time);
+    metaRight.appendChild(time);
+
+    if (item.direction === 'out') {
+      const check = document.createElement('span');
+      check.className = `check ${item.status === 'delivered' ? 'delivered' : ''}`;
+      check.textContent = item.status === 'delivered' ? '✓✓' : '✓';
+      check.title = item.status === 'delivered' ? 'Delivered' : 'Queued';
+      metaRight.appendChild(check);
+    }
+
+    head.appendChild(metaRight);
     bubble.appendChild(head);
 
     const text = document.createElement('div');
     text.className = 'bubble-text';
-    text.textContent = item.content;
+    text.textContent =
+      item.type === 'file'
+        ? `${item.fileName || item.content}${item.fileSize ? ` (${formatFileSize(item.fileSize)})` : ''}`
+        : item.content;
     bubble.appendChild(text);
 
     const actions = document.createElement('div');
     actions.className = 'bubble-actions';
 
-    if (item.type === 'link' && isSafeHttpUrl(item.content)) {
+    if (item.type === 'file') {
+      const dlBtn = document.createElement('button');
+      dlBtn.className = 'chip primary';
+      dlBtn.textContent = 'Download';
+      dlBtn.onclick = () => downloadFileItem(item);
+      actions.appendChild(dlBtn);
+    } else if (item.type === 'link' && isSafeHttpUrl(item.content)) {
       const openBtn = document.createElement('button');
       openBtn.className = 'chip primary';
       openBtn.textContent = 'Open';
@@ -289,14 +349,16 @@ function renderHistory(items) {
       actions.appendChild(openBtn);
     }
 
-    const copyBtn = document.createElement('button');
-    copyBtn.className = 'chip';
-    copyBtn.textContent = 'Copy';
-    copyBtn.onclick = async () => {
-      await navigator.clipboard.writeText(item.content);
-      showToast('Copied');
-    };
-    actions.appendChild(copyBtn);
+    if (item.type !== 'file') {
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'chip';
+      copyBtn.textContent = 'Copy';
+      copyBtn.onclick = async () => {
+        await navigator.clipboard.writeText(item.content);
+        showToast('Copied');
+      };
+      actions.appendChild(copyBtn);
+    }
 
     bubble.appendChild(actions);
     row.appendChild(bubble);
@@ -357,6 +419,33 @@ function getSelectedTargetsPayload() {
   return { targetIds: selectedTargetIds, targetNames: names };
 }
 
+attachBtn.addEventListener('click', () => fileInput.click());
+
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files?.[0];
+  fileInput.value = '';
+  if (!file) return;
+  if (file.size > 7.5 * 1024 * 1024) {
+    showToast('File is too large (max 7.5 MB)');
+    return;
+  }
+  showToast('Pushing file...');
+  const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+  const res = await chrome.runtime.sendMessage({
+    type: 'SEND_FILE',
+    bytes,
+    fileName: file.name || 'file',
+    mimeType: file.type || 'application/octet-stream',
+    ...getSelectedTargetsPayload(),
+  });
+  if (!res.ok) {
+    showToast('Could not send file');
+    return;
+  }
+  showToast('Pushed!');
+  refresh();
+});
+
 sendTabBtn.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.url || !isSafeHttpUrl(tab.url)) {
@@ -408,6 +497,5 @@ clearBtn.addEventListener('click', async () => {
   refresh();
 });
 
-// Opening the popup clears unread badge counter
 chrome.runtime.sendMessage({ type: 'MARK_READ' }).catch(() => {});
 refresh();

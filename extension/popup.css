@@ -393,6 +393,22 @@ input[type='text'] {
   color: #fff;
 }
 
+.meta-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.check {
+  font-size: 0.68rem;
+  color: var(--muted);
+  letter-spacing: -1px;
+}
+
+.check.delivered {
+  color: var(--cyan);
+}
+
 .composer {
   display: flex;
   flex-direction: column;

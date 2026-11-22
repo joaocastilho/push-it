@@ -1,7 +1,7 @@
 // Push It Service Worker — E2EE Web Push decrypt + silent Android Share Target handler
 
 const DB_NAME = 'push-it-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 self.addEventListener('install', () => {
   self.skipWaiting();
@@ -21,6 +21,9 @@ function openDb() {
       }
       if (!db.objectStoreNames.contains('messages')) {
         db.createObjectStore('messages', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('blobs')) {
+        db.createObjectStore('blobs', { keyPath: 'id' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -267,6 +270,11 @@ async function handlePush(event) {
     return;
   }
 
+  const pType =
+    payload.type === 'link' || payload.type === 'file' || payload.type === 'longtext'
+      ? payload.type
+      : 'text';
+
   const item = {
     id: envelope.id,
     senderId: envelope.senderId,
@@ -276,9 +284,14 @@ async function handlePush(event) {
       ? payload.targetNames.map((n) => String(n))
       : undefined,
     ts: envelope.ts || Date.now(),
-    type: payload.type === 'link' ? 'link' : 'text',
+    type: pType,
     content: String(payload.content || ''),
     title: payload.title ? String(payload.title) : undefined,
+    blobId: payload.blobId ? String(payload.blobId) : undefined,
+    blobIv: payload.blobIv ? String(payload.blobIv) : undefined,
+    fileName: payload.fileName ? String(payload.fileName) : undefined,
+    mimeType: payload.mimeType ? String(payload.mimeType) : undefined,
+    fileSize: typeof payload.fileSize === 'number' ? payload.fileSize : undefined,
     direction: 'in',
   };
 
@@ -286,6 +299,20 @@ async function handlePush(event) {
   const prevLastSeen = (await kvGet('lastSeenTs')) || 0;
   if (item.ts > prevLastSeen) {
     await kvSet('lastSeenTs', item.ts);
+  }
+
+  // Send delivery receipt back so sender sees ✓✓
+  const myDeviceId = await kvGet('deviceId');
+  if (myDeviceId) {
+    deriveRoomId(keyB64)
+      .then((rid) =>
+        fetch(`/api/room/${encodeURIComponent(rid)}/ack`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ deviceId: myDeviceId, messageId: item.id }),
+        }),
+      )
+      .catch(() => {});
   }
 
   const windowClients = await self.clients.matchAll({
@@ -307,13 +334,21 @@ async function handlePush(event) {
   }
 
   const isLink = item.type === 'link' && isSafeHttpUrl(item.content);
+  const isPhoto = item.type === 'file' && item.mimeType && item.mimeType.startsWith('image/');
   const fromPrefix = item.senderName ? `${item.senderName} · ` : '';
   const notifTitle = isLink
     ? `${fromPrefix}${item.title || 'New Link — Tap to Open'}`
-    : `${fromPrefix}${item.title || 'New Message'}`;
+    : item.type === 'file'
+      ? `${fromPrefix}${isPhoto ? 'New Photo' : 'New File'}`
+      : `${fromPrefix}${item.title || 'New Message'}`;
+
+  const notifBody =
+    item.type === 'file'
+      ? item.fileName || 'Open Push It to view'
+      : item.content.slice(0, 180);
 
   await self.registration.showNotification(notifTitle, {
-    body: item.content.slice(0, 180),
+    body: notifBody,
     icon: '/icon.svg',
     badge: '/icon.svg',
     tag: item.id,

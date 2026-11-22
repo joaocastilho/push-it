@@ -53,6 +53,8 @@ const VAPID_STORAGE_KEY = 'vapid:keys';
 const MAX_TTL_SECONDS = 2419200; // 28 days (Web Push / FCM max)
 const MESSAGE_TTL_MS = MAX_TTL_SECONDS * 1000;
 const MAX_PENDING_MESSAGES = 200;
+const MAX_BLOB_BYTES = 8 * 1024 * 1024; // 8 MB encrypted blob limit
+const BLOB_CHUNK_SIZE = 512 * 1024; // 512 KB per SQLite row
 export const VAPID_DO_NAME = '__vapid__';
 
 function toBase64Url(bytes: Uint8Array): string {
@@ -82,6 +84,22 @@ async function generateVapidKeys(subject: string): Promise<StoredVapidKeys> {
 
 export class RoomDO extends DurableObject<Env> {
   private cachedVapid: StoredVapidKeys | null = null;
+  private sqlReady = false;
+
+  private ensureBlobTable(): void {
+    if (this.sqlReady) return;
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS blobs (
+        id TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        data BLOB NOT NULL,
+        ts INTEGER NOT NULL,
+        remaining TEXT NOT NULL,
+        PRIMARY KEY (id, chunk_index)
+      )
+    `);
+    this.sqlReady = true;
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -100,8 +118,23 @@ export class RoomDO extends DurableObject<Env> {
       return this.handleSend(request);
     }
 
+    if (path.endsWith('/ack') && request.method === 'POST') {
+      return this.handleAck(request);
+    }
+
     if (path.endsWith('/pending') && request.method === 'GET') {
       return this.handlePending(url);
+    }
+
+    const blobMatch = path.match(/\/blob\/([A-Za-z0-9_-]{8,64})$/);
+    if (blobMatch) {
+      const blobId = blobMatch[1];
+      if (request.method === 'PUT') {
+        return this.handleUploadBlob(request, url, blobId);
+      }
+      if (request.method === 'GET') {
+        return this.handleDownloadBlob(url, blobId);
+      }
     }
 
     if (path.endsWith('/devices') && request.method === 'GET') {
@@ -162,8 +195,8 @@ export class RoomDO extends DurableObject<Env> {
     return keys;
   }
 
-  private broadcastDevicesUpdated(): void {
-    const msg = JSON.stringify({ type: 'devices_updated' });
+  private broadcastJson(payload: unknown): void {
+    const msg = JSON.stringify(payload);
     for (const ws of this.ctx.getWebSockets()) {
       try {
         ws.send(msg);
@@ -183,7 +216,7 @@ export class RoomDO extends DurableObject<Env> {
     const [client, server] = Object.values(pair);
 
     this.ctx.acceptWebSocket(server, [deviceId]);
-    this.broadcastDevicesUpdated();
+    this.broadcastJson({ type: 'devices_updated' });
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -197,7 +230,112 @@ export class RoomDO extends DurableObject<Env> {
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     ws.close(code, reason);
-    this.broadcastDevicesUpdated();
+    this.broadcastJson({ type: 'devices_updated' });
+  }
+
+  private async handleUploadBlob(
+    request: Request,
+    url: URL,
+    blobId: string,
+  ): Promise<Response> {
+    this.ensureBlobTable();
+    const buf = await request.arrayBuffer();
+    if (buf.byteLength === 0 || buf.byteLength > MAX_BLOB_BYTES) {
+      return Response.json({ error: 'File must be between 1 byte and 8 MB' }, { status: 413 });
+    }
+
+    const senderId = url.searchParams.get('senderId') || '';
+    const targetParam = url.searchParams.get('targetIds') || '';
+    const targetIds = targetParam ? targetParam.split(',').filter(Boolean) : [];
+    const targetSet = targetIds.length > 0 ? new Set(targetIds) : null;
+
+    const allDevices = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
+    const remaining: string[] = [];
+    for (const dev of allDevices.values()) {
+      if (dev.deviceId === senderId) continue;
+      if (targetSet && !targetSet.has(dev.deviceId)) continue;
+      remaining.push(dev.deviceId);
+    }
+
+    const now = Date.now();
+    const bytes = new Uint8Array(buf);
+    const remainingJson = JSON.stringify(remaining);
+
+    // Prune expired blobs first
+    this.ctx.storage.sql.exec('DELETE FROM blobs WHERE ts < ?', now - MESSAGE_TTL_MS);
+    this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', blobId);
+
+    let chunkIndex = 0;
+    for (let offset = 0; offset < bytes.byteLength; offset += BLOB_CHUNK_SIZE) {
+      const slice = bytes.slice(offset, offset + BLOB_CHUNK_SIZE);
+      this.ctx.storage.sql.exec(
+        'INSERT INTO blobs (id, chunk_index, data, ts, remaining) VALUES (?, ?, ?, ?, ?)',
+        blobId,
+        chunkIndex,
+        slice,
+        now,
+        remainingJson,
+      );
+      chunkIndex++;
+    }
+
+    return Response.json({ ok: true, blobId, bytes: bytes.byteLength });
+  }
+
+  private handleDownloadBlob(url: URL, blobId: string): Response {
+    this.ensureBlobTable();
+    const deviceId = url.searchParams.get('deviceId') || '';
+
+    const rows = this.ctx.storage.sql
+      .exec('SELECT chunk_index, data, remaining FROM blobs WHERE id = ? ORDER BY chunk_index ASC', blobId)
+      .toArray();
+
+    if (rows.length === 0) {
+      return new Response('Not Found', { status: 404 });
+    }
+
+    let totalLen = 0;
+    const chunks: Uint8Array[] = [];
+    for (const row of rows) {
+      const raw = row.data as ArrayBuffer;
+      const u8 = new Uint8Array(raw);
+      chunks.push(u8);
+      totalLen += u8.byteLength;
+    }
+
+    const combined = new Uint8Array(totalLen);
+    let offset = 0;
+    for (const c of chunks) {
+      combined.set(c, offset);
+      offset += c.byteLength;
+    }
+
+    if (deviceId) {
+      try {
+        const remaining = JSON.parse(String(rows[0].remaining || '[]')) as string[];
+        if (remaining.includes(deviceId)) {
+          const next = remaining.filter((id) => id !== deviceId);
+          if (next.length === 0) {
+            this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', blobId);
+          } else {
+            this.ctx.storage.sql.exec(
+              'UPDATE blobs SET remaining = ? WHERE id = ?',
+              JSON.stringify(next),
+              blobId,
+            );
+          }
+        }
+      } catch {
+        // ignore malformed remaining list
+      }
+    }
+
+    return new Response(combined, {
+      headers: {
+        'content-type': 'application/octet-stream',
+        'cache-control': 'no-store',
+      },
+    });
   }
 
   private async handleListDevices(): Promise<Response> {
@@ -239,7 +377,7 @@ export class RoomDO extends DurableObject<Env> {
     };
 
     await this.ctx.storage.put(`${DEV_PREFIX}${body.deviceId}`, record);
-    this.broadcastDevicesUpdated();
+    this.broadcastJson({ type: 'devices_updated' });
     return Response.json({ ok: true });
   }
 
@@ -262,7 +400,7 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
-    this.broadcastDevicesUpdated();
+    this.broadcastJson({ type: 'devices_updated' });
     return Response.json({ ok: true });
   }
 
@@ -333,6 +471,37 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
+  private async handleAck(request: Request): Promise<Response> {
+    const body = (await request.json()) as { deviceId?: string; messageId?: string };
+    if (!body.deviceId || !body.messageId) {
+      return Response.json({ ok: false }, { status: 400 });
+    }
+
+    const stored = await this.ctx.storage.list<StoredMessage>({ prefix: MSG_PREFIX });
+    const deliveredIds: string[] = [];
+
+    for (const [key, entry] of stored) {
+      if (!('envelope' in entry) || entry.envelope.id !== body.messageId) continue;
+      if (entry.remaining.includes(body.deviceId)) {
+        const next = entry.remaining.filter((id) => id !== body.deviceId);
+        if (next.length === 0) {
+          await this.ctx.storage.delete(key);
+          deliveredIds.push(body.messageId);
+        } else {
+          await this.ctx.storage.put(key, { envelope: entry.envelope, remaining: next });
+        }
+      }
+      break;
+    }
+
+    // Even if it wasn't in the queue (e.g. direct push ack), notify sender sockets
+    if (deliveredIds.length === 0) {
+      deliveredIds.push(body.messageId);
+    }
+    this.broadcastJson({ type: 'delivered', ids: deliveredIds });
+    return Response.json({ ok: true });
+  }
+
   private async handlePending(url: URL): Promise<Response> {
     const deviceId = url.searchParams.get('deviceId') || '';
     const since = Number(url.searchParams.get('since') || '0');
@@ -343,6 +512,7 @@ export class RoomDO extends DurableObject<Env> {
     });
     const toDelete: string[] = [];
     const toUpdate: Array<[string, StoredMessage]> = [];
+    const fullyDeliveredIds: string[] = [];
     const messages: EncryptedEnvelope[] = [];
 
     for (const [key, entry] of stored) {
@@ -370,6 +540,7 @@ export class RoomDO extends DurableObject<Env> {
           const nextRemaining = remaining.filter((id) => id !== deviceId);
           if (nextRemaining.length === 0) {
             toDelete.push(key);
+            fullyDeliveredIds.push(env.id);
           } else {
             toUpdate.push([key, { envelope: env, remaining: nextRemaining }]);
           }
@@ -384,6 +555,10 @@ export class RoomDO extends DurableObject<Env> {
     }
     for (const [k, v] of toUpdate) {
       await this.ctx.storage.put(k, v);
+    }
+
+    if (fullyDeliveredIds.length > 0) {
+      this.broadcastJson({ type: 'delivered', ids: fullyDeliveredIds });
     }
 
     messages.sort((a, b) => a.ts - b.ts);
@@ -500,6 +675,7 @@ export class RoomDO extends DurableObject<Env> {
 
     return Response.json({
       ok: true,
+      delivered: remaining.length === 0 && wsDelivered > 0,
       wsDelivered,
       pushSent,
       pushFailed,

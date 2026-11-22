@@ -1,10 +1,12 @@
 import {
+  decryptBytes,
   decryptEnvelope,
   decryptJson,
   defaultDeviceName,
   deriveRoomId,
   detectOs,
   detectPayloadType,
+  encryptBytes,
   encryptJson,
   encryptPayload,
   isSafeHttpUrl,
@@ -13,6 +15,7 @@ import {
 
 const KEEPALIVE_ALARM = 'push-it-keepalive';
 const MAX_HISTORY = 40;
+const LONG_TEXT_THRESHOLD = 1800;
 const LOCAL_OS = detectOs();
 
 let ws = null;
@@ -86,6 +89,60 @@ async function appendHistory(item) {
   return true;
 }
 
+async function markDeliveredInHistory(ids) {
+  if (!ids?.length) return;
+  const set = new Set(ids);
+  const { history } = await getConfig();
+  let changed = false;
+  const next = history.map((m) => {
+    if (set.has(m.id) && m.status !== 'delivered') {
+      changed = true;
+      return { ...m, status: 'delivered' };
+    }
+    return m;
+  });
+  if (changed) {
+    await chrome.storage.local.set({ history: next });
+  }
+}
+
+async function setupContextMenus() {
+  const { deviceId } = await getConfig();
+  const others = cachedDevices.filter((d) => d.deviceId !== deviceId);
+
+  chrome.contextMenus.removeAll(() => {
+    const contexts = ['page', 'link', 'selection'];
+    if (others.length < 2) {
+      chrome.contextMenus.create({
+        id: 'push-it-all',
+        title: 'Push It',
+        contexts,
+      });
+      return;
+    }
+
+    chrome.contextMenus.create({
+      id: 'push-it-root',
+      title: 'Push It',
+      contexts,
+    });
+    chrome.contextMenus.create({
+      id: 'push-it-all',
+      parentId: 'push-it-root',
+      title: 'All Devices',
+      contexts,
+    });
+    for (const dev of others) {
+      chrome.contextMenus.create({
+        id: `push-it-dev:${dev.deviceId}`,
+        parentId: 'push-it-root',
+        title: dev.name,
+        contexts,
+      });
+    }
+  });
+}
+
 async function registerDeviceRecord(devId, name, os) {
   const { serverUrl, keyB64 } = await getConfig();
   if (!serverUrl || !keyB64 || !devId) return;
@@ -103,6 +160,7 @@ async function refreshDevices() {
   const { serverUrl, keyB64, deviceId, deviceName } = await getConfig();
   if (!serverUrl || !keyB64) {
     cachedDevices = [];
+    setupContextMenus();
     return [];
   }
   try {
@@ -132,9 +190,31 @@ async function refreshDevices() {
       }
     }
     cachedDevices = list;
+    setupContextMenus();
     return list;
   } catch {
     return cachedDevices;
+  }
+}
+
+async function hydrateLongTextIfNeeded(item, cfg) {
+  if (item.type !== 'longtext' || !item.blobId || !item.blobIv) return item;
+  try {
+    const roomId = await deriveRoomId(cfg.keyB64);
+    const base = new URL(cfg.serverUrl);
+    const res = await fetch(
+      `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(item.blobId)}?deviceId=${encodeURIComponent(cfg.deviceId)}`,
+    );
+    if (!res.ok) return item;
+    const cipher = new Uint8Array(await res.arrayBuffer());
+    const plain = await decryptBytes(cfg.keyB64, item.blobIv, cipher);
+    return {
+      ...item,
+      type: 'text',
+      content: new TextDecoder().decode(plain),
+    };
+  } catch {
+    return item;
   }
 }
 
@@ -155,7 +235,7 @@ async function syncPending() {
     for (const env of data.messages) {
       try {
         const decrypted = await decryptEnvelope(cfg.keyB64, env);
-        const item = {
+        let item = {
           id: env.id,
           senderId: env.senderId,
           senderName: decrypted.senderName,
@@ -165,9 +245,15 @@ async function syncPending() {
           type: decrypted.type,
           content: decrypted.content,
           title: decrypted.title,
+          blobId: decrypted.blobId,
+          blobIv: decrypted.blobIv,
+          fileName: decrypted.fileName,
+          mimeType: decrypted.mimeType,
+          fileSize: decrypted.fileSize,
           direction: 'in',
         };
         if (item.ts > maxTs) maxTs = item.ts;
+        item = await hydrateLongTextIfNeeded(item, cfg);
         const added = await appendHistory(item);
         if (added) {
           await handleIncoming(item, cfg.autoOpen);
@@ -250,13 +336,17 @@ async function connect() {
           await refreshDevices();
           return;
         }
+        if (parsed.type === 'delivered' && Array.isArray(parsed.ids)) {
+          await markDeliveredInHistory(parsed.ids);
+          return;
+        }
         if (parsed.type !== 'message' || !parsed.envelope) return;
 
         const cfg = await getConfig();
         if (!cfg.keyB64 || parsed.envelope.senderId === cfg.deviceId) return;
 
         const decrypted = await decryptEnvelope(cfg.keyB64, parsed.envelope);
-        const item = {
+        let item = {
           id: parsed.envelope.id,
           senderId: parsed.envelope.senderId,
           senderName: decrypted.senderName,
@@ -266,9 +356,15 @@ async function connect() {
           type: decrypted.type,
           content: decrypted.content,
           title: decrypted.title,
+          blobId: decrypted.blobId,
+          blobIv: decrypted.blobIv,
+          fileName: decrypted.fileName,
+          mimeType: decrypted.mimeType,
+          fileSize: decrypted.fileSize,
           direction: 'in',
         };
 
+        item = await hydrateLongTextIfNeeded(item, cfg);
         const added = await appendHistory(item);
         if (item.ts > cfg.lastSeenTs) {
           await chrome.storage.local.set({ lastSeenTs: item.ts });
@@ -308,7 +404,6 @@ async function handleIncoming(item, autoOpen) {
     return;
   }
 
-  // Increment unread counter for red badge on toolbar icon
   const { unreadCount } = await getConfig();
   await chrome.storage.local.set({ unreadCount: unreadCount + 1 });
   await updateBadge();
@@ -319,74 +414,165 @@ async function handleIncoming(item, autoOpen) {
   }
 
   const fromPrefix = item.senderName ? `${item.senderName} · ` : '';
+  const isPhoto = item.type === 'file' && item.mimeType?.startsWith('image/');
   chrome.notifications.create(notifId, {
     type: 'basic',
     iconUrl: 'icon128.png',
     title: isLink
       ? `${fromPrefix}${item.title || 'New Link — Click to Open'}`
-      : `${fromPrefix}${item.title || 'New Message'}`,
-    message: item.content.slice(0, 200),
+      : item.type === 'file'
+        ? `${fromPrefix}${isPhoto ? 'New Photo' : 'New File'}`
+        : `${fromPrefix}${item.title || 'New Message'}`,
+    message: item.type === 'file' ? item.fileName || 'Open Push It to download' : item.content.slice(0, 200),
     priority: 2,
   });
 }
 
+async function uploadEncryptedBlob(cfg, roomId, plainBytes, targetIds) {
+  const blobId = crypto.randomUUID().replace(/-/g, '');
+  const { iv: blobIv, ciphertext } = await encryptBytes(cfg.keyB64, plainBytes);
+  const base = new URL(cfg.serverUrl);
+  const params = new URLSearchParams({ senderId: cfg.deviceId });
+  if (targetIds && targetIds.length > 0) params.set('targetIds', targetIds.join(','));
+
+  const res = await fetch(
+    `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(blobId)}?${params.toString()}`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: ciphertext,
+    },
+  );
+  if (!res.ok) throw new Error('File too large (max 8 MB)');
+  return { blobId, blobIv };
+}
+
 async function sendContent(rawContent, title, targetIds, targetNames) {
   const content = String(rawContent || '').trim();
-  const { serverUrl, keyB64, deviceId, deviceName, deviceOs } = await getConfig();
+  const cfg = await getConfig();
   if (!content) throw new Error('Nothing to send');
-  if (!serverUrl || !keyB64) throw new Error('Pair this device first');
+  if (!cfg.serverUrl || !cfg.keyB64) throw new Error('Pair this device first');
 
-  const roomId = await deriveRoomId(keyB64);
-  const type = detectPayloadType(content);
-  const envelope = await encryptPayload(
-    keyB64,
-    deviceId,
-    {
-      type,
-      content,
-      title,
-      senderName: deviceName,
-      senderOs: deviceOs,
-      targetNames: targetNames && targetNames.length > 0 ? targetNames : undefined,
-    },
-    targetIds && targetIds.length > 0 ? targetIds : undefined,
-  );
+  const roomId = await deriveRoomId(cfg.keyB64);
+  const isLong = content.length > LONG_TEXT_THRESHOLD;
+  let envelope;
 
-  const base = new URL(serverUrl);
+  if (isLong) {
+    const plain = new TextEncoder().encode(content);
+    const { blobId, blobIv } = await uploadEncryptedBlob(cfg, roomId, plain, targetIds);
+    envelope = await encryptPayload(
+      cfg.keyB64,
+      cfg.deviceId,
+      {
+        type: 'longtext',
+        content: content.slice(0, 140) + '…',
+        title,
+        senderName: cfg.deviceName,
+        senderOs: cfg.deviceOs,
+        targetNames: targetNames?.length ? targetNames : undefined,
+        blobId,
+        blobIv,
+        fileSize: plain.byteLength,
+      },
+      targetIds?.length ? targetIds : undefined,
+    );
+  } else {
+    const type = detectPayloadType(content);
+    envelope = await encryptPayload(
+      cfg.keyB64,
+      cfg.deviceId,
+      {
+        type,
+        content,
+        title,
+        senderName: cfg.deviceName,
+        senderOs: cfg.deviceOs,
+        targetNames: targetNames?.length ? targetNames : undefined,
+      },
+      targetIds?.length ? targetIds : undefined,
+    );
+  }
+
+  const base = new URL(cfg.serverUrl);
   const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/send`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(envelope),
   });
 
-  if (!res.ok) {
-    throw new Error('Could not send right now');
-  }
+  if (!res.ok) throw new Error('Could not send right now');
 
   const result = await res.json();
   await appendHistory({
     id: envelope.id,
-    senderId: deviceId,
-    senderName: deviceName,
-    senderOs: deviceOs,
-    targetNames: targetNames && targetNames.length > 0 ? targetNames : undefined,
+    senderId: cfg.deviceId,
+    senderName: cfg.deviceName,
+    senderOs: cfg.deviceOs,
+    targetNames: targetNames?.length ? targetNames : undefined,
     ts: envelope.ts,
-    type,
+    type: isLong ? 'text' : detectPayloadType(content),
     content,
     title,
     direction: 'out',
+    status: result.delivered ? 'delivered' : 'queued',
   });
   return result;
 }
 
-function setupContextMenus() {
-  chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
-      id: 'push-it-send',
-      title: 'Push It',
-      contexts: ['page', 'link', 'selection'],
-    });
+async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNames) {
+  const cfg = await getConfig();
+  if (!cfg.serverUrl || !cfg.keyB64) throw new Error('Pair this device first');
+
+  const plainBytes = new Uint8Array(bytesArray);
+  const roomId = await deriveRoomId(cfg.keyB64);
+  const { blobId, blobIv } = await uploadEncryptedBlob(cfg, roomId, plainBytes, targetIds);
+
+  const envelope = await encryptPayload(
+    cfg.keyB64,
+    cfg.deviceId,
+    {
+      type: 'file',
+      content: fileName,
+      senderName: cfg.deviceName,
+      senderOs: cfg.deviceOs,
+      targetNames: targetNames?.length ? targetNames : undefined,
+      blobId,
+      blobIv,
+      fileName,
+      mimeType,
+      fileSize: plainBytes.byteLength,
+    },
+    targetIds?.length ? targetIds : undefined,
+  );
+
+  const base = new URL(cfg.serverUrl);
+  const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/send`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(envelope),
   });
+
+  if (!res.ok) throw new Error('Could not send file');
+
+  const result = await res.json();
+  await appendHistory({
+    id: envelope.id,
+    senderId: cfg.deviceId,
+    senderName: cfg.deviceName,
+    senderOs: cfg.deviceOs,
+    targetNames: targetNames?.length ? targetNames : undefined,
+    ts: envelope.ts,
+    type: 'file',
+    content: fileName,
+    blobId,
+    blobIv,
+    fileName,
+    mimeType,
+    fileSize: plainBytes.byteLength,
+    direction: 'out',
+    status: result.delivered ? 'delivered' : 'queued',
+  });
+  return result;
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -416,11 +602,25 @@ chrome.notifications.onClicked.addListener(async (notifId) => {
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  if (info.menuItemId !== 'push-it-send') return;
+  const menuId = String(info.menuItemId || '');
+  if (menuId !== 'push-it-all' && !menuId.startsWith('push-it-dev:')) return;
+
   const content = info.linkUrl || info.selectionText || info.pageUrl || tab?.url;
   if (!content) return;
+
+  let targetIds;
+  let targetNames;
+  if (menuId.startsWith('push-it-dev:')) {
+    const devId = menuId.slice('push-it-dev:'.length);
+    const dev = cachedDevices.find((d) => d.deviceId === devId);
+    if (dev) {
+      targetIds = [dev.deviceId];
+      targetNames = [dev.name];
+    }
+  }
+
   try {
-    await sendContent(content, tab?.title);
+    await sendContent(content, tab?.title, targetIds, targetNames);
   } catch (err) {
     chrome.notifications.create({
       type: 'basic',
@@ -440,6 +640,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         status: wsStatus,
         paired: Boolean(cfg.serverUrl && cfg.keyB64),
         serverUrl: cfg.serverUrl,
+        keyB64: cfg.keyB64,
         deviceId: cfg.deviceId,
         deviceName: cfg.deviceName,
         deviceOs: cfg.deviceOs,
@@ -493,6 +694,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     if (msg.type === 'SEND') {
       const res = await sendContent(msg.content, msg.title, msg.targetIds, msg.targetNames);
+      sendResponse({ ok: true, result: res });
+      return;
+    }
+
+    if (msg.type === 'SEND_FILE') {
+      const res = await sendFileBytes(
+        msg.bytes,
+        msg.fileName,
+        msg.mimeType,
+        msg.targetIds,
+        msg.targetNames,
+      );
       sendResponse({ ok: true, result: res });
       return;
     }

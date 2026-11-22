@@ -2,12 +2,15 @@ import { createEffect, createMemo, createSignal, For, Show } from 'solid-js';
 import QRCode from 'qrcode';
 import { OsIcon } from './components/OsIcon';
 import {
+  decryptBytes,
   decryptEnvelope,
   decryptJson,
   deriveRoomId,
   detectPayloadType,
+  encryptBytes,
   encryptJson,
   encryptPayload,
+  formatFileSize,
   generateRawKeyB64,
   isSafeHttpUrl,
   isValidKeyB64,
@@ -16,9 +19,12 @@ import {
 } from './lib/crypto';
 import {
   clearMessages,
+  getBlob,
   kvGet,
   kvSet,
   listMessages,
+  markMessagesDelivered,
+  saveBlob,
   saveMessage,
   type StoredMessage,
 } from './lib/db';
@@ -39,6 +45,9 @@ interface PairedDevice {
   updatedAt: number;
 }
 
+const MAX_FILE_BYTES = 7.5 * 1024 * 1024;
+const LONG_TEXT_THRESHOLD = 1800;
+
 export default function App() {
   const localOs: DeviceOs = detectOs();
 
@@ -55,6 +64,7 @@ export default function App() {
   const [editDeviceDraft, setEditDeviceDraft] = createSignal<string>('');
 
   const [messages, setMessages] = createSignal<StoredMessage[]>([]);
+  const [blobUrls, setBlobUrls] = createSignal<Record<string, string>>({});
   const [draft, setDraft] = createSignal<string>('');
   const [sending, setSending] = createSignal(false);
   const [wsStatus, setWsStatus] = createSignal<'disconnected' | 'connecting' | 'connected'>('disconnected');
@@ -68,6 +78,7 @@ export default function App() {
   const [unreadCount, setUnreadCount] = createSignal<number>(0);
 
   let chatEndEl: HTMLDivElement | undefined;
+  let fileInputEl: HTMLInputElement | undefined;
   let toastTimer: number | undefined;
 
   function notify(msg: string) {
@@ -110,6 +121,61 @@ export default function App() {
       await nav.setAppBadge?.(count).catch(() => {});
     } else {
       await nav.clearAppBadge?.().catch(() => {});
+    }
+  }
+
+  async function ensureBlobHydrated(
+    item: StoredMessage,
+    rid = roomId(),
+    k = keyB64(),
+    myId = deviceId(),
+  ): Promise<StoredMessage> {
+    if (!item.blobId || !item.blobIv || !rid || !k) return item;
+
+    let cached = await getBlob(item.blobId);
+    if (!cached) {
+      try {
+        const res = await fetch(
+          `/api/room/${encodeURIComponent(rid)}/blob/${encodeURIComponent(item.blobId)}?deviceId=${encodeURIComponent(myId)}`,
+        );
+        if (!res.ok) return item;
+        const cipherBuf = await res.arrayBuffer();
+        const plainBytes = await decryptBytes(k, item.blobIv, new Uint8Array(cipherBuf));
+        const copyBuf = new ArrayBuffer(plainBytes.byteLength);
+        new Uint8Array(copyBuf).set(plainBytes);
+        cached = {
+          id: item.blobId,
+          data: copyBuf,
+          mimeType: item.mimeType || 'application/octet-stream',
+          fileName: item.fileName || 'file',
+        };
+        await saveBlob(cached);
+      } catch {
+        return item;
+      }
+    }
+
+    if (item.type === 'longtext') {
+      const fullText = new TextDecoder().decode(new Uint8Array(cached.data));
+      const updated: StoredMessage = { ...item, type: 'text', content: fullText };
+      await saveMessage(updated);
+      setMessages((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+      return updated;
+    }
+
+    if (item.type === 'file' && !blobUrls()[item.blobId]) {
+      const url = URL.createObjectURL(new Blob([cached.data], { type: cached.mimeType }));
+      setBlobUrls((prev) => ({ ...prev, [item.blobId!]: url }));
+    }
+
+    return item;
+  }
+
+  async function hydrateExistingBlobs(list: StoredMessage[], rid: string, k: string, myId: string) {
+    for (const m of list) {
+      if (m.blobId && m.blobIv) {
+        await ensureBlobHydrated(m, rid, k, myId);
+      }
     }
   }
 
@@ -162,16 +228,15 @@ export default function App() {
             await kvSet('deviceName', name);
           }
         } catch {
-          // Ignore devices encrypted with another key
+          // Ignore devices with another key
         }
       }
 
       setDevices(decrypted);
-      // Drop any selected targets that no longer exist
       const validIds = new Set(decrypted.map((d) => d.deviceId));
       setSelectedTargets((prev) => prev.filter((id) => validIds.has(id) && id !== myId));
     } catch {
-      // ignore network error
+      // ignore
     }
   }
 
@@ -190,7 +255,7 @@ export default function App() {
       for (const env of data.messages) {
         try {
           const decrypted = await decryptEnvelope(k, env);
-          const item: StoredMessage = {
+          let item: StoredMessage = {
             id: env.id,
             senderId: env.senderId,
             senderName: decrypted.senderName,
@@ -200,17 +265,23 @@ export default function App() {
             type: decrypted.type,
             content: decrypted.content,
             title: decrypted.title,
+            blobId: decrypted.blobId,
+            blobIv: decrypted.blobIv,
+            fileName: decrypted.fileName,
+            mimeType: decrypted.mimeType,
+            fileSize: decrypted.fileSize,
             direction: 'in',
           };
           if (item.ts > maxTs) maxTs = item.ts;
           const existed = messages().some((m) => m.id === item.id);
           await saveMessage(item);
           addOrUpdateMessage(item);
+          item = await ensureBlobHydrated(item, rid, k, myId);
           if (!existed) {
             handleIncomingAction(item);
           }
         } catch {
-          // ignore wrong-key
+          // ignore
         }
       }
 
@@ -232,6 +303,7 @@ export default function App() {
         const data = event.data as { type?: string; item?: StoredMessage } | undefined;
         if (data?.type === 'PUSH_RECEIVED' && data.item) {
           addOrUpdateMessage(data.item);
+          ensureBlobHydrated(data.item);
         }
       };
 
@@ -297,12 +369,11 @@ export default function App() {
         await updateBadge(0);
         scrollToBottom();
 
-        // Register this device and pull room devices + missed messages
         await registerDeviceRecord(rid, activeKey, devId, devName, localOs);
         await refreshDevices(rid, activeKey, devId);
+        await hydrateExistingBlobs(existingMsgs, rid, activeKey, devId);
         await syncPending(rid, activeKey, devId);
 
-        // Fallback Share Target handler if SW wasn't controlling yet
         if (
           window.location.pathname === '/share' ||
           window.location.search.includes('url=') ||
@@ -380,17 +451,26 @@ export default function App() {
           try {
             const parsed = JSON.parse(event.data) as {
               type?: string;
+              ids?: string[];
               envelope?: EncryptedEnvelope;
             };
             if (parsed.type === 'devices_updated') {
               await refreshDevices(rid, k, did);
               return;
             }
+            if (parsed.type === 'delivered' && Array.isArray(parsed.ids)) {
+              const deliveredSet = new Set(parsed.ids);
+              setMessages((prev) =>
+                prev.map((m) => (deliveredSet.has(m.id) ? { ...m, status: 'delivered' } : m)),
+              );
+              await markMessagesDelivered(parsed.ids);
+              return;
+            }
             if (parsed.type !== 'message' || !parsed.envelope) return;
             if (parsed.envelope.senderId === did) return;
 
             const decrypted = await decryptEnvelope(k, parsed.envelope);
-            const item: StoredMessage = {
+            let item: StoredMessage = {
               id: parsed.envelope.id,
               senderId: parsed.envelope.senderId,
               senderName: decrypted.senderName,
@@ -400,12 +480,18 @@ export default function App() {
               type: decrypted.type,
               content: decrypted.content,
               title: decrypted.title,
+              blobId: decrypted.blobId,
+              blobIv: decrypted.blobIv,
+              fileName: decrypted.fileName,
+              mimeType: decrypted.mimeType,
+              fileSize: decrypted.fileSize,
               direction: 'in',
             };
 
             await saveMessage(item);
             await kvSet('lastSeenTs', item.ts);
             addOrUpdateMessage(item);
+            item = await ensureBlobHydrated(item, rid, k, did);
 
             if (document.visibilityState !== 'visible') {
               await updateBadge(unreadCount() + 1);
@@ -464,6 +550,8 @@ export default function App() {
       } else {
         notify(`Link from ${from}`);
       }
+    } else if (item.type === 'file') {
+      notify(`File from ${from}`);
     } else {
       notify(`Message from ${from}`);
     }
@@ -473,6 +561,47 @@ export default function App() {
     setSelectedTargets((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
     );
+  }
+
+  function getTargetInfo() {
+    const chosenIds = selectedTargets();
+    const chosenNames =
+      chosenIds.length > 0
+        ? otherDevices()
+            .filter((d) => chosenIds.includes(d.deviceId))
+            .map((d) => d.name)
+        : undefined;
+    return {
+      targetIds: chosenIds.length > 0 ? chosenIds : undefined,
+      targetNames: chosenNames,
+    };
+  }
+
+  async function uploadEncryptedBlob(
+    rid: string,
+    k: string,
+    did: string,
+    plainBytes: Uint8Array<ArrayBuffer>,
+    targetIds?: string[],
+  ): Promise<{ blobId: string; blobIv: string }> {
+    const blobId = crypto.randomUUID().replace(/-/g, '');
+    const { iv: blobIv, ciphertext } = await encryptBytes(k, plainBytes);
+    const params = new URLSearchParams({ senderId: did });
+    if (targetIds && targetIds.length > 0) params.set('targetIds', targetIds.join(','));
+
+    const res = await fetch(
+      `/api/room/${encodeURIComponent(rid)}/blob/${encodeURIComponent(blobId)}?${params.toString()}`,
+      {
+        method: 'PUT',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: ciphertext,
+      },
+    );
+
+    if (!res.ok) {
+      throw new Error('File too large (max 8 MB)');
+    }
+    return { blobId, blobIv };
   }
 
   async function sendText(
@@ -490,30 +619,55 @@ export default function App() {
     const dName = overrideName || deviceName();
     if (!content || !k || !rid || !did) return;
 
-    const chosenIds = selectedTargets();
-    const chosenNames =
-      chosenIds.length > 0
-        ? otherDevices()
-            .filter((d) => chosenIds.includes(d.deviceId))
-            .map((d) => d.name)
-        : undefined;
-
+    const { targetIds, targetNames } = getTargetInfo();
     setSending(true);
     try {
-      const type = detectPayloadType(content);
-      const envelope = await encryptPayload(
-        k,
-        did,
-        {
-          type,
-          content,
-          title,
-          senderName: dName,
-          senderOs: localOs,
-          targetNames: chosenNames,
-        },
-        chosenIds.length > 0 ? chosenIds : undefined,
-      );
+      const isLong = content.length > LONG_TEXT_THRESHOLD;
+      let envelope: EncryptedEnvelope;
+
+      if (isLong) {
+        const encoded = new TextEncoder().encode(content);
+        const buf = new ArrayBuffer(encoded.byteLength);
+        new Uint8Array(buf).set(encoded);
+        const { blobId, blobIv } = await uploadEncryptedBlob(
+          rid,
+          k,
+          did,
+          new Uint8Array(buf),
+          targetIds,
+        );
+        envelope = await encryptPayload(
+          k,
+          did,
+          {
+            type: 'longtext',
+            content: content.slice(0, 140) + '…',
+            title,
+            senderName: dName,
+            senderOs: localOs,
+            targetNames,
+            blobId,
+            blobIv,
+            fileSize: buf.byteLength,
+          },
+          targetIds,
+        );
+      } else {
+        const type = detectPayloadType(content);
+        envelope = await encryptPayload(
+          k,
+          did,
+          {
+            type,
+            content,
+            title,
+            senderName: dName,
+            senderOs: localOs,
+            targetNames,
+          },
+          targetIds,
+        );
+      }
 
       const res = await fetch(`/api/room/${encodeURIComponent(rid)}/send`, {
         method: 'POST',
@@ -525,17 +679,19 @@ export default function App() {
         throw new Error('Could not send right now');
       }
 
+      const result = (await res.json()) as { delivered?: boolean };
       const item: StoredMessage = {
         id: envelope.id,
         senderId: did,
         senderName: dName,
         senderOs: localOs,
-        targetNames: chosenNames,
+        targetNames,
         ts: envelope.ts,
-        type,
+        type: isLong ? 'text' : detectPayloadType(content),
         content,
         title,
         direction: 'out',
+        status: result.delivered ? 'delivered' : 'queued',
       };
 
       await saveMessage(item);
@@ -544,6 +700,94 @@ export default function App() {
       notify('Pushed!');
     } catch (e) {
       notify(e instanceof Error ? e.message : 'Could not send');
+    } finally {
+      setSending(false);
+    }
+  }
+
+  async function sendFile(file: File) {
+    const k = keyB64();
+    const rid = roomId();
+    const did = deviceId();
+    const dName = deviceName();
+    if (!k || !rid || !did) return;
+
+    if (file.size > MAX_FILE_BYTES) {
+      notify('File is too large (max 7.5 MB)');
+      return;
+    }
+
+    const { targetIds, targetNames } = getTargetInfo();
+    setSending(true);
+    try {
+      const fileBuf = await file.arrayBuffer();
+      const { blobId, blobIv } = await uploadEncryptedBlob(
+        rid,
+        k,
+        did,
+        new Uint8Array(fileBuf),
+        targetIds,
+      );
+
+      const mimeType = file.type || 'application/octet-stream';
+      const fileName = file.name || (mimeType.startsWith('image/') ? 'photo.png' : 'file');
+
+      const envelope = await encryptPayload(
+        k,
+        did,
+        {
+          type: 'file',
+          content: fileName,
+          senderName: dName,
+          senderOs: localOs,
+          targetNames,
+          blobId,
+          blobIv,
+          fileName,
+          mimeType,
+          fileSize: file.size,
+        },
+        targetIds,
+      );
+
+      const res = await fetch(`/api/room/${encodeURIComponent(rid)}/send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(envelope),
+      });
+
+      if (!res.ok) {
+        throw new Error('Could not send file');
+      }
+
+      const result = (await res.json()) as { delivered?: boolean };
+      await saveBlob({ id: blobId, data: fileBuf, mimeType, fileName });
+      const localUrl = URL.createObjectURL(new Blob([fileBuf], { type: mimeType }));
+      setBlobUrls((prev) => ({ ...prev, [blobId]: localUrl }));
+
+      const item: StoredMessage = {
+        id: envelope.id,
+        senderId: did,
+        senderName: dName,
+        senderOs: localOs,
+        targetNames,
+        ts: envelope.ts,
+        type: 'file',
+        content: fileName,
+        blobId,
+        blobIv,
+        fileName,
+        mimeType,
+        fileSize: file.size,
+        direction: 'out',
+        status: result.delivered ? 'delivered' : 'queued',
+      };
+
+      await saveMessage(item);
+      addOrUpdateMessage(item);
+      notify('Pushed!');
+    } catch (e) {
+      notify(e instanceof Error ? e.message : 'Could not send file');
     } finally {
       setSending(false);
     }
@@ -632,19 +876,6 @@ export default function App() {
     notify('Created a new pairing code');
   }
 
-  async function handlePasteAndSend() {
-    try {
-      const clip = await navigator.clipboard.readText();
-      if (!clip.trim()) {
-        notify('Clipboard is empty');
-        return;
-      }
-      await sendText(clip);
-    } catch {
-      notify('Paste into the box to send');
-    }
-  }
-
   async function copyToClipboard(text: string, label = 'Copied') {
     try {
       await navigator.clipboard.writeText(text);
@@ -655,7 +886,15 @@ export default function App() {
   }
 
   return (
-    <div class="app-shell">
+    <div
+      class="app-shell"
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => {
+        e.preventDefault();
+        const file = e.dataTransfer?.files?.[0];
+        if (file) sendFile(file);
+      }}
+    >
       <header class="topbar">
         <div class="brand">
           <img src="/icon.svg" alt="" class="logo" />
@@ -762,7 +1001,9 @@ export default function App() {
                           }
                         >
                           <div class="device-info">
-                            <span class={`dot ${dev.online || isSelf ? 'connected' : 'disconnected'}`} />
+                            <span
+                              class={`dot ${dev.online || isSelf ? 'connected' : 'disconnected'}`}
+                            />
                             <OsIcon os={dev.os} size={15} />
                             <span class="device-name">{dev.name}</span>
                             <Show when={isSelf}>
@@ -780,10 +1021,7 @@ export default function App() {
                               Rename
                             </button>
                             <Show when={!isSelf}>
-                              <button
-                                class="chip danger"
-                                onClick={() => removeDevice(dev)}
-                              >
+                              <button class="chip danger" onClick={() => removeDevice(dev)}>
                                 Remove
                               </button>
                             </Show>
@@ -873,6 +1111,7 @@ export default function App() {
                   onClick={async () => {
                     await clearMessages();
                     setMessages([]);
+                    setBlobUrls({});
                     notify('History cleared');
                   }}
                 >
@@ -890,7 +1129,7 @@ export default function App() {
               <div class="empty">
                 <p>Nothing pushed yet.</p>
                 <p class="muted">
-                  Send a link or note below, or share straight from Android’s Share menu.
+                  Send a link, note, or photo below—or share straight from Android’s Share menu.
                 </p>
               </div>
             }
@@ -904,6 +1143,9 @@ export default function App() {
                   ? ` → ${msg.targetNames.join(', ')}`
                   : '';
               const isLink = msg.type === 'link' && isSafeHttpUrl(msg.content);
+              const isFile = msg.type === 'file';
+              const isImage = isFile && Boolean(msg.mimeType?.startsWith('image/'));
+              const fileUrl = () => (msg.blobId ? blobUrls()[msg.blobId] : undefined);
 
               return (
                 <div class={`bubble-row ${msg.direction}`}>
@@ -916,18 +1158,44 @@ export default function App() {
                           {targetLabel}
                         </span>
                       </span>
-                      <time>
-                        {new Date(msg.ts).toLocaleTimeString([], {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
-                      </time>
+                      <span class="meta-right">
+                        <time>
+                          {new Date(msg.ts).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </time>
+                        <Show when={msg.direction === 'out'}>
+                          <span
+                            class={`check ${msg.status === 'delivered' ? 'delivered' : ''}`}
+                            title={msg.status === 'delivered' ? 'Delivered' : 'Queued'}
+                          >
+                            {msg.status === 'delivered' ? '✓✓' : '✓'}
+                          </span>
+                        </Show>
+                      </span>
                     </div>
+
                     <Show when={msg.title}>
                       <div class="bubble-title">{msg.title}</div>
                     </Show>
+
                     <div class="bubble-body">
-                      {isLink ? (
+                      {isFile ? (
+                        <div class="file-card">
+                          <Show when={isImage && fileUrl()}>
+                            <a href={fileUrl()} target="_blank" rel="noopener noreferrer">
+                              <img src={fileUrl()} alt={msg.fileName || 'Photo'} class="photo-preview" />
+                            </a>
+                          </Show>
+                          <div class="file-meta">
+                            <span class="file-name">{msg.fileName || msg.content}</span>
+                            <Show when={msg.fileSize}>
+                              <span class="muted">{formatFileSize(msg.fileSize)}</span>
+                            </Show>
+                          </div>
+                        </div>
+                      ) : isLink ? (
                         <a href={msg.content} target="_blank" rel="noopener noreferrer">
                           {msg.content}
                         </a>
@@ -935,6 +1203,7 @@ export default function App() {
                         <pre>{msg.content}</pre>
                       )}
                     </div>
+
                     <div class="bubble-actions">
                       <Show when={isLink}>
                         <a
@@ -946,12 +1215,23 @@ export default function App() {
                           Open
                         </a>
                       </Show>
-                      <button
-                        class="chip"
-                        onClick={() => copyToClipboard(msg.content, 'Copied')}
-                      >
-                        Copy
-                      </button>
+                      <Show when={isFile && fileUrl()}>
+                        <a
+                          class="chip primary"
+                          href={fileUrl()}
+                          download={msg.fileName || 'file'}
+                        >
+                          Download
+                        </a>
+                      </Show>
+                      <Show when={!isFile}>
+                        <button
+                          class="chip"
+                          onClick={() => copyToClipboard(msg.content, 'Copied')}
+                        >
+                          Copy
+                        </button>
+                      </Show>
                     </div>
                   </article>
                 </div>
@@ -985,19 +1265,43 @@ export default function App() {
         </Show>
 
         <footer class="composer-bar">
+          <input
+            ref={fileInputEl}
+            type="file"
+            class="hidden-file"
+            onChange={(e) => {
+              const file = e.currentTarget.files?.[0];
+              if (file) sendFile(file);
+              e.currentTarget.value = '';
+            }}
+          />
           <button
             class="btn secondary icon-btn"
-            title="Paste clipboard and push"
+            title="Attach photo or file"
             disabled={sending()}
-            onClick={handlePasteAndSend}
+            onClick={() => fileInputEl?.click()}
           >
-            Paste
+            +
           </button>
           <textarea
             rows={1}
-            placeholder="Paste a link or note..."
+            placeholder="Paste a link, note, or screenshot..."
             value={draft()}
             onInput={(e) => setDraft(e.currentTarget.value)}
+            onPaste={(e) => {
+              const items = e.clipboardData?.items;
+              if (!items) return;
+              for (const item of items) {
+                if (item.kind === 'file') {
+                  const file = item.getAsFile();
+                  if (file) {
+                    e.preventDefault();
+                    sendFile(file);
+                    return;
+                  }
+                }
+              }
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();

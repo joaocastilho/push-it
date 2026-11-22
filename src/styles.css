@@ -473,6 +473,54 @@ h2 {
   color: #fff;
 }
 
+.meta-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.check {
+  font-size: 0.72rem;
+  color: var(--muted);
+  letter-spacing: -1px;
+}
+
+.check.delivered {
+  color: var(--cyan);
+}
+
+.hidden-file {
+  display: none;
+}
+
+.file-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.photo-preview {
+  display: block;
+  max-width: 100%;
+  max-height: 240px;
+  border-radius: 8px;
+  object-fit: contain;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.file-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.file-name {
+  font-size: 0.86rem;
+  font-weight: 600;
+  word-break: break-all;
+}
+
 .composer-bar {
   display: flex;
   align-items: flex-end;
