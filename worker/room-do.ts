@@ -35,6 +35,11 @@ interface StoredDevice {
   updatedAt: number;
 }
 
+interface StoredMessage {
+  envelope: EncryptedEnvelope;
+  remaining: string[];
+}
+
 interface StoredVapidKeys {
   publicKey: string;
   privateKey: string;
@@ -45,8 +50,9 @@ const SUB_PREFIX = 'sub:';
 const DEV_PREFIX = 'dev:';
 const MSG_PREFIX = 'msg:';
 const VAPID_STORAGE_KEY = 'vapid:keys';
-const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000;
-const MAX_PENDING_MESSAGES = 50;
+const MAX_TTL_SECONDS = 2419200; // 28 days (Web Push / FCM max)
+const MESSAGE_TTL_MS = MAX_TTL_SECONDS * 1000;
+const MAX_PENDING_MESSAGES = 200;
 export const VAPID_DO_NAME = '__vapid__';
 
 function toBase64Url(bytes: Uint8Array): string {
@@ -299,11 +305,14 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   private async pruneOldMessages(now: number): Promise<void> {
-    const stored = await this.ctx.storage.list<EncryptedEnvelope>({ prefix: MSG_PREFIX });
+    const stored = await this.ctx.storage.list<StoredMessage | EncryptedEnvelope>({
+      prefix: MSG_PREFIX,
+    });
     const toDelete: string[] = [];
     const entries = Array.from(stored.entries());
 
-    for (const [key, env] of entries) {
+    for (const [key, entry] of entries) {
+      const env = 'envelope' in entry ? entry.envelope : entry;
       if (now - env.ts > MESSAGE_TTL_MS) {
         toDelete.push(key);
       }
@@ -329,30 +338,52 @@ export class RoomDO extends DurableObject<Env> {
     const since = Number(url.searchParams.get('since') || '0');
     const now = Date.now();
 
-    const stored = await this.ctx.storage.list<EncryptedEnvelope>({ prefix: MSG_PREFIX });
-    const expiredKeys: string[] = [];
+    const stored = await this.ctx.storage.list<StoredMessage | EncryptedEnvelope>({
+      prefix: MSG_PREFIX,
+    });
+    const toDelete: string[] = [];
+    const toUpdate: Array<[string, StoredMessage]> = [];
     const messages: EncryptedEnvelope[] = [];
 
-    for (const [key, env] of stored) {
+    for (const [key, entry] of stored) {
+      const isWrapped = 'envelope' in entry;
+      const env = isWrapped ? entry.envelope : entry;
+      const remaining = isWrapped ? entry.remaining : [];
+
       if (now - env.ts > MESSAGE_TTL_MS) {
-        expiredKeys.push(key);
+        toDelete.push(key);
         continue;
       }
-      if (env.ts <= since) continue;
+
       if (deviceId && env.senderId === deviceId) continue;
-      if (
-        deviceId &&
-        Array.isArray(env.targetIds) &&
-        env.targetIds.length > 0 &&
-        !env.targetIds.includes(deviceId)
-      ) {
-        continue;
+
+      const targetedToDevice =
+        !Array.isArray(env.targetIds) ||
+        env.targetIds.length === 0 ||
+        (deviceId !== '' && env.targetIds.includes(deviceId));
+
+      if (!targetedToDevice) continue;
+
+      if (isWrapped && deviceId) {
+        if (remaining.includes(deviceId)) {
+          messages.push(env);
+          const nextRemaining = remaining.filter((id) => id !== deviceId);
+          if (nextRemaining.length === 0) {
+            toDelete.push(key);
+          } else {
+            toUpdate.push([key, { envelope: env, remaining: nextRemaining }]);
+          }
+        }
+      } else if (env.ts > since) {
+        messages.push(env);
       }
-      messages.push(env);
     }
 
-    if (expiredKeys.length > 0) {
-      await this.ctx.storage.delete(expiredKeys);
+    if (toDelete.length > 0) {
+      await this.ctx.storage.delete(toDelete);
+    }
+    for (const [k, v] of toUpdate) {
+      await this.ctx.storage.put(k, v);
     }
 
     messages.sort((a, b) => a.ts - b.ts);
@@ -378,15 +409,11 @@ export class RoomDO extends DurableObject<Env> {
         ? new Set(envelope.targetIds)
         : null;
 
-    // 1. Persist encrypted envelope in 24h offline queue
-    const paddedTs = String(envelope.ts).padStart(15, '0');
-    await this.ctx.storage.put(`${MSG_PREFIX}${paddedTs}:${envelope.id}`, envelope);
-    await this.pruneOldMessages(now);
-
     const serialized = JSON.stringify({ type: 'message', envelope });
 
-    // 2. Fan out to connected WebSockets (respecting targetIds and skipping sender)
+    // 1. Fan out to connected WebSockets (respecting targetIds and skipping sender)
     let wsDelivered = 0;
+    const deliveredIds = new Set<string>();
     for (const ws of this.ctx.getWebSockets()) {
       const tags = this.ctx.getTags(ws);
       if (tags.includes(envelope.senderId)) continue;
@@ -394,9 +421,28 @@ export class RoomDO extends DurableObject<Env> {
       try {
         ws.send(serialized);
         wsDelivered++;
+        for (const t of tags) deliveredIds.add(t);
       } catch {
         // Ignore dead sockets
       }
+    }
+
+    // 2. Queue only for intended devices that were NOT online right now;
+    //    auto-deleted once every remaining device retrieves it (or after 28 days).
+    const allDevices = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
+    const remaining: string[] = [];
+    for (const dev of allDevices.values()) {
+      if (dev.deviceId === envelope.senderId) continue;
+      if (targetSet && !targetSet.has(dev.deviceId)) continue;
+      if (deliveredIds.has(dev.deviceId)) continue;
+      remaining.push(dev.deviceId);
+    }
+
+    if (remaining.length > 0) {
+      const paddedTs = String(envelope.ts).padStart(15, '0');
+      const record: StoredMessage = { envelope, remaining };
+      await this.ctx.storage.put(`${MSG_PREFIX}${paddedTs}:${envelope.id}`, record);
+      await this.pruneOldMessages(now);
     }
 
     // 3. Fan out Web Push to registered devices (respecting targetIds and skipping sender)
@@ -420,7 +466,7 @@ export class RoomDO extends DurableObject<Env> {
                 {
                   data: envelope as unknown as Record<string, string | number>,
                   options: {
-                    ttl: 86400,
+                    ttl: MAX_TTL_SECONDS,
                     urgency: 'high',
                   },
                 },
