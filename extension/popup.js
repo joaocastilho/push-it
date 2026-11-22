@@ -23,6 +23,7 @@ const savePairBtn = document.getElementById('savePair');
 const autoOpenEl = document.getElementById('autoOpen');
 const targetBar = document.getElementById('targetBar');
 const sendTabBtn = document.getElementById('sendTab');
+const sendTabLabel = document.getElementById('sendTabLabel');
 const fileInput = document.getElementById('fileInput');
 const attachBtn = document.getElementById('attachBtn');
 const draftEl = document.getElementById('draft');
@@ -340,13 +341,25 @@ function renderHistory(items) {
     head.appendChild(metaRight);
     bubble.appendChild(head);
 
-    const text = document.createElement('div');
-    text.className = 'bubble-text';
-    text.textContent =
-      item.type === 'file'
-        ? `${item.fileName || item.content}${item.fileSize ? ` (${formatFileSize(item.fileSize)})` : ''}`
-        : item.content;
-    bubble.appendChild(text);
+    if (item.type === 'link' && isSafeHttpUrl(item.content)) {
+      const link = document.createElement('a');
+      link.className = 'bubble-link';
+      link.href = item.content;
+      link.textContent = item.content;
+      link.onclick = (e) => {
+        e.preventDefault();
+        chrome.tabs.create({ url: item.content, active: true });
+      };
+      bubble.appendChild(link);
+    } else {
+      const text = document.createElement('div');
+      text.className = 'bubble-text';
+      text.textContent =
+        item.type === 'file'
+          ? `${item.fileName || item.content}${item.fileSize ? ` (${formatFileSize(item.fileSize)})` : ''}`
+          : item.content;
+      bubble.appendChild(text);
+    }
 
     const actions = document.createElement('div');
     actions.className = 'bubble-actions';
@@ -437,9 +450,7 @@ function getSelectedTargetsPayload() {
 
 attachBtn.addEventListener('click', () => fileInput.click());
 
-fileInput.addEventListener('change', async () => {
-  const file = fileInput.files?.[0];
-  fileInput.value = '';
+async function pushFileObject(file) {
   if (!file) return;
   if (file.size > 7.5 * 1024 * 1024) {
     showToast('File is too large (max 7.5 MB)');
@@ -450,7 +461,7 @@ fileInput.addEventListener('change', async () => {
   const res = await chrome.runtime.sendMessage({
     type: 'SEND_FILE',
     bytes,
-    fileName: file.name || 'file',
+    fileName: file.name || (file.type?.startsWith('image/') ? 'screenshot.png' : 'file'),
     mimeType: file.type || 'application/octet-stream',
     ...getSelectedTargetsPayload(),
   });
@@ -460,7 +471,43 @@ fileInput.addEventListener('change', async () => {
   }
   showToast('Pushed!');
   refresh();
+}
+
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files?.[0];
+  fileInput.value = '';
+  await pushFileObject(file);
 });
+
+function autoResizeDraft() {
+  draftEl.style.height = 'auto';
+  draftEl.style.height = `${Math.min(draftEl.scrollHeight, 96)}px`;
+}
+
+draftEl.addEventListener('input', autoResizeDraft);
+
+draftEl.addEventListener('paste', (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.kind === 'file') {
+      const file = item.getAsFile();
+      if (file) {
+        e.preventDefault();
+        pushFileObject(file);
+        return;
+      }
+    }
+  }
+});
+
+// Show active tab title/host in the quick Push This Tab bar
+chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
+  if (tab?.url && isSafeHttpUrl(tab.url)) {
+    const label = tab.title ? `Push tab: ${tab.title}` : `Push tab: ${new URL(tab.url).host}`;
+    sendTabLabel.textContent = label;
+  }
+}).catch(() => {});
 
 sendTabBtn.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -495,13 +542,14 @@ async function submitDraft() {
     return;
   }
   draftEl.value = '';
+  autoResizeDraft();
   showToast('Pushed!');
   refresh();
 }
 
 sendDraftBtn.addEventListener('click', submitDraft);
 draftEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
+  if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     submitDraft();
   }

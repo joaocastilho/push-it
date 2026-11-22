@@ -6,7 +6,7 @@
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <div class="wrap">
+    <div class="shell">
       <header class="header">
         <div class="title-row">
           <img src="icon128.png" alt="" class="icon" />
@@ -65,15 +65,23 @@
 
         <div id="targetBar" class="target-bar hidden"></div>
 
-        <div class="composer">
-          <button id="sendTab" class="btn primary full">Push This Tab</button>
-          <div class="compose-row">
+        <footer class="composer-area">
+          <button id="sendTab" class="tab-bar-btn" title="Push the active browser tab">
+            <span class="tab-bar-icon">↗</span>
+            <span id="sendTabLabel" class="tab-bar-text">Push This Tab</span>
+          </button>
+
+          <div class="input-box">
             <input id="fileInput" type="file" class="hidden" />
-            <button id="attachBtn" class="btn secondary" title="Attach photo or file">+</button>
-            <input id="draft" type="text" placeholder="Paste a link or note..." />
-            <button id="sendDraft" class="btn secondary">Push It</button>
+            <button id="attachBtn" class="icon-action" title="Attach photo or file">+</button>
+            <textarea
+              id="draft"
+              rows="1"
+              placeholder="Write a note, paste a link or screenshot..."
+            ></textarea>
+            <button id="sendDraft" class="send-btn">Push It</button>
           </div>
-        </div>
+        </footer>
       </section>
     </div>
     <script type="module" src="popup.js"></script>
