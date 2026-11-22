@@ -208,7 +208,7 @@ async function handleSilentShare(url) {
 </style>
 </head>
 <body>
-  <div class="pill">${ok ? '✓ Sent E2EE' : escapeHtml(statusMsg)}</div>
+  <div class="pill">${ok ? '✓ Pushed' : escapeHtml(statusMsg)}</div>
   <script>
     window.close();
     setTimeout(() => { window.close(); if (history.length > 1) history.back(); }, 250);
@@ -238,7 +238,7 @@ async function handlePush(event) {
   const keyB64 = await kvGet('keyB64');
   if (!keyB64) {
     await self.registration.showNotification('Push It', {
-      body: 'Encrypted message received (open app to pair key)',
+      body: 'Open Push It to pair this device',
       icon: '/icon.svg',
       data: { type: 'app' },
     });
@@ -250,7 +250,7 @@ async function handlePush(event) {
     payload = await decryptEnvelope(keyB64, envelope);
   } catch {
     await self.registration.showNotification('Push It', {
-      body: 'Could not decrypt message (key mismatch)',
+      body: 'Re-pair this device to read this message',
       icon: '/icon.svg',
       data: { type: 'app' },
     });
@@ -287,7 +287,7 @@ async function handlePush(event) {
   const fromPrefix = item.senderName ? `${item.senderName} · ` : '';
   const notifTitle = isLink
     ? `${fromPrefix}${item.title || 'New Link — Tap to Open'}`
-    : `${fromPrefix}${item.title || 'New Encrypted Text'}`;
+    : `${fromPrefix}${item.title || 'New Message'}`;
 
   await self.registration.showNotification(notifTitle, {
     body: item.content.slice(0, 180),

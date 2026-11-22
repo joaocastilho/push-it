@@ -3,10 +3,12 @@ import { defaultDeviceName, isSafeHttpUrl, isValidKeyB64 } from './crypto.js';
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const devicePill = document.getElementById('devicePill');
-const deviceNameInput = document.getElementById('deviceNameInput');
+const toggleSettingsBtn = document.getElementById('toggleSettings');
 const toastEl = document.getElementById('toast');
-const setupBox = document.getElementById('setupBox');
-const toggleSetupBtn = document.getElementById('toggleSetup');
+const settingsView = document.getElementById('settingsView');
+const chatView = document.getElementById('chatView');
+const deviceNameInput = document.getElementById('deviceNameInput');
+const saveNameBtn = document.getElementById('saveNameBtn');
 const pairInput = document.getElementById('pairInput');
 const savePairBtn = document.getElementById('savePair');
 const autoOpenEl = document.getElementById('autoOpen');
@@ -18,6 +20,7 @@ const historyList = document.getElementById('historyList');
 
 let currentDeviceOs = 'windows';
 let currentDeviceName = 'Windows';
+let showingSettings = false;
 let toastTimer;
 
 const OS_PATHS = {
@@ -50,7 +53,15 @@ function showToast(msg) {
   toastEl.textContent = msg;
   toastEl.classList.remove('hidden');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.add('hidden'), 2400);
+  toastTimer = setTimeout(() => toastEl.classList.add('hidden'), 2200);
+}
+
+function setView(showSettings) {
+  showingSettings = showSettings;
+  settingsView.classList.toggle('hidden', !showSettings);
+  chatView.classList.toggle('hidden', showSettings);
+  devicePill.classList.toggle('hidden', showSettings);
+  toggleSettingsBtn.textContent = showSettings ? '← Back' : 'Settings';
 }
 
 function renderDevicePill() {
@@ -65,18 +76,21 @@ async function refresh() {
   const state = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
   currentDeviceOs = state.deviceOs || 'windows';
   currentDeviceName = state.deviceName || defaultDeviceName(currentDeviceOs);
+  deviceNameInput.value = currentDeviceName;
   renderDevicePill();
 
   statusDot.className = `dot ${state.paired ? state.status : 'disconnected'}`;
   statusText.textContent = !state.paired
     ? 'Not paired'
     : state.status === 'connected'
-      ? 'Live E2EE'
-      : state.status;
+      ? 'Connected'
+      : state.status === 'connecting'
+        ? 'Connecting...'
+        : 'Offline';
   autoOpenEl.checked = Boolean(state.autoOpen);
 
   if (!state.paired) {
-    setupBox.classList.remove('hidden');
+    setView(true);
   }
 
   renderHistory(state.history || []);
@@ -87,7 +101,7 @@ function renderHistory(items) {
   if (!items.length) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = 'No messages yet.';
+    empty.textContent = 'Nothing pushed yet.';
     historyList.appendChild(empty);
     return;
   }
@@ -107,12 +121,16 @@ function renderHistory(items) {
     const os = item.senderOs || (item.direction === 'out' ? currentDeviceOs : 'other');
     sender.appendChild(createOsSvg(os, 12));
     const nameSpan = document.createElement('span');
-    nameSpan.textContent = item.senderName || (item.direction === 'out' ? currentDeviceName : 'Other device');
+    nameSpan.textContent =
+      item.senderName || (item.direction === 'out' ? currentDeviceName : 'Other device');
     sender.appendChild(nameSpan);
     head.appendChild(sender);
 
     const time = document.createElement('time');
-    time.textContent = new Date(item.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    time.textContent = new Date(item.ts).toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
     head.appendChild(time);
     bubble.appendChild(head);
 
@@ -149,10 +167,12 @@ function renderHistory(items) {
   historyList.scrollTop = historyList.scrollHeight;
 }
 
+toggleSettingsBtn.addEventListener('click', () => {
+  setView(!showingSettings);
+});
+
 devicePill.addEventListener('click', () => {
-  devicePill.classList.add('hidden');
-  deviceNameInput.value = currentDeviceName;
-  deviceNameInput.classList.remove('hidden');
+  setView(true);
   deviceNameInput.focus();
   deviceNameInput.select();
 });
@@ -160,23 +180,18 @@ devicePill.addEventListener('click', () => {
 async function commitDeviceName() {
   const next = deviceNameInput.value.trim() || defaultDeviceName(currentDeviceOs);
   currentDeviceName = next;
+  deviceNameInput.value = next;
   await chrome.storage.local.set({ deviceName: next });
-  deviceNameInput.classList.add('hidden');
-  devicePill.classList.remove('hidden');
   renderDevicePill();
-  showToast(`Device named "${next}"`);
+  showToast(`Saved as "${next}"`);
 }
 
-deviceNameInput.addEventListener('blur', commitDeviceName);
+saveNameBtn.addEventListener('click', commitDeviceName);
 deviceNameInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     e.preventDefault();
-    deviceNameInput.blur();
+    commitDeviceName();
   }
-});
-
-toggleSetupBtn.addEventListener('click', () => {
-  setupBox.classList.toggle('hidden');
 });
 
 savePairBtn.addEventListener('click', async () => {
@@ -186,7 +201,7 @@ savePairBtn.addEventListener('click', async () => {
     const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ''));
     const keyB64 = hashParams.get('key')?.trim() || '';
     if (!isValidKeyB64(keyB64)) {
-      showToast('Pair link is missing a valid #key=...');
+      showToast('That pair link is not valid');
       return;
     }
 
@@ -195,24 +210,24 @@ savePairBtn.addEventListener('click', async () => {
       keyB64,
     });
     pairInput.value = '';
-    setupBox.classList.add('hidden');
     await chrome.runtime.sendMessage({ type: 'RECONNECT' });
-    showToast('Paired and connecting...');
+    setView(false);
+    showToast('Paired!');
     setTimeout(refresh, 500);
   } catch {
-    showToast('Paste the full pair URL (https://.../#key=...)');
+    showToast('Paste the full pair link');
   }
 });
 
 autoOpenEl.addEventListener('change', async () => {
   await chrome.storage.local.set({ autoOpen: autoOpenEl.checked });
-  showToast(autoOpenEl.checked ? 'Auto-open enabled' : 'Auto-open disabled');
+  showToast(autoOpenEl.checked ? 'Auto-open on' : 'Auto-open off');
 });
 
 sendTabBtn.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.url || !isSafeHttpUrl(tab.url)) {
-    showToast('Active tab has no http/https URL');
+    showToast('Open a website tab first');
     return;
   }
   const res = await chrome.runtime.sendMessage({
@@ -221,10 +236,10 @@ sendTabBtn.addEventListener('click', async () => {
     title: tab.title,
   });
   if (!res.ok) {
-    showToast(res.error || 'Send failed');
+    showToast('Could not send right now');
     return;
   }
-  showToast(`Sent (${res.result.wsDelivered} live, ${res.result.pushSent} push)`);
+  showToast('Pushed!');
   refresh();
 });
 
@@ -233,11 +248,11 @@ async function submitDraft() {
   if (!content) return;
   const res = await chrome.runtime.sendMessage({ type: 'SEND', content });
   if (!res.ok) {
-    showToast(res.error || 'Send failed');
+    showToast('Could not send right now');
     return;
   }
   draftEl.value = '';
-  showToast(`Sent (${res.result.wsDelivered} live, ${res.result.pushSent} push)`);
+  showToast('Pushed!');
   refresh();
 }
 
@@ -251,6 +266,7 @@ draftEl.addEventListener('keydown', (e) => {
 
 clearBtn.addEventListener('click', async () => {
   await chrome.storage.local.set({ history: [] });
+  showToast('History cleared');
   refresh();
 });
 

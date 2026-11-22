@@ -31,12 +31,12 @@ import {
 export default function App() {
   const localOs: DeviceOs = detectOs();
 
+  const [view, setView] = createSignal<'chat' | 'settings'>('chat');
   const [keyB64, setKeyB64] = createSignal<string>('');
   const [roomId, setRoomId] = createSignal<string>('');
   const [deviceId, setDeviceId] = createSignal<string>('');
   const [deviceName, setDeviceName] = createSignal<string>(defaultDeviceName(localOs));
-  const [editingName, setEditingName] = createSignal<boolean>(false);
-  const [nameDraft, setNameDraft] = createSignal<string>('');
+  const [nameInput, setNameInput] = createSignal<string>(defaultDeviceName(localOs));
 
   const [messages, setMessages] = createSignal<StoredMessage[]>([]);
   const [draft, setDraft] = createSignal<string>('');
@@ -45,7 +45,6 @@ export default function App() {
   const [autoOpen, setAutoOpen] = createSignal<boolean>(true);
   const [pushEnabled, setPushEnabled] = createSignal<boolean>(false);
   const [pushBusy, setPushBusy] = createSignal<boolean>(false);
-  const [showDrawer, setShowDrawer] = createSignal<boolean>(false);
   const [qrDataUrl, setQrDataUrl] = createSignal<string>('');
   const [importInput, setImportInput] = createSignal<string>('');
   const [toast, setToast] = createSignal<string>('');
@@ -57,7 +56,7 @@ export default function App() {
   function notify(msg: string) {
     setToast(msg);
     if (toastTimer) window.clearTimeout(toastTimer);
-    toastTimer = window.setTimeout(() => setToast(''), 3000);
+    toastTimer = window.setTimeout(() => setToast(''), 2800);
   }
 
   function scrollToBottom() {
@@ -70,6 +69,12 @@ export default function App() {
     const k = keyB64();
     if (!k) return '';
     return `${window.location.origin}/#key=${encodeURIComponent(k)}`;
+  });
+
+  const statusLabel = createMemo(() => {
+    if (wsStatus() === 'connected') return 'Connected';
+    if (wsStatus() === 'connecting') return 'Connecting...';
+    return 'Offline';
   });
 
   // 1. Bootstrap key, device identity, preferences, SW, and URL hash/share target
@@ -118,7 +123,7 @@ export default function App() {
           activeKey = hashKey.trim();
           await kvSet('keyB64', activeKey);
           window.history.replaceState(null, '', window.location.pathname + window.location.search);
-          notify('Paired with shared E2EE key');
+          notify('Devices paired!');
         } else if (!activeKey) {
           activeKey = generateRawKeyB64();
           await kvSet('keyB64', activeKey);
@@ -132,6 +137,7 @@ export default function App() {
 
         setDeviceId(devId);
         setDeviceName(devName);
+        setNameInput(devName);
         setKeyB64(activeKey);
         setRoomId(rid);
         setMessages(existingMsgs);
@@ -139,7 +145,11 @@ export default function App() {
         scrollToBottom();
 
         // Fallback Share Target handler if Service Worker wasn't controlling yet
-        if (window.location.pathname === '/share' || window.location.search.includes('url=') || window.location.search.includes('text=')) {
+        if (
+          window.location.pathname === '/share' ||
+          window.location.search.includes('url=') ||
+          window.location.search.includes('text=')
+        ) {
           const sp = new URLSearchParams(window.location.search);
           const sharedUrl = sp.get('url')?.trim() || '';
           const sharedText = sp.get('text')?.trim() || '';
@@ -164,11 +174,11 @@ export default function App() {
     },
   );
 
-  // 2. Generate QR code when drawer opens
+  // 2. Generate QR code when Settings view is open
   createEffect(
-    () => [showDrawer(), pairUrl()] as const,
-    ([visible, url]) => {
-      if (!visible || !url) return;
+    () => [view(), pairUrl()] as const,
+    ([activeView, url]) => {
+      if (activeView !== 'settings' || !url) return;
       QRCode.toDataURL(url, {
         width: 220,
         margin: 2,
@@ -179,7 +189,7 @@ export default function App() {
     },
   );
 
-  // 3. Live WebSocket connection
+  // 3. Live connection
   createEffect(
     () => [roomId(), deviceId(), keyB64()] as const,
     ([rid, did, k]) => {
@@ -231,7 +241,7 @@ export default function App() {
             addOrUpdateMessage(item);
             handleIncomingAction(item);
           } catch {
-            // Ignore malformed or wrong-key frames
+            // Ignore unreadable messages
           }
         };
 
@@ -273,10 +283,8 @@ export default function App() {
       if (autoOpen()) {
         const win = window.open(item.content, '_blank', 'noopener,noreferrer');
         if (!win) {
-          setPopupWarning(
-            'Browser blocked auto-open. Allow Pop-ups & redirects for this site or use the Helium extension.',
-          );
-          notify(`Link from ${from} (pop-up blocked)`);
+          setPopupWarning('Allow pop-ups for this site to open incoming links automatically.');
+          notify(`Link from ${from}`);
         } else {
           setPopupWarning('');
           notify(`Opened link from ${from}`);
@@ -322,11 +330,9 @@ export default function App() {
       });
 
       if (!res.ok) {
-        const err = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(err.error || `Send failed (${res.status})`);
+        throw new Error('Could not send right now');
       }
 
-      const result = (await res.json()) as { wsDelivered: number; pushSent: number };
       const item: StoredMessage = {
         id: envelope.id,
         senderId: did,
@@ -342,20 +348,20 @@ export default function App() {
       await saveMessage(item);
       addOrUpdateMessage(item);
       setDraft('');
-      notify(`Sent (${result.wsDelivered} live, ${result.pushSent} push)`);
+      notify('Pushed!');
     } catch (e) {
-      notify(e instanceof Error ? e.message : 'Failed to send');
+      notify(e instanceof Error ? e.message : 'Could not send');
     } finally {
       setSending(false);
     }
   }
 
   async function saveDeviceName() {
-    const trimmed = nameDraft().trim() || defaultDeviceName(localOs);
+    const trimmed = nameInput().trim() || defaultDeviceName(localOs);
     setDeviceName(trimmed);
-    setEditingName(false);
+    setNameInput(trimmed);
     await kvSet('deviceName', trimmed);
-    notify(`Device named "${trimmed}"`);
+    notify(`Saved as "${trimmed}"`);
   }
 
   async function handleToggleAutoOpen() {
@@ -375,14 +381,14 @@ export default function App() {
       if (pushEnabled()) {
         await unsubscribePush(rid, did);
         setPushEnabled(false);
-        notify('Background push disabled');
+        notify('Notifications turned off');
       } else {
         await subscribePush(rid, did);
         setPushEnabled(true);
-        notify('Background push enabled');
+        notify('Notifications turned on');
       }
-    } catch (e) {
-      notify(e instanceof Error ? e.message : 'Push setup failed');
+    } catch {
+      notify('Notifications are not supported in this browser');
     } finally {
       setPushBusy(false);
     }
@@ -395,7 +401,7 @@ export default function App() {
       raw = decodeURIComponent(raw.split('#key=')[1].split('&')[0]);
     }
     if (!isValidKeyB64(raw)) {
-      notify('Invalid E2EE key');
+      notify('That pair link is not valid');
       return;
     }
     await kvSet('keyB64', raw);
@@ -403,7 +409,7 @@ export default function App() {
     setKeyB64(raw);
     setRoomId(rid);
     setImportInput('');
-    notify('Key imported! Re-enable Push to bind this room.');
+    notify('Devices paired!');
   }
 
   async function handleRotateKey() {
@@ -412,7 +418,7 @@ export default function App() {
     const rid = await deriveRoomId(fresh);
     setKeyB64(fresh);
     setRoomId(rid);
-    notify('Generated new E2EE key — pair your other device');
+    notify('Created a new pairing code');
   }
 
   async function handlePasteAndSend() {
@@ -424,7 +430,7 @@ export default function App() {
       }
       await sendText(clip);
     } catch {
-      notify('Clipboard read denied — paste manually');
+      notify('Paste into the box to send');
     }
   }
 
@@ -433,7 +439,7 @@ export default function App() {
       await navigator.clipboard.writeText(text);
       notify(label);
     } catch {
-      notify('Copy failed');
+      notify('Could not copy');
     }
   }
 
@@ -446,54 +452,42 @@ export default function App() {
             <h1>Push It</h1>
             <div class="status-row">
               <span class={`dot ${wsStatus()}`} />
-              <span class="status-text">
-                {wsStatus() === 'connected' ? 'Live E2EE' : wsStatus()}
-              </span>
-              <span class="room-pill" title="Derived room hash">
-                #{roomId().slice(0, 6)}
-              </span>
+              <span>{statusLabel()}</span>
             </div>
           </div>
         </div>
 
         <div class="topbar-actions">
           <Show
-            when={!editingName()}
+            when={view() === 'chat'}
             fallback={
-              <form
-                class="name-form"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  saveDeviceName();
+              <button
+                class="btn secondary small"
+                onClick={() => {
+                  setView('chat');
+                  scrollToBottom();
                 }}
               >
-                <input
-                  type="text"
-                  maxlength={24}
-                  value={nameDraft()}
-                  onInput={(e) => setNameDraft(e.currentTarget.value)}
-                  onBlur={saveDeviceName}
-                  autofocus
-                />
-              </form>
+                ← Back
+              </button>
             }
           >
             <button
               class="device-pill"
-              title="Click to rename this device"
-              onClick={() => {
-                setNameDraft(deviceName());
-                setEditingName(true);
-              }}
+              title="Device settings"
+              onClick={() => setView('settings')}
             >
               <OsIcon os={localOs} size={14} />
               <span>{deviceName()}</span>
             </button>
+            <button
+              class="btn secondary small"
+              aria-label="Settings"
+              onClick={() => setView('settings')}
+            >
+              Settings
+            </button>
           </Show>
-
-          <button class="btn secondary small" onClick={() => setShowDrawer((v) => !v)}>
-            {showDrawer() ? 'Close' : 'Pair / Settings'}
-          </button>
         </div>
       </header>
 
@@ -501,186 +495,224 @@ export default function App() {
         <div class="toast">{toast()}</div>
       </Show>
 
-      <Show when={popupWarning()}>
+      <Show when={popupWarning() && view() === 'chat'}>
         <div class="banner warning">{popupWarning()}</div>
       </Show>
 
-      <Show when={showDrawer()}>
-        <div class="drawer">
-          <section class="card">
-            <label class="toggle">
-              <div>
-                <strong>Auto-open links</strong>
-                <span class="muted">Opens incoming URLs when this tab is open</span>
+      <Show
+        when={view() === 'chat'}
+        fallback={
+          <main class="settings-page">
+            <section class="card">
+              <h2>This Device</h2>
+              <div class="import-row">
+                <input
+                  type="text"
+                  maxlength={24}
+                  placeholder={defaultDeviceName(localOs)}
+                  value={nameInput()}
+                  onInput={(e) => setNameInput(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      saveDeviceName();
+                    }
+                  }}
+                />
+                <button class="btn primary small" onClick={saveDeviceName}>
+                  Save
+                </button>
               </div>
-              <input type="checkbox" checked={autoOpen()} onChange={handleToggleAutoOpen} />
-            </label>
+            </section>
 
-            <div class="divider" />
+            <section class="card">
+              <h2>Preferences</h2>
+              <label class="toggle">
+                <div>
+                  <strong>Auto-open links</strong>
+                  <span class="muted">Open incoming links automatically while this tab is open</span>
+                </div>
+                <input type="checkbox" checked={autoOpen()} onChange={handleToggleAutoOpen} />
+              </label>
 
-            <div class="toggle">
-              <div>
-                <strong>Background Push Notifications</strong>
-                <span class="muted">
-                  {isPushSupported()
-                    ? 'Decrypts in Service Worker when app is closed'
-                    : 'Not supported in this browser'}
-                </span>
-              </div>
-              <button
-                class={`btn small ${pushEnabled() ? 'success' : 'secondary'}`}
-                disabled={!isPushSupported() || pushBusy()}
-                onClick={handleTogglePush}
-              >
-                {pushBusy() ? '...' : pushEnabled() ? 'Enabled' : 'Enable'}
-              </button>
-            </div>
-          </section>
+              <div class="divider" />
 
-          <section class="card">
-            <div class="row between">
-              <h2>Pair Device</h2>
-              <Show when={messages().length > 0}>
+              <div class="toggle">
+                <div>
+                  <strong>Notifications</strong>
+                  <span class="muted">
+                    {isPushSupported()
+                      ? 'Notify me when the app is closed'
+                      : 'Not available in this browser'}
+                  </span>
+                </div>
                 <button
-                  class="link-btn"
+                  class={`btn small ${pushEnabled() ? 'success' : 'secondary'}`}
+                  disabled={!isPushSupported() || pushBusy()}
+                  onClick={handleTogglePush}
+                >
+                  {pushBusy() ? '...' : pushEnabled() ? 'On' : 'Turn On'}
+                </button>
+              </div>
+            </section>
+
+            <section class="card">
+              <h2>Pair Another Device</h2>
+              <p class="muted">
+                Scan this code on your phone or copy the link into another device.
+              </p>
+              <Show when={qrDataUrl()}>
+                <div class="qr-wrap">
+                  <img src={qrDataUrl()} alt="Pairing QR Code" class="qr-img" />
+                </div>
+              </Show>
+              <div class="row gap">
+                <button
+                  class="btn primary"
+                  onClick={() => copyToClipboard(pairUrl(), 'Pair link copied')}
+                >
+                  Copy Pair Link
+                </button>
+                <button class="btn secondary" onClick={handleRotateKey}>
+                  New Code
+                </button>
+              </div>
+              <div class="import-row">
+                <input
+                  type="text"
+                  placeholder="Paste pair link from another device..."
+                  value={importInput()}
+                  onInput={(e) => setImportInput(e.currentTarget.value)}
+                />
+                <button class="btn secondary" onClick={handleImportKey}>
+                  Pair
+                </button>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="row between">
+                <div>
+                  <strong>Chat History</strong>
+                  <span class="muted">Stored only on this device</span>
+                </div>
+                <button
+                  class="btn secondary small"
+                  disabled={messages().length === 0}
                   onClick={async () => {
                     await clearMessages();
                     setMessages([]);
-                    notify('Cleared local chat history');
+                    notify('History cleared');
                   }}
                 >
-                  Clear Chat
+                  Clear
                 </button>
-              </Show>
-            </div>
-            <p class="muted">
-              Scan this QR code or copy the pair link into another device or the Helium extension.
-            </p>
-            <Show when={qrDataUrl()}>
-              <div class="qr-wrap">
-                <img src={qrDataUrl()} alt="Pairing QR Code" class="qr-img" />
               </div>
-            </Show>
-            <div class="row gap">
-              <button
-                class="btn primary"
-                onClick={() => copyToClipboard(pairUrl(), 'Pair link copied')}
-              >
-                Copy Pair Link
-              </button>
-              <button class="btn secondary" onClick={handleRotateKey}>
-                New Key
-              </button>
-            </div>
-            <div class="import-row">
-              <input
-                type="text"
-                placeholder="Paste pair link or raw key..."
-                value={importInput()}
-                onInput={(e) => setImportInput(e.currentTarget.value)}
-              />
-              <button class="btn secondary" onClick={handleImportKey}>
-                Import
-              </button>
-            </div>
-          </section>
-        </div>
-      </Show>
-
-      <main class="chat-stream">
-        <For
-          each={messages()}
-          fallback={
-            <div class="empty">
-              <p>No messages yet.</p>
-              <p class="muted">
-                Send a link or note below, or share directly from Android’s Share menu.
-              </p>
-            </div>
-          }
-        >
-          {(msg) => {
-            const os = msg.senderOs ?? (msg.direction === 'out' ? localOs : 'other');
-            const label = msg.senderName || (msg.direction === 'out' ? deviceName() : 'Other device');
-            const isLink = msg.type === 'link' && isSafeHttpUrl(msg.content);
-
-            return (
-              <div class={`bubble-row ${msg.direction}`}>
-                <article class={`bubble ${msg.direction}`}>
-                  <div class="bubble-head">
-                    <span class="sender-tag">
-                      <OsIcon os={os} size={13} />
-                      <span>{label}</span>
-                    </span>
-                    <time>{new Date(msg.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
-                  </div>
-                  <Show when={msg.title}>
-                    <div class="bubble-title">{msg.title}</div>
-                  </Show>
-                  <div class="bubble-body">
-                    {isLink ? (
-                      <a href={msg.content} target="_blank" rel="noopener noreferrer">
-                        {msg.content}
-                      </a>
-                    ) : (
-                      <pre>{msg.content}</pre>
-                    )}
-                  </div>
-                  <div class="bubble-actions">
-                    <Show when={isLink}>
-                      <a
-                        class="chip primary"
-                        href={msg.content}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        Open
-                      </a>
-                    </Show>
-                    <button
-                      class="chip"
-                      onClick={() => copyToClipboard(msg.content, 'Copied')}
-                    >
-                      Copy
-                    </button>
-                  </div>
-                </article>
+            </section>
+          </main>
+        }
+      >
+        <main class="chat-stream">
+          <For
+            each={messages()}
+            fallback={
+              <div class="empty">
+                <p>Nothing pushed yet.</p>
+                <p class="muted">
+                  Send a link or note below, or share straight from Android’s Share menu.
+                </p>
               </div>
-            );
-          }}
-        </For>
-        <div ref={chatEndEl} />
-      </main>
-
-      <footer class="composer-bar">
-        <button
-          class="btn secondary icon-btn"
-          title="Paste clipboard & send"
-          disabled={sending()}
-          onClick={handlePasteAndSend}
-        >
-          Paste
-        </button>
-        <textarea
-          rows={1}
-          placeholder="Send a link or encrypted message..."
-          value={draft()}
-          onInput={(e) => setDraft(e.currentTarget.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              sendText(draft());
             }
-          }}
-        />
-        <button
-          class="btn primary"
-          disabled={sending() || !draft().trim()}
-          onClick={() => sendText(draft())}
-        >
-          {sending() ? '...' : 'Send'}
-        </button>
-      </footer>
+          >
+            {(msg) => {
+              const os = msg.senderOs ?? (msg.direction === 'out' ? localOs : 'other');
+              const label =
+                msg.senderName || (msg.direction === 'out' ? deviceName() : 'Other device');
+              const isLink = msg.type === 'link' && isSafeHttpUrl(msg.content);
+
+              return (
+                <div class={`bubble-row ${msg.direction}`}>
+                  <article class={`bubble ${msg.direction}`}>
+                    <div class="bubble-head">
+                      <span class="sender-tag">
+                        <OsIcon os={os} size={13} />
+                        <span>{label}</span>
+                      </span>
+                      <time>
+                        {new Date(msg.ts).toLocaleTimeString([], {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                      </time>
+                    </div>
+                    <Show when={msg.title}>
+                      <div class="bubble-title">{msg.title}</div>
+                    </Show>
+                    <div class="bubble-body">
+                      {isLink ? (
+                        <a href={msg.content} target="_blank" rel="noopener noreferrer">
+                          {msg.content}
+                        </a>
+                      ) : (
+                        <pre>{msg.content}</pre>
+                      )}
+                    </div>
+                    <div class="bubble-actions">
+                      <Show when={isLink}>
+                        <a
+                          class="chip primary"
+                          href={msg.content}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          Open
+                        </a>
+                      </Show>
+                      <button
+                        class="chip"
+                        onClick={() => copyToClipboard(msg.content, 'Copied')}
+                      >
+                        Copy
+                      </button>
+                    </div>
+                  </article>
+                </div>
+              );
+            }}
+          </For>
+          <div ref={chatEndEl} />
+        </main>
+
+        <footer class="composer-bar">
+          <button
+            class="btn secondary icon-btn"
+            title="Paste clipboard and push"
+            disabled={sending()}
+            onClick={handlePasteAndSend}
+          >
+            Paste
+          </button>
+          <textarea
+            rows={1}
+            placeholder="Paste a link or note..."
+            value={draft()}
+            onInput={(e) => setDraft(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendText(draft());
+              }
+            }}
+          />
+          <button
+            class="btn primary"
+            disabled={sending() || !draft().trim()}
+            onClick={() => sendText(draft())}
+          >
+            {sending() ? '...' : 'Push It'}
+          </button>
+        </footer>
+      </Show>
     </div>
   );
 }

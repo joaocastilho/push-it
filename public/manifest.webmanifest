@@ -1,7 +1,7 @@
 {
-  "name": "Push It — E2EE Relay",
+  "name": "Push It",
   "short_name": "Push It",
-  "description": "End-to-end encrypted links & text between Android and Windows",
+  "description": "Send links and notes privately between your devices",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

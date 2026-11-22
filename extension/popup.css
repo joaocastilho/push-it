@@ -188,7 +188,14 @@ input[type='text'] {
 }
 
 .hidden {
-  display: none;
+  display: none !important;
+}
+
+.settings-view,
+.chat-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .feed-head {

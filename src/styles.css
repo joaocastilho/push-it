@@ -178,16 +178,13 @@ h2 {
   font-size: 0.82rem;
 }
 
-.drawer {
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--border);
-  background: #0e1424;
+.settings-page {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  max-height: 68dvh;
-  overflow-y: auto;
-  flex-shrink: 0;
+  gap: 12px;
 }
 
 .card {

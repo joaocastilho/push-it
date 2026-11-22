@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Push It — E2EE Relay",
-  "version": "1.0.0",
-  "description": "Receive E2EE links and texts automatically in Helium and push tabs to Android.",
+  "name": "Push It",
+  "version": "1.1.0",
+  "description": "Send links and notes privately between your devices.",
   "icons": {
     "128": "icon128.png"
   },

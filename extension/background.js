@@ -185,7 +185,7 @@ async function handleIncoming(item, autoOpen) {
     iconUrl: 'icon128.png',
     title: isLink
       ? `${fromPrefix}${item.title || 'New Link — Click to Open'}`
-      : `${fromPrefix}${item.title || 'New Encrypted Text'}`,
+      : `${fromPrefix}${item.title || 'New Message'}`,
     message: item.content.slice(0, 200),
     priority: 2,
   });
@@ -238,7 +238,7 @@ function setupContextMenus() {
   chrome.contextMenus.removeAll(() => {
     chrome.contextMenus.create({
       id: 'push-it-send',
-      title: 'Send to Push It (E2EE)',
+      title: 'Push It',
       contexts: ['page', 'link', 'selection'],
     });
   });

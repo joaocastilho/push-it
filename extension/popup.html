@@ -19,41 +19,52 @@
           </div>
         </div>
         <div class="header-actions">
-          <button id="devicePill" class="device-pill" title="Click to rename device"></button>
-          <input id="deviceNameInput" class="name-input hidden" type="text" maxlength="24" />
-          <button id="toggleSetup" class="btn secondary small">Pair</button>
+          <button id="devicePill" class="device-pill" title="Settings"></button>
+          <button id="toggleSettings" class="btn secondary small">Settings</button>
         </div>
       </header>
 
       <div id="toast" class="toast hidden"></div>
 
-      <section id="setupBox" class="card hidden">
-        <label class="label" for="pairInput">Paste Pair Link from Push It web app</label>
-        <input
-          id="pairInput"
-          type="text"
-          placeholder="https://push-it...workers.dev/#key=..."
-        />
-        <button id="savePair" class="btn primary">Save &amp; Connect</button>
-        <label class="toggle">
-          <span>Auto-open incoming links</span>
-          <input id="autoOpen" type="checkbox" checked />
-        </label>
-      </section>
-
-      <section class="feed">
-        <div class="feed-head">
-          <span>Chat</span>
-          <button id="clearBtn" class="link-btn">Clear</button>
+      <section id="settingsView" class="settings-view hidden">
+        <div class="card">
+          <label class="label" for="deviceNameInput">This Device</label>
+          <div class="compose-row">
+            <input id="deviceNameInput" type="text" maxlength="24" />
+            <button id="saveNameBtn" class="btn primary small">Save</button>
+          </div>
         </div>
-        <div id="historyList" class="history"></div>
+
+        <div class="card">
+          <label class="toggle">
+            <span>Auto-open incoming links</span>
+            <input id="autoOpen" type="checkbox" checked />
+          </label>
+        </div>
+
+        <div class="card">
+          <label class="label" for="pairInput">Pair with Push It</label>
+          <input id="pairInput" type="text" placeholder="Paste pair link here..." />
+          <button id="savePair" class="btn primary">Save &amp; Connect</button>
+        </div>
+
+        <div class="card">
+          <div class="toggle">
+            <span>Chat history</span>
+            <button id="clearBtn" class="btn secondary small">Clear</button>
+          </div>
+        </div>
       </section>
 
-      <section class="composer">
-        <button id="sendTab" class="btn primary full">Send Current Tab</button>
-        <div class="compose-row">
-          <input id="draft" type="text" placeholder="Send link or message..." />
-          <button id="sendDraft" class="btn secondary">Send</button>
+      <section id="chatView" class="chat-view">
+        <div id="historyList" class="history"></div>
+
+        <div class="composer">
+          <button id="sendTab" class="btn primary full">Push This Tab</button>
+          <div class="compose-row">
+            <input id="draft" type="text" placeholder="Paste a link or note..." />
+            <button id="sendDraft" class="btn secondary">Push It</button>
+          </div>
         </div>
       </section>
     </div>
