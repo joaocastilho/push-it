@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Push It</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="header">
+        <div class="title-row">
+          <img src="icon128.png" alt="" class="icon" />
+          <div>
+            <h1>Push It</h1>
+            <div class="status-row">
+              <span id="statusDot" class="dot"></span>
+              <span id="statusText">Not paired</span>
+            </div>
+          </div>
+        </div>
+        <button id="toggleSetup" class="btn secondary small">Pair</button>
+      </header>
+
+      <div id="toast" class="toast hidden"></div>
+
+      <section id="setupBox" class="card hidden">
+        <label class="label" for="pairInput">Paste Pair Link from Push It web app</label>
+        <input
+          id="pairInput"
+          type="text"
+          placeholder="https://push-it...workers.dev/#key=..."
+        />
+        <button id="savePair" class="btn primary">Save &amp; Connect</button>
+      </section>
+
+      <section class="card">
+        <label class="toggle">
+          <span>Auto-open incoming links</span>
+          <input id="autoOpen" type="checkbox" checked />
+        </label>
+      </section>
+
+      <section class="card">
+        <button id="sendTab" class="btn primary full">Send Current Tab to Android</button>
+        <textarea id="draft" rows="2" placeholder="Or type a link / text..."></textarea>
+        <button id="sendDraft" class="btn secondary full">Send Text / Link</button>
+      </section>
+
+      <section class="feed">
+        <div class="feed-head">
+          <span>Recent</span>
+          <button id="clearBtn" class="link-btn">Clear</button>
+        </div>
+        <div id="historyList" class="history"></div>
+      </section>
+    </div>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

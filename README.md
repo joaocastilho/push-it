@@ -1,58 +1,31 @@
 # Push It
 
-End-to-end encrypted (E2EE) link & text relay between **Android** and **Windows**, built as a **SolidJS 2.0 + Vite 8 + Bun** PWA hosted 100% on **Cloudflare Workers + Durable Objects**.
+End-to-end encrypted (E2EE) link and text relay between **Android** and **Windows**, powered by a **SolidJS 2.0 + Vite 8 + Bun** PWA, a **Cloudflare Workers + Durable Objects** backend, and a **Manifest V3 Chromium/Helium extension**.
 
-Nothing runs on your local machine—once deployed, both the PWA and the WebSocket/Web Push relay run on Cloudflare's edge.
+## What It Does
 
-## Features
+- **Client-Side E2EE (`AES-GCM` 256-bit):** Encrypts and decrypts links and text locally using the Web Crypto API. The symmetric key is shared via a QR code / URL fragment (`#key=...`) and never leaves your devices.
+- **Zero-Knowledge Routing:** Derives a one-way `SHA-256` room ID from the key so Cloudflare Workers only route opaque room hashes and ciphertext.
+- **Android PWA + Share Sheet:** Installable PWA with Web Share Target (`/share`) so links can be shared directly from any Android app, plus background Web Push notifications decrypted inside the Service Worker (`public/sw.js`).
+- **Helium / Chromium Extension (`extension/`):** Connects to the room over WebSocket in the background, automatically opens incoming links in new tabs via `chrome.tabs.create`, displays native OS notifications without Google FCM, and sends the active tab or right-clicked links/text to Android.
+- **Auto-Generated VAPID Keys:** The Durable Object (`worker/room-do.ts`) automatically generates and persists a P-256 VAPID keypair in Durable Object storage on first use.
 
-- **Zero-Knowledge E2EE (`AES-GCM` 256-bit):** Uses the browser's native Web Crypto API. The symmetric key is shared via QR code in the URL fragment (`#key=...`), which is never sent to the server.
-- **One-Way Room Routing:** The server only sees `SHA-256("push-it-room-v1:" + key)` as the room ID and opaque ciphertext envelopes.
-- **Auto-Open Links on Windows:** While the PWA tab is open, incoming links arrive over a hibernating WebSocket and open immediately in a new tab (once you allow pop-ups for the site).
-- **Background Web Push Notifications:** When the app is closed on Android or Windows, the Service Worker wakes up, reads the AES key from IndexedDB, decrypts the message locally, and shows a notification. Tapping a link notification opens the URL directly.
-- **Android Share Sheet Integration:** Installing the PWA on Android registers it as a native Share Target (`/share`), letting you push links from any app in 2 taps.
-- **Zero-Config VAPID Keys:** On first request, the Worker automatically generates and persists its own P-256 VAPID keypair in Durable Object storage (no local scripts or manual secrets required).
+## Project Structure
 
-## Architecture
-
-```text
-Android (PWA / Share Sheet)
-  ──[Encrypt with AES-GCM key in IndexedDB]──▶
-Cloudflare Worker + Durable Object (sees only roomId hash + ciphertext)
-  ├── Open tab (Windows)   ──▶ WebSocket (Hibernation API) ──▶ Decrypt ──▶ window.open(url)
-  └── Closed / Background  ──▶ Web Push (RFC 8291) ──▶ Service Worker ──▶ Decrypt ──▶ Notification
-```
-
-## Tech Stack
-
-- **Frontend:** SolidJS 2.0 (`solid-js`, `@solidjs/web`), Vite 8 (`@solidjs/vite-plugin`), Bun
-- **Backend:** Cloudflare Workers Static Assets + Durable Objects (SQLite storage + WebSocket Hibernation)
-- **Web Push:** `@block65/webcrypto-web-push` (pure Web Crypto, zero Node polyfills)
+- `src/` — SolidJS 2.0 PWA frontend (`crypto.ts`, `db.ts`, `push.ts`, `App.tsx`)
+- `public/` — PWA manifest (`manifest.webmanifest`), Service Worker (`sw.js`), and icons
+- `worker/` — Cloudflare Worker (`index.ts`) and Durable Object (`room-do.ts`) with WebSocket Hibernation and RFC 8291 Web Push fan-out
+- `extension/` — Unpacked Manifest V3 extension for Helium / Chromium browsers
 
 ## Deploy to Cloudflare Workers
 
-### Option 1: Zero-Local Git Auto-Deploy (Cloudflare Dashboard)
+1. Connect this repository in **Cloudflare Dashboard → Workers & Pages → Create → Import a repository**.
+2. Set **Build command** to `bun install && bun run build` and **Deploy command** to `bunx wrangler deploy`.
+3. Deploy.
 
-1. Push this repository to GitHub.
-2. Open **Cloudflare Dashboard → Workers & Pages → Create → Import a repository**.
-3. Configure:
-   - **Build command:** `bun install && bun run build`
-   - **Deploy command:** `bunx wrangler deploy`
-4. Deploy! VAPID keys are generated automatically on Cloudflare on first boot.
+## Install the Helium Extension
 
-### Option 2: Deploy via Wrangler CLI
-
-```bash
-bun install
-bun run deploy
-```
-
-*(Optional)* If you prefer to supply your own VAPID keys instead of auto-generated ones, run `bun run gen:vapid` and set `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, and `VAPID_SUBJECT` as Worker secrets.
-
-## Pairing Android & Windows
-
-1. Open your deployed `https://push-it.<your-subdomain>.workers.dev` URL on Windows.
-2. Click **Pair Device** and scan the QR code with your Android phone.
-3. Click **Enable Push** on both devices to allow background notifications.
-4. **Android:** Tap browser menu → **Add to Home screen / Install app** to enable the native Share menu target.
-5. **Windows:** Allow **Pop-ups and redirects** for your Worker URL if you want incoming links to open automatically while the tab is open.
+1. Open `chrome://extensions` in Helium.
+2. Enable **Developer mode** (top right).
+3. Click **Load unpacked** and select the `extension` folder from this repository.
+4. Open your deployed Push It URL, click **Pair Device → Copy Pair Link**, then click the **Push It** extension icon in Helium, paste the pair link, and click **Save & Connect**.

@@ -1,0 +1,79 @@
+export function toBase64Url(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export function fromBase64Url(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const std = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(std);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+export function isValidKeyB64(keyB64) {
+  try {
+    return fromBase64Url(keyB64.trim()).length === 32;
+  } catch {
+    return false;
+  }
+}
+
+export async function deriveRoomId(keyB64) {
+  const data = new TextEncoder().encode(`push-it-room-v1:${keyB64}`);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  return toBase64Url(hash).slice(0, 24);
+}
+
+export async function importAesKey(keyB64) {
+  const raw = fromBase64Url(keyB64);
+  if (raw.length !== 32) throw new Error('Key must be 256 bits');
+  return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+export async function encryptPayload(keyB64, senderId, payload) {
+  const key = await importAesKey(keyB64);
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const plain = new TextEncoder().encode(JSON.stringify(payload));
+  const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
+  return {
+    id: crypto.randomUUID(),
+    senderId,
+    iv: toBase64Url(iv),
+    ciphertext: toBase64Url(new Uint8Array(cipher)),
+    ts: Date.now(),
+  };
+}
+
+export async function decryptEnvelope(keyB64, envelope) {
+  const key = await importAesKey(keyB64);
+  const iv = fromBase64Url(envelope.iv);
+  const ciphertext = fromBase64Url(envelope.ciphertext);
+  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  const parsed = JSON.parse(new TextDecoder().decode(plainBuf));
+  return {
+    type: parsed.type === 'link' ? 'link' : 'text',
+    content: String(parsed.content ?? ''),
+    title: parsed.title ? String(parsed.title) : undefined,
+  };
+}
+
+export function isSafeHttpUrl(input) {
+  try {
+    const u = new URL(String(input).trim());
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+export function detectPayloadType(input) {
+  const trimmed = String(input).trim();
+  if (!trimmed.includes('\n') && !trimmed.includes(' ') && isSafeHttpUrl(trimmed)) {
+    return 'link';
+  }
+  return 'text';
+}
