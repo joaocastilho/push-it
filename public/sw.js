@@ -1,4 +1,4 @@
-// Push It Service Worker — decrypts E2EE Web Push payloads using key stored in IndexedDB
+// Push It Service Worker — E2EE Web Push decrypt + silent Android Share Target handler
 
 const DB_NAME = 'push-it-db';
 const DB_VERSION = 1;
@@ -48,6 +48,12 @@ async function saveMessage(msg) {
   });
 }
 
+function toBase64Url(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 function fromBase64Url(b64) {
   const pad = '='.repeat((4 - (b64.length % 4)) % 4);
   const std = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/');
@@ -55,6 +61,28 @@ function fromBase64Url(b64) {
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
+}
+
+async function deriveRoomId(keyB64) {
+  const data = new TextEncoder().encode(`push-it-room-v1:${keyB64}`);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  return toBase64Url(hash).slice(0, 24);
+}
+
+async function encryptPayload(keyB64, senderId, payload) {
+  const rawKey = fromBase64Url(keyB64);
+  const key = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt']);
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const plainBytes = new TextEncoder().encode(JSON.stringify(payload));
+  const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plainBytes);
+  return {
+    id: crypto.randomUUID(),
+    senderId,
+    iv: toBase64Url(iv),
+    ciphertext: toBase64Url(new Uint8Array(cipherBuf)),
+    ts: Date.now(),
+  };
 }
 
 async function decryptEnvelope(keyB64, envelope) {
@@ -69,11 +97,128 @@ async function decryptEnvelope(keyB64, envelope) {
 
 function isSafeHttpUrl(str) {
   try {
-    const u = new URL(str);
+    const u = new URL(String(str).trim());
     return u.protocol === 'http:' || u.protocol === 'https:';
   } catch {
     return false;
   }
+}
+
+function detectPayloadType(input) {
+  const trimmed = String(input).trim();
+  if (!trimmed.includes('\n') && !trimmed.includes(' ') && isSafeHttpUrl(trimmed)) {
+    return 'link';
+  }
+  return 'text';
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+// Intercept Android Share Target (/share?...) directly in SW so it sends immediately
+// and auto-closes without loading or showing the full PWA UI.
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  if (event.request.method === 'GET' && url.pathname === '/share') {
+    event.respondWith(handleSilentShare(url));
+  }
+});
+
+async function handleSilentShare(url) {
+  const sharedUrl = (url.searchParams.get('url') || '').trim();
+  const sharedText = (url.searchParams.get('text') || '').trim();
+  const sharedTitle = (url.searchParams.get('title') || '').trim() || undefined;
+  const content = sharedUrl || sharedText;
+
+  let statusMsg = 'Sent';
+  let ok = false;
+
+  try {
+    const [keyB64, deviceId, deviceName, deviceOs] = await Promise.all([
+      kvGet('keyB64'),
+      kvGet('deviceId'),
+      kvGet('deviceName'),
+      kvGet('deviceOs'),
+    ]);
+
+    if (!keyB64 || !deviceId) {
+      return Response.redirect('/', 302);
+    }
+
+    if (content) {
+      const roomId = await deriveRoomId(keyB64);
+      const type = detectPayloadType(content);
+      const senderName = deviceName || 'Android';
+      const senderOs = deviceOs || 'android';
+
+      const envelope = await encryptPayload(keyB64, deviceId, {
+        type,
+        content,
+        title: sharedTitle,
+        senderName,
+        senderOs,
+      });
+
+      const res = await fetch(`/api/room/${encodeURIComponent(roomId)}/send`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(envelope),
+      });
+
+      if (res.ok) {
+        ok = true;
+        const item = {
+          id: envelope.id,
+          senderId: deviceId,
+          senderName,
+          senderOs,
+          ts: envelope.ts,
+          type,
+          content,
+          title: sharedTitle,
+          direction: 'out',
+        };
+        await saveMessage(item);
+
+        const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+        for (const c of clients) {
+          c.postMessage({ type: 'PUSH_RECEIVED', item });
+        }
+      } else {
+        statusMsg = `Failed (${res.status})`;
+      }
+    }
+  } catch {
+    statusMsg = 'Send failed';
+  }
+
+  const html = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<meta name="theme-color" content="#0b0f19" />
+<style>
+  body{margin:0;min-height:100dvh;display:grid;place-items:center;background:#0b0f19;color:#eef2ff;font:600 16px/1.4 system-ui,sans-serif}
+  .pill{padding:12px 20px;border-radius:999px;background:#131a2a;border:1px solid ${ok ? '#10b981' : '#f59e0b'}}
+</style>
+</head>
+<body>
+  <div class="pill">${ok ? '✓ Sent E2EE' : escapeHtml(statusMsg)}</div>
+  <script>
+    window.close();
+    setTimeout(() => { window.close(); if (history.length > 1) history.back(); }, 250);
+  </script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' },
+  });
 }
 
 self.addEventListener('push', (event) => {
@@ -115,6 +260,8 @@ async function handlePush(event) {
   const item = {
     id: envelope.id,
     senderId: envelope.senderId,
+    senderName: payload.senderName ? String(payload.senderName) : undefined,
+    senderOs: payload.senderOs ? String(payload.senderOs) : undefined,
     ts: envelope.ts || Date.now(),
     type: payload.type === 'link' ? 'link' : 'text',
     content: String(payload.content || ''),
@@ -129,19 +276,18 @@ async function handlePush(event) {
     includeUncontrolled: true,
   });
 
-  // Notify any open tabs so their UI updates immediately
   for (const client of windowClients) {
     client.postMessage({ type: 'PUSH_RECEIVED', item });
   }
 
-  // If a tab is already open & visible, skip duplicate OS toast
   const hasVisibleClient = windowClients.some((c) => c.visibilityState === 'visible');
   if (hasVisibleClient) return;
 
   const isLink = item.type === 'link' && isSafeHttpUrl(item.content);
+  const fromPrefix = item.senderName ? `${item.senderName} · ` : '';
   const notifTitle = isLink
-    ? item.title || 'New Link — Tap to Open'
-    : item.title || 'New Encrypted Text';
+    ? `${fromPrefix}${item.title || 'New Link — Tap to Open'}`
+    : `${fromPrefix}${item.title || 'New Encrypted Text'}`;
 
   await self.registration.showNotification(notifTitle, {
     body: item.content.slice(0, 180),

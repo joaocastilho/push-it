@@ -1,7 +1,11 @@
+import { normalizeOs, type DeviceOs } from './device';
+
 export interface DecryptedPayload {
   type: 'link' | 'text';
   content: string;
   title?: string;
+  senderName?: string;
+  senderOs?: DeviceOs;
 }
 
 export interface EncryptedEnvelope {
@@ -95,6 +99,8 @@ export async function decryptEnvelope(
     type: parsed.type === 'link' ? 'link' : 'text',
     content: String(parsed.content ?? ''),
     title: parsed.title ? String(parsed.title) : undefined,
+    senderName: parsed.senderName ? String(parsed.senderName) : undefined,
+    senderOs: parsed.senderOs ? normalizeOs(parsed.senderOs) : undefined,
   };
 }
 

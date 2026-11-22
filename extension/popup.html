@@ -18,7 +18,11 @@
             </div>
           </div>
         </div>
-        <button id="toggleSetup" class="btn secondary small">Pair</button>
+        <div class="header-actions">
+          <button id="devicePill" class="device-pill" title="Click to rename device"></button>
+          <input id="deviceNameInput" class="name-input hidden" type="text" maxlength="24" />
+          <button id="toggleSetup" class="btn secondary small">Pair</button>
+        </div>
       </header>
 
       <div id="toast" class="toast hidden"></div>
@@ -31,27 +35,26 @@
           placeholder="https://push-it...workers.dev/#key=..."
         />
         <button id="savePair" class="btn primary">Save &amp; Connect</button>
-      </section>
-
-      <section class="card">
         <label class="toggle">
           <span>Auto-open incoming links</span>
           <input id="autoOpen" type="checkbox" checked />
         </label>
       </section>
 
-      <section class="card">
-        <button id="sendTab" class="btn primary full">Send Current Tab to Android</button>
-        <textarea id="draft" rows="2" placeholder="Or type a link / text..."></textarea>
-        <button id="sendDraft" class="btn secondary full">Send Text / Link</button>
-      </section>
-
       <section class="feed">
         <div class="feed-head">
-          <span>Recent</span>
+          <span>Chat</span>
           <button id="clearBtn" class="link-btn">Clear</button>
         </div>
         <div id="historyList" class="history"></div>
+      </section>
+
+      <section class="composer">
+        <button id="sendTab" class="btn primary full">Send Current Tab</button>
+        <div class="compose-row">
+          <input id="draft" type="text" placeholder="Send link or message..." />
+          <button id="sendDraft" class="btn secondary">Send</button>
+        </div>
       </section>
     </div>
     <script type="module" src="popup.js"></script>

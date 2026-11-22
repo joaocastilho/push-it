@@ -1,6 +1,10 @@
+import type { DeviceOs } from './device';
+
 export interface StoredMessage {
   id: string;
   senderId: string;
+  senderName?: string;
+  senderOs?: DeviceOs;
   ts: number;
   type: 'link' | 'text';
   content: string;
@@ -58,15 +62,16 @@ export async function saveMessage(msg: StoredMessage): Promise<void> {
   });
 }
 
-export async function listMessages(limit = 50): Promise<StoredMessage[]> {
+export async function listMessages(limit = 60): Promise<StoredMessage[]> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction('messages', 'readonly');
     const req = tx.objectStore('messages').getAll();
     req.onsuccess = () => {
       const all = (req.result as StoredMessage[]) || [];
-      all.sort((a, b) => b.ts - a.ts);
-      resolve(all.slice(0, limit));
+      // Chronological chat order: oldest -> newest
+      all.sort((a, b) => a.ts - b.ts);
+      resolve(all.slice(-limit));
     };
     req.onerror = () => reject(req.error);
   });

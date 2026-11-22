@@ -1,13 +1,16 @@
 import {
   decryptEnvelope,
+  defaultDeviceName,
   deriveRoomId,
+  detectOs,
   detectPayloadType,
   encryptPayload,
   isSafeHttpUrl,
 } from './crypto.js';
 
 const KEEPALIVE_ALARM = 'push-it-keepalive';
-const MAX_HISTORY = 30;
+const MAX_HISTORY = 40;
+const LOCAL_OS = detectOs();
 
 let ws = null;
 let pingTimer = null;
@@ -20,6 +23,7 @@ async function getConfig() {
     'serverUrl',
     'keyB64',
     'deviceId',
+    'deviceName',
     'autoOpen',
     'history',
   ]);
@@ -28,10 +32,17 @@ async function getConfig() {
     deviceId = crypto.randomUUID();
     await chrome.storage.local.set({ deviceId });
   }
+  let deviceName = data.deviceName;
+  if (!deviceName) {
+    deviceName = defaultDeviceName(LOCAL_OS);
+    await chrome.storage.local.set({ deviceName });
+  }
   return {
     serverUrl: data.serverUrl || '',
     keyB64: data.keyB64 || '',
     deviceId,
+    deviceName,
+    deviceOs: LOCAL_OS,
     autoOpen: typeof data.autoOpen === 'boolean' ? data.autoOpen : true,
     history: Array.isArray(data.history) ? data.history : [],
   };
@@ -48,7 +59,8 @@ function setStatus(status) {
 async function appendHistory(item) {
   const { history } = await getConfig();
   if (history.some((m) => m.id === item.id)) return;
-  const next = [item, ...history].slice(0, MAX_HISTORY);
+  // Chronological chat order: oldest -> newest
+  const next = [...history, item].slice(-MAX_HISTORY);
   await chrome.storage.local.set({ history: next });
 }
 
@@ -119,6 +131,8 @@ async function connect() {
         const item = {
           id: parsed.envelope.id,
           senderId: parsed.envelope.senderId,
+          senderName: decrypted.senderName,
+          senderOs: decrypted.senderOs,
           ts: parsed.envelope.ts || Date.now(),
           type: decrypted.type,
           content: decrypted.content,
@@ -165,10 +179,13 @@ async function handleIncoming(item, autoOpen) {
     notifUrls.set(notifId, item.content);
   }
 
+  const fromPrefix = item.senderName ? `${item.senderName} · ` : '';
   chrome.notifications.create(notifId, {
     type: 'basic',
     iconUrl: 'icon128.png',
-    title: isLink ? item.title || 'New Link — Click to Open' : item.title || 'New Encrypted Text',
+    title: isLink
+      ? `${fromPrefix}${item.title || 'New Link — Click to Open'}`
+      : `${fromPrefix}${item.title || 'New Encrypted Text'}`,
     message: item.content.slice(0, 200),
     priority: 2,
   });
@@ -176,13 +193,19 @@ async function handleIncoming(item, autoOpen) {
 
 async function sendContent(rawContent, title) {
   const content = String(rawContent || '').trim();
-  const { serverUrl, keyB64, deviceId } = await getConfig();
+  const { serverUrl, keyB64, deviceId, deviceName, deviceOs } = await getConfig();
   if (!content) throw new Error('Nothing to send');
   if (!serverUrl || !keyB64) throw new Error('Pair the extension first');
 
   const roomId = await deriveRoomId(keyB64);
   const type = detectPayloadType(content);
-  const envelope = await encryptPayload(keyB64, deviceId, { type, content, title });
+  const envelope = await encryptPayload(keyB64, deviceId, {
+    type,
+    content,
+    title,
+    senderName: deviceName,
+    senderOs: deviceOs,
+  });
 
   const base = new URL(serverUrl);
   const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/send`, {
@@ -200,6 +223,8 @@ async function sendContent(rawContent, title) {
   await appendHistory({
     id: envelope.id,
     senderId: deviceId,
+    senderName: deviceName,
+    senderOs: deviceOs,
     ts: envelope.ts,
     type,
     content,
@@ -269,6 +294,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         status: wsStatus,
         paired: Boolean(cfg.serverUrl && cfg.keyB64),
         serverUrl: cfg.serverUrl,
+        deviceName: cfg.deviceName,
+        deviceOs: cfg.deviceOs,
         autoOpen: cfg.autoOpen,
         history: cfg.history,
       });

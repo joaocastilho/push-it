@@ -1,3 +1,43 @@
+export function detectOs() {
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  if (/Android/i.test(ua)) return 'android';
+  if (/iPhone|iPad|iPod/i.test(ua)) return 'ios';
+  if (/Windows/i.test(ua)) return 'windows';
+  if (/Macintosh|Mac OS X/i.test(ua)) return 'macos';
+  if (/Linux/i.test(ua)) return 'linux';
+  return 'other';
+}
+
+export function defaultDeviceName(os) {
+  switch (os) {
+    case 'android':
+      return 'Android';
+    case 'windows':
+      return 'Windows';
+    case 'macos':
+      return 'macOS';
+    case 'ios':
+      return 'iOS';
+    case 'linux':
+      return 'Linux';
+    default:
+      return 'Device';
+  }
+}
+
+export function normalizeOs(value) {
+  if (
+    value === 'android' ||
+    value === 'windows' ||
+    value === 'macos' ||
+    value === 'ios' ||
+    value === 'linux'
+  ) {
+    return value;
+  }
+  return 'other';
+}
+
 export function toBase64Url(bytes) {
   let bin = '';
   for (const b of bytes) bin += String.fromCharCode(b);
@@ -58,6 +98,8 @@ export async function decryptEnvelope(keyB64, envelope) {
     type: parsed.type === 'link' ? 'link' : 'text',
     content: String(parsed.content ?? ''),
     title: parsed.title ? String(parsed.title) : undefined,
+    senderName: parsed.senderName ? String(parsed.senderName) : undefined,
+    senderOs: parsed.senderOs ? normalizeOs(parsed.senderOs) : undefined,
   };
 }
 
