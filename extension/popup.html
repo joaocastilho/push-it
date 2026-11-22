@@ -28,10 +28,15 @@
 
       <section id="settingsView" class="settings-view hidden">
         <div class="card">
-          <label class="label" for="deviceNameInput">This Device</label>
-          <div class="compose-row">
-            <input id="deviceNameInput" type="text" maxlength="24" />
-            <button id="saveNameBtn" class="btn primary small">Save</button>
+          <div class="toggle">
+            <strong id="devicesHeading">Devices</strong>
+            <button id="togglePairBtn" class="btn primary small">+ Pair</button>
+          </div>
+          <div id="deviceList" class="device-list"></div>
+          <div id="pairBox" class="pair-box hidden">
+            <label class="label" for="pairInput">Paste pair link from Push It</label>
+            <input id="pairInput" type="text" placeholder="Paste pair link here..." />
+            <button id="savePair" class="btn primary">Save &amp; Connect</button>
           </div>
         </div>
 
@@ -40,12 +45,6 @@
             <span>Auto-open incoming links</span>
             <input id="autoOpen" type="checkbox" checked />
           </label>
-        </div>
-
-        <div class="card">
-          <label class="label" for="pairInput">Pair with Push It</label>
-          <input id="pairInput" type="text" placeholder="Paste pair link here..." />
-          <button id="savePair" class="btn primary">Save &amp; Connect</button>
         </div>
 
         <div class="card">
@@ -58,6 +57,8 @@
 
       <section id="chatView" class="chat-view">
         <div id="historyList" class="history"></div>
+
+        <div id="targetBar" class="target-bar hidden"></div>
 
         <div class="composer">
           <button id="sendTab" class="btn primary full">Push This Tab</button>

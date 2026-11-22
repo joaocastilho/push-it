@@ -38,6 +38,16 @@ async function kvGet(key) {
   });
 }
 
+async function kvSet(key, value) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('kv', 'readwrite');
+    tx.objectStore('kv').put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 async function saveMessage(msg) {
   const db = await openDb();
   return new Promise((resolve, reject) => {
@@ -262,6 +272,9 @@ async function handlePush(event) {
     senderId: envelope.senderId,
     senderName: payload.senderName ? String(payload.senderName) : undefined,
     senderOs: payload.senderOs ? String(payload.senderOs) : undefined,
+    targetNames: Array.isArray(payload.targetNames)
+      ? payload.targetNames.map((n) => String(n))
+      : undefined,
     ts: envelope.ts || Date.now(),
     type: payload.type === 'link' ? 'link' : 'text',
     content: String(payload.content || ''),
@@ -270,6 +283,10 @@ async function handlePush(event) {
   };
 
   await saveMessage(item);
+  const prevLastSeen = (await kvGet('lastSeenTs')) || 0;
+  if (item.ts > prevLastSeen) {
+    await kvSet('lastSeenTs', item.ts);
+  }
 
   const windowClients = await self.clients.matchAll({
     type: 'window',
@@ -282,6 +299,12 @@ async function handlePush(event) {
 
   const hasVisibleClient = windowClients.some((c) => c.visibilityState === 'visible');
   if (hasVisibleClient) return;
+
+  const nextUnread = ((await kvGet('unreadCount')) || 0) + 1;
+  await kvSet('unreadCount', nextUnread);
+  if (self.navigator && typeof self.navigator.setAppBadge === 'function') {
+    await self.navigator.setAppBadge(nextUnread).catch(() => {});
+  }
 
   const isLink = item.type === 'link' && isSafeHttpUrl(item.content);
   const fromPrefix = item.senderName ? `${item.senderName} · ` : '';

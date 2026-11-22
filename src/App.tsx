@@ -3,12 +3,15 @@ import QRCode from 'qrcode';
 import { OsIcon } from './components/OsIcon';
 import {
   decryptEnvelope,
+  decryptJson,
   deriveRoomId,
   detectPayloadType,
+  encryptJson,
   encryptPayload,
   generateRawKeyB64,
   isSafeHttpUrl,
   isValidKeyB64,
+  type DeviceMeta,
   type EncryptedEnvelope,
 } from './lib/crypto';
 import {
@@ -19,7 +22,7 @@ import {
   saveMessage,
   type StoredMessage,
 } from './lib/db';
-import { defaultDeviceName, detectOs, type DeviceOs } from './lib/device';
+import { defaultDeviceName, detectOs, normalizeOs, type DeviceOs } from './lib/device';
 import {
   getCurrentPushSubscription,
   isPushSupported,
@@ -28,15 +31,28 @@ import {
   unsubscribePush,
 } from './lib/push';
 
+interface PairedDevice {
+  deviceId: string;
+  name: string;
+  os: DeviceOs;
+  online: boolean;
+  updatedAt: number;
+}
+
 export default function App() {
   const localOs: DeviceOs = detectOs();
 
   const [view, setView] = createSignal<'chat' | 'settings'>('chat');
+  const [showAddDevice, setShowAddDevice] = createSignal<boolean>(false);
   const [keyB64, setKeyB64] = createSignal<string>('');
   const [roomId, setRoomId] = createSignal<string>('');
   const [deviceId, setDeviceId] = createSignal<string>('');
   const [deviceName, setDeviceName] = createSignal<string>(defaultDeviceName(localOs));
-  const [nameInput, setNameInput] = createSignal<string>(defaultDeviceName(localOs));
+
+  const [devices, setDevices] = createSignal<PairedDevice[]>([]);
+  const [selectedTargets, setSelectedTargets] = createSignal<string[]>([]);
+  const [editingDeviceId, setEditingDeviceId] = createSignal<string | null>(null);
+  const [editDeviceDraft, setEditDeviceDraft] = createSignal<string>('');
 
   const [messages, setMessages] = createSignal<StoredMessage[]>([]);
   const [draft, setDraft] = createSignal<string>('');
@@ -49,6 +65,7 @@ export default function App() {
   const [importInput, setImportInput] = createSignal<string>('');
   const [toast, setToast] = createSignal<string>('');
   const [popupWarning, setPopupWarning] = createSignal<string>('');
+  const [unreadCount, setUnreadCount] = createSignal<number>(0);
 
   let chatEndEl: HTMLDivElement | undefined;
   let toastTimer: number | undefined;
@@ -65,6 +82,10 @@ export default function App() {
     });
   }
 
+  const otherDevices = createMemo(() =>
+    devices().filter((d) => d.deviceId !== deviceId()),
+  );
+
   const pairUrl = createMemo(() => {
     const k = keyB64();
     if (!k) return '';
@@ -76,6 +97,130 @@ export default function App() {
     if (wsStatus() === 'connecting') return 'Connecting...';
     return 'Offline';
   });
+
+  async function updateBadge(count: number) {
+    setUnreadCount(count);
+    document.title = count > 0 ? `(${count}) Push It` : 'Push It';
+    await kvSet('unreadCount', count);
+    const nav = navigator as Navigator & {
+      setAppBadge?: (n: number) => Promise<void>;
+      clearAppBadge?: () => Promise<void>;
+    };
+    if (count > 0) {
+      await nav.setAppBadge?.(count).catch(() => {});
+    } else {
+      await nav.clearAppBadge?.().catch(() => {});
+    }
+  }
+
+  async function registerDeviceRecord(
+    rid: string,
+    k: string,
+    devId: string,
+    name: string,
+    os: DeviceOs,
+  ) {
+    if (!rid || !k || !devId) return;
+    const enc = await encryptJson(k, { name, os } satisfies DeviceMeta);
+    await fetch(`/api/room/${encodeURIComponent(rid)}/devices`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deviceId: devId, iv: enc.iv, ciphertext: enc.ciphertext }),
+    }).catch(() => {});
+  }
+
+  async function refreshDevices(rid = roomId(), k = keyB64(), myId = deviceId()) {
+    if (!rid || !k) return;
+    try {
+      const res = await fetch(`/api/room/${encodeURIComponent(rid)}/devices`);
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        devices: Array<{
+          deviceId: string;
+          iv: string;
+          ciphertext: string;
+          updatedAt: number;
+          online: boolean;
+        }>;
+      };
+
+      const decrypted: PairedDevice[] = [];
+      for (const d of data.devices) {
+        try {
+          const meta = await decryptJson<Partial<DeviceMeta>>(k, d.iv, d.ciphertext);
+          const os = normalizeOs(meta.os);
+          const name = meta.name ? String(meta.name) : defaultDeviceName(os);
+          decrypted.push({
+            deviceId: d.deviceId,
+            name,
+            os,
+            online: d.online,
+            updatedAt: d.updatedAt,
+          });
+          if (d.deviceId === myId && name !== deviceName()) {
+            setDeviceName(name);
+            await kvSet('deviceName', name);
+          }
+        } catch {
+          // Ignore devices encrypted with another key
+        }
+      }
+
+      setDevices(decrypted);
+      // Drop any selected targets that no longer exist
+      const validIds = new Set(decrypted.map((d) => d.deviceId));
+      setSelectedTargets((prev) => prev.filter((id) => validIds.has(id) && id !== myId));
+    } catch {
+      // ignore network error
+    }
+  }
+
+  async function syncPending(rid = roomId(), k = keyB64(), myId = deviceId()) {
+    if (!rid || !k || !myId) return;
+    try {
+      const since = (await kvGet<number>('lastSeenTs')) || 0;
+      const res = await fetch(
+        `/api/room/${encodeURIComponent(rid)}/pending?deviceId=${encodeURIComponent(myId)}&since=${since}`,
+      );
+      if (!res.ok) return;
+      const data = (await res.json()) as { messages: EncryptedEnvelope[] };
+      if (!data.messages?.length) return;
+
+      let maxTs = since;
+      for (const env of data.messages) {
+        try {
+          const decrypted = await decryptEnvelope(k, env);
+          const item: StoredMessage = {
+            id: env.id,
+            senderId: env.senderId,
+            senderName: decrypted.senderName,
+            senderOs: decrypted.senderOs,
+            targetNames: decrypted.targetNames,
+            ts: env.ts || Date.now(),
+            type: decrypted.type,
+            content: decrypted.content,
+            title: decrypted.title,
+            direction: 'in',
+          };
+          if (item.ts > maxTs) maxTs = item.ts;
+          const existed = messages().some((m) => m.id === item.id);
+          await saveMessage(item);
+          addOrUpdateMessage(item);
+          if (!existed) {
+            handleIncomingAction(item);
+          }
+        } catch {
+          // ignore wrong-key
+        }
+      }
+
+      if (maxTs > since) {
+        await kvSet('lastSeenTs', maxTs);
+      }
+    } catch {
+      // ignore
+    }
+  }
 
   // 1. Bootstrap key, device identity, preferences, SW, and URL hash/share target
   createEffect(
@@ -90,9 +235,17 @@ export default function App() {
         }
       };
 
+      const onVisibility = () => {
+        if (document.visibilityState === 'visible') {
+          updateBadge(0);
+          syncPending();
+        }
+      };
+
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.addEventListener('message', onSwMessage);
       }
+      document.addEventListener('visibilitychange', onVisibility);
 
       (async () => {
         await registerServiceWorker().catch(() => {});
@@ -137,14 +290,19 @@ export default function App() {
 
         setDeviceId(devId);
         setDeviceName(devName);
-        setNameInput(devName);
         setKeyB64(activeKey);
         setRoomId(rid);
         setMessages(existingMsgs);
         setPushEnabled(Boolean(currentSub));
+        await updateBadge(0);
         scrollToBottom();
 
-        // Fallback Share Target handler if Service Worker wasn't controlling yet
+        // Register this device and pull room devices + missed messages
+        await registerDeviceRecord(rid, activeKey, devId, devName, localOs);
+        await refreshDevices(rid, activeKey, devId);
+        await syncPending(rid, activeKey, devId);
+
+        // Fallback Share Target handler if SW wasn't controlling yet
         if (
           window.location.pathname === '/share' ||
           window.location.search.includes('url=') ||
@@ -170,15 +328,16 @@ export default function App() {
         if ('serviceWorker' in navigator) {
           navigator.serviceWorker.removeEventListener('message', onSwMessage);
         }
+        document.removeEventListener('visibilitychange', onVisibility);
       };
     },
   );
 
-  // 2. Generate QR code when Settings view is open
+  // 2. Generate QR code when Add Device is open in Settings
   createEffect(
-    () => [view(), pairUrl()] as const,
-    ([activeView, url]) => {
-      if (activeView !== 'settings' || !url) return;
+    () => [view(), showAddDevice(), pairUrl()] as const,
+    ([activeView, adding, url]) => {
+      if (activeView !== 'settings' || !adding || !url) return;
       QRCode.toDataURL(url, {
         width: 220,
         margin: 2,
@@ -209,6 +368,8 @@ export default function App() {
 
         ws.onopen = () => {
           setWsStatus('connected');
+          refreshDevices(rid, k, did);
+          syncPending(rid, k, did);
           pingTimer = window.setInterval(() => {
             if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
           }, 25000);
@@ -221,6 +382,10 @@ export default function App() {
               type?: string;
               envelope?: EncryptedEnvelope;
             };
+            if (parsed.type === 'devices_updated') {
+              await refreshDevices(rid, k, did);
+              return;
+            }
             if (parsed.type !== 'message' || !parsed.envelope) return;
             if (parsed.envelope.senderId === did) return;
 
@@ -230,6 +395,7 @@ export default function App() {
               senderId: parsed.envelope.senderId,
               senderName: decrypted.senderName,
               senderOs: decrypted.senderOs,
+              targetNames: decrypted.targetNames,
               ts: parsed.envelope.ts || Date.now(),
               type: decrypted.type,
               content: decrypted.content,
@@ -238,7 +404,13 @@ export default function App() {
             };
 
             await saveMessage(item);
+            await kvSet('lastSeenTs', item.ts);
             addOrUpdateMessage(item);
+
+            if (document.visibilityState !== 'visible') {
+              await updateBadge(unreadCount() + 1);
+            }
+
             handleIncomingAction(item);
           } catch {
             // Ignore unreadable messages
@@ -297,6 +469,12 @@ export default function App() {
     }
   }
 
+  function toggleTarget(id: string) {
+    setSelectedTargets((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  }
+
   async function sendText(
     rawText: string,
     title?: string,
@@ -312,16 +490,30 @@ export default function App() {
     const dName = overrideName || deviceName();
     if (!content || !k || !rid || !did) return;
 
+    const chosenIds = selectedTargets();
+    const chosenNames =
+      chosenIds.length > 0
+        ? otherDevices()
+            .filter((d) => chosenIds.includes(d.deviceId))
+            .map((d) => d.name)
+        : undefined;
+
     setSending(true);
     try {
       const type = detectPayloadType(content);
-      const envelope = await encryptPayload(k, did, {
-        type,
-        content,
-        title,
-        senderName: dName,
-        senderOs: localOs,
-      });
+      const envelope = await encryptPayload(
+        k,
+        did,
+        {
+          type,
+          content,
+          title,
+          senderName: dName,
+          senderOs: localOs,
+          targetNames: chosenNames,
+        },
+        chosenIds.length > 0 ? chosenIds : undefined,
+      );
 
       const res = await fetch(`/api/room/${encodeURIComponent(rid)}/send`, {
         method: 'POST',
@@ -338,6 +530,7 @@ export default function App() {
         senderId: did,
         senderName: dName,
         senderOs: localOs,
+        targetNames: chosenNames,
         ts: envelope.ts,
         type,
         content,
@@ -356,12 +549,26 @@ export default function App() {
     }
   }
 
-  async function saveDeviceName() {
-    const trimmed = nameInput().trim() || defaultDeviceName(localOs);
-    setDeviceName(trimmed);
-    setNameInput(trimmed);
-    await kvSet('deviceName', trimmed);
-    notify(`Saved as "${trimmed}"`);
+  async function saveEditedDevice(dev: PairedDevice) {
+    const nextName = editDeviceDraft().trim() || defaultDeviceName(dev.os);
+    setEditingDeviceId(null);
+    if (dev.deviceId === deviceId()) {
+      setDeviceName(nextName);
+      await kvSet('deviceName', nextName);
+    }
+    await registerDeviceRecord(roomId(), keyB64(), dev.deviceId, nextName, dev.os);
+    await refreshDevices();
+    notify(`Renamed to "${nextName}"`);
+  }
+
+  async function removeDevice(dev: PairedDevice) {
+    await fetch(`/api/room/${encodeURIComponent(roomId())}/devices`, {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ deviceId: dev.deviceId }),
+    }).catch(() => {});
+    await refreshDevices();
+    notify(`Removed "${dev.name}"`);
   }
 
   async function handleToggleAutoOpen() {
@@ -409,6 +616,8 @@ export default function App() {
     setKeyB64(raw);
     setRoomId(rid);
     setImportInput('');
+    await registerDeviceRecord(rid, raw, deviceId(), deviceName(), localOs);
+    await refreshDevices(rid, raw, deviceId());
     notify('Devices paired!');
   }
 
@@ -418,6 +627,8 @@ export default function App() {
     const rid = await deriveRoomId(fresh);
     setKeyB64(fresh);
     setRoomId(rid);
+    await registerDeviceRecord(rid, fresh, deviceId(), deviceName(), localOs);
+    await refreshDevices(rid, fresh, deviceId());
     notify('Created a new pairing code');
   }
 
@@ -474,7 +685,7 @@ export default function App() {
           >
             <button
               class="device-pill"
-              title="Device settings"
+              title="Manage devices"
               onClick={() => setView('settings')}
             >
               <OsIcon os={localOs} size={14} />
@@ -504,25 +715,119 @@ export default function App() {
         fallback={
           <main class="settings-page">
             <section class="card">
-              <h2>This Device</h2>
-              <div class="import-row">
-                <input
-                  type="text"
-                  maxlength={24}
-                  placeholder={defaultDeviceName(localOs)}
-                  value={nameInput()}
-                  onInput={(e) => setNameInput(e.currentTarget.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      saveDeviceName();
-                    }
-                  }}
-                />
-                <button class="btn primary small" onClick={saveDeviceName}>
-                  Save
+              <div class="row between">
+                <h2>Devices ({devices().length})</h2>
+                <button
+                  class="btn primary small"
+                  onClick={() => setShowAddDevice((v) => !v)}
+                >
+                  {showAddDevice() ? 'Hide Pair' : '+ Add Device'}
                 </button>
               </div>
+
+              <div class="device-list">
+                <For each={devices()}>
+                  {(dev) => {
+                    const isSelf = dev.deviceId === deviceId();
+                    return (
+                      <div class="device-row">
+                        <Show
+                          when={editingDeviceId() !== dev.deviceId}
+                          fallback={
+                            <form
+                              class="import-row full-width"
+                              onSubmit={(e) => {
+                                e.preventDefault();
+                                saveEditedDevice(dev);
+                              }}
+                            >
+                              <input
+                                type="text"
+                                maxlength={24}
+                                value={editDeviceDraft()}
+                                onInput={(e) => setEditDeviceDraft(e.currentTarget.value)}
+                                autofocus
+                              />
+                              <button class="btn primary small" type="submit">
+                                Save
+                              </button>
+                              <button
+                                class="btn secondary small"
+                                type="button"
+                                onClick={() => setEditingDeviceId(null)}
+                              >
+                                Cancel
+                              </button>
+                            </form>
+                          }
+                        >
+                          <div class="device-info">
+                            <span class={`dot ${dev.online || isSelf ? 'connected' : 'disconnected'}`} />
+                            <OsIcon os={dev.os} size={15} />
+                            <span class="device-name">{dev.name}</span>
+                            <Show when={isSelf}>
+                              <span class="self-tag">This device</span>
+                            </Show>
+                          </div>
+                          <div class="row gap">
+                            <button
+                              class="chip"
+                              onClick={() => {
+                                setEditingDeviceId(dev.deviceId);
+                                setEditDeviceDraft(dev.name);
+                              }}
+                            >
+                              Rename
+                            </button>
+                            <Show when={!isSelf}>
+                              <button
+                                class="chip danger"
+                                onClick={() => removeDevice(dev)}
+                              >
+                                Remove
+                              </button>
+                            </Show>
+                          </div>
+                        </Show>
+                      </div>
+                    );
+                  }}
+                </For>
+              </div>
+
+              <Show when={showAddDevice()}>
+                <div class="divider" />
+                <p class="muted">
+                  Scan this code on your phone or copy the link into another device.
+                </p>
+                <Show when={qrDataUrl()}>
+                  <div class="qr-wrap">
+                    <img src={qrDataUrl()} alt="Pairing QR Code" class="qr-img" />
+                  </div>
+                </Show>
+                <div class="row gap">
+                  <button
+                    class="btn primary"
+                    onClick={() => copyToClipboard(pairUrl(), 'Pair link copied')}
+                  >
+                    Copy Pair Link
+                  </button>
+                  <button class="btn secondary" onClick={handleRotateKey}>
+                    New Code
+                  </button>
+                </div>
+                <div class="import-row">
+                  <input
+                    type="text"
+                    placeholder="Paste pair link from another device..."
+                    value={importInput()}
+                    onInput={(e) => setImportInput(e.currentTarget.value)}
+                  />
+                  <button class="btn secondary" onClick={handleImportKey}>
+                    Pair
+                  </button>
+                </div>
+              </Show>
             </section>
 
             <section class="card">
@@ -552,40 +857,6 @@ export default function App() {
                   onClick={handleTogglePush}
                 >
                   {pushBusy() ? '...' : pushEnabled() ? 'On' : 'Turn On'}
-                </button>
-              </div>
-            </section>
-
-            <section class="card">
-              <h2>Pair Another Device</h2>
-              <p class="muted">
-                Scan this code on your phone or copy the link into another device.
-              </p>
-              <Show when={qrDataUrl()}>
-                <div class="qr-wrap">
-                  <img src={qrDataUrl()} alt="Pairing QR Code" class="qr-img" />
-                </div>
-              </Show>
-              <div class="row gap">
-                <button
-                  class="btn primary"
-                  onClick={() => copyToClipboard(pairUrl(), 'Pair link copied')}
-                >
-                  Copy Pair Link
-                </button>
-                <button class="btn secondary" onClick={handleRotateKey}>
-                  New Code
-                </button>
-              </div>
-              <div class="import-row">
-                <input
-                  type="text"
-                  placeholder="Paste pair link from another device..."
-                  value={importInput()}
-                  onInput={(e) => setImportInput(e.currentTarget.value)}
-                />
-                <button class="btn secondary" onClick={handleImportKey}>
-                  Pair
                 </button>
               </div>
             </section>
@@ -628,6 +899,10 @@ export default function App() {
               const os = msg.senderOs ?? (msg.direction === 'out' ? localOs : 'other');
               const label =
                 msg.senderName || (msg.direction === 'out' ? deviceName() : 'Other device');
+              const targetLabel =
+                msg.targetNames && msg.targetNames.length > 0
+                  ? ` → ${msg.targetNames.join(', ')}`
+                  : '';
               const isLink = msg.type === 'link' && isSafeHttpUrl(msg.content);
 
               return (
@@ -636,7 +911,10 @@ export default function App() {
                     <div class="bubble-head">
                       <span class="sender-tag">
                         <OsIcon os={os} size={13} />
-                        <span>{label}</span>
+                        <span>
+                          {label}
+                          {targetLabel}
+                        </span>
                       </span>
                       <time>
                         {new Date(msg.ts).toLocaleTimeString([], {
@@ -682,6 +960,29 @@ export default function App() {
           </For>
           <div ref={chatEndEl} />
         </main>
+
+        <Show when={otherDevices().length > 1}>
+          <div class="target-bar">
+            <span class="target-label">To:</span>
+            <button
+              class={`target-pill ${selectedTargets().length === 0 ? 'active' : ''}`}
+              onClick={() => setSelectedTargets([])}
+            >
+              All
+            </button>
+            <For each={otherDevices()}>
+              {(dev) => (
+                <button
+                  class={`target-pill ${selectedTargets().includes(dev.deviceId) ? 'active' : ''}`}
+                  onClick={() => toggleTarget(dev.deviceId)}
+                >
+                  <OsIcon os={dev.os} size={12} />
+                  <span>{dev.name}</span>
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
 
         <footer class="composer-bar">
           <button

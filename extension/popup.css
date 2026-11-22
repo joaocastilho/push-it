@@ -306,6 +306,93 @@ input[type='text'] {
   border-color: transparent;
 }
 
+.chip.danger {
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.device-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+}
+
+.device-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.device-name {
+  font-size: 0.78rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.item-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.pair-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.target-bar {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  overflow-x: auto;
+  padding: 2px 0;
+}
+
+.target-label {
+  font-size: 0.72rem;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+.target-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.target-pill.active {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+
 .composer {
   display: flex;
   flex-direction: column;

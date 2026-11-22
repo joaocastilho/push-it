@@ -6,14 +6,21 @@ export interface DecryptedPayload {
   title?: string;
   senderName?: string;
   senderOs?: DeviceOs;
+  targetNames?: string[];
 }
 
 export interface EncryptedEnvelope {
   id: string;
   senderId: string;
+  targetIds?: string[];
   iv: string;
   ciphertext: string;
   ts: number;
+}
+
+export interface DeviceMeta {
+  name: string;
+  os: DeviceOs;
 }
 
 export function toBase64Url(bytes: Uint8Array): string {
@@ -54,34 +61,54 @@ export async function importAesKey(keyB64: string): Promise<CryptoKey> {
   return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-/**
- * Derives a one-way roomId from the symmetric key so the server can route
- * messages without ever knowing or being able to recover the encryption key.
- */
 export async function deriveRoomId(keyB64: string): Promise<string> {
   const data = new TextEncoder().encode(`push-it-room-v1:${keyB64}`);
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
   return toBase64Url(hash).slice(0, 24);
 }
 
-export async function encryptPayload(
+export async function encryptJson(
   keyB64: string,
-  senderId: string,
-  payload: DecryptedPayload,
-): Promise<EncryptedEnvelope> {
+  value: unknown,
+): Promise<{ iv: string; ciphertext: string }> {
   const key = await importAesKey(keyB64);
   const ivBuf = new ArrayBuffer(12);
   const iv = new Uint8Array(ivBuf);
   crypto.getRandomValues(iv);
 
-  const plainBytes = new TextEncoder().encode(JSON.stringify(payload));
+  const plainBytes = new TextEncoder().encode(JSON.stringify(value));
   const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plainBytes);
+  return {
+    iv: toBase64Url(iv),
+    ciphertext: toBase64Url(new Uint8Array(cipherBuf)),
+  };
+}
 
+export async function decryptJson<T>(
+  keyB64: string,
+  ivB64: string,
+  ciphertextB64: string,
+): Promise<T> {
+  const key = await importAesKey(keyB64);
+  const iv = fromBase64Url(ivB64);
+  const ciphertext = fromBase64Url(ciphertextB64);
+  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  return JSON.parse(new TextDecoder().decode(plainBuf)) as T;
+}
+
+export async function encryptPayload(
+  keyB64: string,
+  senderId: string,
+  payload: DecryptedPayload,
+  targetIds?: string[],
+): Promise<EncryptedEnvelope> {
+  const { iv, ciphertext } = await encryptJson(keyB64, payload);
   return {
     id: crypto.randomUUID(),
     senderId,
-    iv: toBase64Url(iv),
-    ciphertext: toBase64Url(new Uint8Array(cipherBuf)),
+    targetIds: targetIds && targetIds.length > 0 ? targetIds : undefined,
+    iv,
+    ciphertext,
     ts: Date.now(),
   };
 }
@@ -90,17 +117,20 @@ export async function decryptEnvelope(
   keyB64: string,
   envelope: EncryptedEnvelope,
 ): Promise<DecryptedPayload> {
-  const key = await importAesKey(keyB64);
-  const iv = fromBase64Url(envelope.iv);
-  const ciphertext = fromBase64Url(envelope.ciphertext);
-  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
-  const parsed = JSON.parse(new TextDecoder().decode(plainBuf)) as Partial<DecryptedPayload>;
+  const parsed = await decryptJson<Partial<DecryptedPayload>>(
+    keyB64,
+    envelope.iv,
+    envelope.ciphertext,
+  );
   return {
     type: parsed.type === 'link' ? 'link' : 'text',
     content: String(parsed.content ?? ''),
     title: parsed.title ? String(parsed.title) : undefined,
     senderName: parsed.senderName ? String(parsed.senderName) : undefined,
     senderOs: parsed.senderOs ? normalizeOs(parsed.senderOs) : undefined,
+    targetNames: Array.isArray(parsed.targetNames)
+      ? parsed.targetNames.map((n) => String(n))
+      : undefined,
   };
 }
 

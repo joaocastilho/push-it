@@ -5,6 +5,7 @@ export interface StoredMessage {
   senderId: string;
   senderName?: string;
   senderOs?: DeviceOs;
+  targetNames?: string[];
   ts: number;
   type: 'link' | 'text';
   content: string;

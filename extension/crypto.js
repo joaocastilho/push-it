@@ -73,33 +73,49 @@ export async function importAesKey(keyB64) {
   return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-export async function encryptPayload(keyB64, senderId, payload) {
+export async function encryptJson(keyB64, value) {
   const key = await importAesKey(keyB64);
   const iv = new Uint8Array(12);
   crypto.getRandomValues(iv);
-  const plain = new TextEncoder().encode(JSON.stringify(payload));
+  const plain = new TextEncoder().encode(JSON.stringify(value));
   const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
+  return {
+    iv: toBase64Url(iv),
+    ciphertext: toBase64Url(new Uint8Array(cipher)),
+  };
+}
+
+export async function decryptJson(keyB64, ivB64, ciphertextB64) {
+  const key = await importAesKey(keyB64);
+  const iv = fromBase64Url(ivB64);
+  const ciphertext = fromBase64Url(ciphertextB64);
+  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
+  return JSON.parse(new TextDecoder().decode(plainBuf));
+}
+
+export async function encryptPayload(keyB64, senderId, payload, targetIds) {
+  const { iv, ciphertext } = await encryptJson(keyB64, payload);
   return {
     id: crypto.randomUUID(),
     senderId,
-    iv: toBase64Url(iv),
-    ciphertext: toBase64Url(new Uint8Array(cipher)),
+    targetIds: targetIds && targetIds.length > 0 ? targetIds : undefined,
+    iv,
+    ciphertext,
     ts: Date.now(),
   };
 }
 
 export async function decryptEnvelope(keyB64, envelope) {
-  const key = await importAesKey(keyB64);
-  const iv = fromBase64Url(envelope.iv);
-  const ciphertext = fromBase64Url(envelope.ciphertext);
-  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
-  const parsed = JSON.parse(new TextDecoder().decode(plainBuf));
+  const parsed = await decryptJson(keyB64, envelope.iv, envelope.ciphertext);
   return {
     type: parsed.type === 'link' ? 'link' : 'text',
     content: String(parsed.content ?? ''),
     title: parsed.title ? String(parsed.title) : undefined,
     senderName: parsed.senderName ? String(parsed.senderName) : undefined,
     senderOs: parsed.senderOs ? normalizeOs(parsed.senderOs) : undefined,
+    targetNames: Array.isArray(parsed.targetNames)
+      ? parsed.targetNames.map((n) => String(n))
+      : undefined,
   };
 }
 

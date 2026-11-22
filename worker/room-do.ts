@@ -16,6 +16,7 @@ export interface Env {
 export interface EncryptedEnvelope {
   id: string;
   senderId: string;
+  targetIds?: string[];
   iv: string;
   ciphertext: string;
   ts: number;
@@ -23,8 +24,14 @@ export interface EncryptedEnvelope {
 
 interface StoredSubscription {
   deviceId: string;
-  deviceName?: string;
   subscription: PushSubscription;
+  updatedAt: number;
+}
+
+interface StoredDevice {
+  deviceId: string;
+  iv: string;
+  ciphertext: string;
   updatedAt: number;
 }
 
@@ -35,7 +42,11 @@ interface StoredVapidKeys {
 }
 
 const SUB_PREFIX = 'sub:';
+const DEV_PREFIX = 'dev:';
+const MSG_PREFIX = 'msg:';
 const VAPID_STORAGE_KEY = 'vapid:keys';
+const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_PENDING_MESSAGES = 50;
 export const VAPID_DO_NAME = '__vapid__';
 
 function toBase64Url(bytes: Uint8Array): string {
@@ -81,6 +92,22 @@ export class RoomDO extends DurableObject<Env> {
 
     if (path.endsWith('/send') && request.method === 'POST') {
       return this.handleSend(request);
+    }
+
+    if (path.endsWith('/pending') && request.method === 'GET') {
+      return this.handlePending(url);
+    }
+
+    if (path.endsWith('/devices') && request.method === 'GET') {
+      return this.handleListDevices();
+    }
+
+    if (path.endsWith('/devices') && request.method === 'POST') {
+      return this.handleUpsertDevice(request);
+    }
+
+    if (path.endsWith('/devices') && request.method === 'DELETE') {
+      return this.handleDeleteDevice(request);
     }
 
     if (path.endsWith('/subscribe') && request.method === 'POST') {
@@ -129,6 +156,17 @@ export class RoomDO extends DurableObject<Env> {
     return keys;
   }
 
+  private broadcastDevicesUpdated(): void {
+    const msg = JSON.stringify({ type: 'devices_updated' });
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(msg);
+      } catch {
+        // ignore dead sockets
+      }
+    }
+  }
+
   private handleWebSocket(request: Request, url: URL): Response {
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected Upgrade: websocket', { status: 426 });
@@ -138,8 +176,8 @@ export class RoomDO extends DurableObject<Env> {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    // Hibernation API: tag the socket with deviceId so we can skip echo
     this.ctx.acceptWebSocket(server, [deviceId]);
+    this.broadcastDevicesUpdated();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -153,12 +191,78 @@ export class RoomDO extends DurableObject<Env> {
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     ws.close(code, reason);
+    this.broadcastDevicesUpdated();
+  }
+
+  private async handleListDevices(): Promise<Response> {
+    const onlineIds = new Set<string>();
+    for (const ws of this.ctx.getWebSockets()) {
+      for (const tag of this.ctx.getTags(ws)) onlineIds.add(tag);
+    }
+
+    const stored = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
+    const devices = Array.from(stored.values())
+      .map((d) => ({
+        deviceId: d.deviceId,
+        iv: d.iv,
+        ciphertext: d.ciphertext,
+        updatedAt: d.updatedAt,
+        online: onlineIds.has(d.deviceId),
+      }))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+
+    return Response.json({ devices });
+  }
+
+  private async handleUpsertDevice(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      deviceId?: string;
+      iv?: string;
+      ciphertext?: string;
+    };
+
+    if (!body.deviceId || !body.iv || !body.ciphertext || body.ciphertext.length > 1000) {
+      return Response.json({ error: 'Invalid device payload' }, { status: 400 });
+    }
+
+    const record: StoredDevice = {
+      deviceId: body.deviceId,
+      iv: body.iv,
+      ciphertext: body.ciphertext,
+      updatedAt: Date.now(),
+    };
+
+    await this.ctx.storage.put(`${DEV_PREFIX}${body.deviceId}`, record);
+    this.broadcastDevicesUpdated();
+    return Response.json({ ok: true });
+  }
+
+  private async handleDeleteDevice(request: Request): Promise<Response> {
+    const body = (await request.json()) as { deviceId?: string };
+    if (!body.deviceId) {
+      return Response.json({ error: 'Missing deviceId' }, { status: 400 });
+    }
+
+    await Promise.all([
+      this.ctx.storage.delete(`${DEV_PREFIX}${body.deviceId}`),
+      this.ctx.storage.delete(`${SUB_PREFIX}${body.deviceId}`),
+    ]);
+
+    for (const ws of this.ctx.getWebSockets(body.deviceId)) {
+      try {
+        ws.close(1000, 'Device removed');
+      } catch {
+        // ignore
+      }
+    }
+
+    this.broadcastDevicesUpdated();
+    return Response.json({ ok: true });
   }
 
   private async handleSubscribe(request: Request): Promise<Response> {
     const body = (await request.json()) as {
       deviceId: string;
-      deviceName?: string;
       subscription: PushSubscription;
     };
 
@@ -168,7 +272,6 @@ export class RoomDO extends DurableObject<Env> {
 
     const record: StoredSubscription = {
       deviceId: body.deviceId,
-      deviceName: body.deviceName,
       subscription: body.subscription,
       updatedAt: Date.now(),
     };
@@ -195,6 +298,67 @@ export class RoomDO extends DurableObject<Env> {
     });
   }
 
+  private async pruneOldMessages(now: number): Promise<void> {
+    const stored = await this.ctx.storage.list<EncryptedEnvelope>({ prefix: MSG_PREFIX });
+    const toDelete: string[] = [];
+    const entries = Array.from(stored.entries());
+
+    for (const [key, env] of entries) {
+      if (now - env.ts > MESSAGE_TTL_MS) {
+        toDelete.push(key);
+      }
+    }
+
+    const remaining = entries.length - toDelete.length;
+    if (remaining > MAX_PENDING_MESSAGES) {
+      const validKeys = entries
+        .filter(([k]) => !toDelete.includes(k))
+        .map(([k]) => k)
+        .sort();
+      const overflow = validKeys.slice(0, remaining - MAX_PENDING_MESSAGES);
+      toDelete.push(...overflow);
+    }
+
+    if (toDelete.length > 0) {
+      await this.ctx.storage.delete(toDelete);
+    }
+  }
+
+  private async handlePending(url: URL): Promise<Response> {
+    const deviceId = url.searchParams.get('deviceId') || '';
+    const since = Number(url.searchParams.get('since') || '0');
+    const now = Date.now();
+
+    const stored = await this.ctx.storage.list<EncryptedEnvelope>({ prefix: MSG_PREFIX });
+    const expiredKeys: string[] = [];
+    const messages: EncryptedEnvelope[] = [];
+
+    for (const [key, env] of stored) {
+      if (now - env.ts > MESSAGE_TTL_MS) {
+        expiredKeys.push(key);
+        continue;
+      }
+      if (env.ts <= since) continue;
+      if (deviceId && env.senderId === deviceId) continue;
+      if (
+        deviceId &&
+        Array.isArray(env.targetIds) &&
+        env.targetIds.length > 0 &&
+        !env.targetIds.includes(deviceId)
+      ) {
+        continue;
+      }
+      messages.push(env);
+    }
+
+    if (expiredKeys.length > 0) {
+      await this.ctx.storage.delete(expiredKeys);
+    }
+
+    messages.sort((a, b) => a.ts - b.ts);
+    return Response.json({ messages });
+  }
+
   private async handleSend(request: Request): Promise<Response> {
     const envelope = (await request.json()) as EncryptedEnvelope;
 
@@ -202,30 +366,40 @@ export class RoomDO extends DurableObject<Env> {
       return Response.json({ error: 'Invalid encrypted envelope' }, { status: 400 });
     }
 
-    // Limit ciphertext size so Web Push (4 KB limit) always succeeds
     if (envelope.ciphertext.length > 3500) {
-      return Response.json(
-        { error: 'Payload too large for Web Push (max ~2.5 KB plaintext)' },
-        { status: 413 },
-      );
+      return Response.json({ error: 'Message too large' }, { status: 413 });
     }
+
+    const now = Date.now();
+    envelope.ts = envelope.ts || now;
+
+    const targetSet =
+      Array.isArray(envelope.targetIds) && envelope.targetIds.length > 0
+        ? new Set(envelope.targetIds)
+        : null;
+
+    // 1. Persist encrypted envelope in 24h offline queue
+    const paddedTs = String(envelope.ts).padStart(15, '0');
+    await this.ctx.storage.put(`${MSG_PREFIX}${paddedTs}:${envelope.id}`, envelope);
+    await this.pruneOldMessages(now);
 
     const serialized = JSON.stringify({ type: 'message', envelope });
 
-    // 1. Fan out to all connected WebSockets (except sender)
+    // 2. Fan out to connected WebSockets (respecting targetIds and skipping sender)
     let wsDelivered = 0;
     for (const ws of this.ctx.getWebSockets()) {
       const tags = this.ctx.getTags(ws);
       if (tags.includes(envelope.senderId)) continue;
+      if (targetSet && !tags.some((t) => targetSet.has(t))) continue;
       try {
         ws.send(serialized);
         wsDelivered++;
       } catch {
-        // Ignore dead sockets; runtime cleans them up
+        // Ignore dead sockets
       }
     }
 
-    // 2. Fan out Web Push to registered devices (except sender)
+    // 3. Fan out Web Push to registered devices (respecting targetIds and skipping sender)
     let pushSent = 0;
     let pushFailed = 0;
 
@@ -237,6 +411,7 @@ export class RoomDO extends DurableObject<Env> {
 
       for (const [storageKey, entry] of subs) {
         if (entry.deviceId === envelope.senderId) continue;
+        if (targetSet && !targetSet.has(entry.deviceId)) continue;
 
         pushTasks.push(
           (async () => {
@@ -260,7 +435,6 @@ export class RoomDO extends DurableObject<Env> {
               });
 
               if (res.status === 404 || res.status === 410) {
-                // Subscription expired/revoked — prune it
                 await this.ctx.storage.delete(storageKey);
                 pushFailed++;
               } else if (res.ok) {

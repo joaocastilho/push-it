@@ -18,7 +18,9 @@ export default {
       return Response.json({ publicKey: keys.publicKey });
     }
 
-    const roomMatch = url.pathname.match(/^\/api\/room\/([^/]+)\/(ws|send|subscribe|status)$/);
+    const roomMatch = url.pathname.match(
+      /^\/api\/room\/([^/]+)\/(ws|send|pending|devices|subscribe|status)$/,
+    );
     if (roomMatch) {
       const roomId = roomMatch[1];
       if (!ROOM_ID_RE.test(roomId) || roomId === VAPID_DO_NAME) {

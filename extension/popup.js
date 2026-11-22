@@ -7,19 +7,25 @@ const toggleSettingsBtn = document.getElementById('toggleSettings');
 const toastEl = document.getElementById('toast');
 const settingsView = document.getElementById('settingsView');
 const chatView = document.getElementById('chatView');
-const deviceNameInput = document.getElementById('deviceNameInput');
-const saveNameBtn = document.getElementById('saveNameBtn');
+const devicesHeading = document.getElementById('devicesHeading');
+const deviceList = document.getElementById('deviceList');
+const togglePairBtn = document.getElementById('togglePairBtn');
+const pairBox = document.getElementById('pairBox');
 const pairInput = document.getElementById('pairInput');
 const savePairBtn = document.getElementById('savePair');
 const autoOpenEl = document.getElementById('autoOpen');
+const targetBar = document.getElementById('targetBar');
 const sendTabBtn = document.getElementById('sendTab');
 const draftEl = document.getElementById('draft');
 const sendDraftBtn = document.getElementById('sendDraft');
 const clearBtn = document.getElementById('clearBtn');
 const historyList = document.getElementById('historyList');
 
+let myDeviceId = '';
 let currentDeviceOs = 'windows';
 let currentDeviceName = 'Windows';
+let pairedDevices = [];
+let selectedTargetIds = [];
 let showingSettings = false;
 let toastTimer;
 
@@ -72,12 +78,139 @@ function renderDevicePill() {
   devicePill.appendChild(span);
 }
 
+function renderTargetBar() {
+  const others = pairedDevices.filter((d) => d.deviceId !== myDeviceId);
+  if (others.length < 2) {
+    targetBar.classList.add('hidden');
+    selectedTargetIds = [];
+    return;
+  }
+
+  targetBar.classList.remove('hidden');
+  targetBar.innerHTML = '';
+
+  const lbl = document.createElement('span');
+  lbl.className = 'target-label';
+  lbl.textContent = 'To:';
+  targetBar.appendChild(lbl);
+
+  const allBtn = document.createElement('button');
+  allBtn.className = `target-pill ${selectedTargetIds.length === 0 ? 'active' : ''}`;
+  allBtn.textContent = 'All';
+  allBtn.onclick = () => {
+    selectedTargetIds = [];
+    renderTargetBar();
+  };
+  targetBar.appendChild(allBtn);
+
+  for (const dev of others) {
+    const btn = document.createElement('button');
+    btn.className = `target-pill ${selectedTargetIds.includes(dev.deviceId) ? 'active' : ''}`;
+    btn.appendChild(createOsSvg(dev.os, 11));
+    const s = document.createElement('span');
+    s.textContent = dev.name;
+    btn.appendChild(s);
+    btn.onclick = () => {
+      if (selectedTargetIds.includes(dev.deviceId)) {
+        selectedTargetIds = selectedTargetIds.filter((id) => id !== dev.deviceId);
+      } else {
+        selectedTargetIds = [...selectedTargetIds, dev.deviceId];
+      }
+      renderTargetBar();
+    };
+    targetBar.appendChild(btn);
+  }
+}
+
+function renderDeviceList() {
+  devicesHeading.textContent = `Devices (${pairedDevices.length})`;
+  deviceList.innerHTML = '';
+
+  for (const dev of pairedDevices) {
+    const isSelf = dev.deviceId === myDeviceId;
+    const row = document.createElement('div');
+    row.className = 'device-row';
+
+    const info = document.createElement('div');
+    info.className = 'device-info';
+
+    const dot = document.createElement('span');
+    dot.className = `dot ${dev.online || isSelf ? 'connected' : 'disconnected'}`;
+    info.appendChild(dot);
+    info.appendChild(createOsSvg(dev.os, 13));
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'device-name';
+    nameEl.textContent = isSelf ? `${dev.name} (You)` : dev.name;
+    info.appendChild(nameEl);
+
+    const actions = document.createElement('div');
+    actions.className = 'item-actions';
+
+    const renameBtn = document.createElement('button');
+    renameBtn.className = 'chip';
+    renameBtn.textContent = 'Rename';
+    renameBtn.onclick = () => {
+      row.innerHTML = '';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.maxLength = 24;
+      input.value = dev.name;
+      const saveBtn = document.createElement('button');
+      saveBtn.className = 'btn primary small';
+      saveBtn.textContent = 'Save';
+      const commit = async () => {
+        const nextName = input.value.trim() || defaultDeviceName(dev.os);
+        await chrome.runtime.sendMessage({
+          type: 'RENAME_DEVICE',
+          deviceId: dev.deviceId,
+          name: nextName,
+          os: dev.os,
+        });
+        showToast(`Renamed to "${nextName}"`);
+        refresh();
+      };
+      saveBtn.onclick = commit;
+      input.onkeydown = (e) => {
+        if (e.key === 'Enter') commit();
+      };
+      row.appendChild(input);
+      row.appendChild(saveBtn);
+      input.focus();
+      input.select();
+    };
+    actions.appendChild(renameBtn);
+
+    if (!isSelf) {
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'chip danger';
+      removeBtn.textContent = 'Remove';
+      removeBtn.onclick = async () => {
+        await chrome.runtime.sendMessage({
+          type: 'REMOVE_DEVICE',
+          deviceId: dev.deviceId,
+        });
+        showToast(`Removed "${dev.name}"`);
+        refresh();
+      };
+      actions.appendChild(removeBtn);
+    }
+
+    row.appendChild(info);
+    row.appendChild(actions);
+    deviceList.appendChild(row);
+  }
+}
+
 async function refresh() {
   const state = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
+  myDeviceId = state.deviceId || '';
   currentDeviceOs = state.deviceOs || 'windows';
   currentDeviceName = state.deviceName || defaultDeviceName(currentDeviceOs);
-  deviceNameInput.value = currentDeviceName;
+  pairedDevices = Array.isArray(state.devices) ? state.devices : [];
   renderDevicePill();
+  renderDeviceList();
+  renderTargetBar();
 
   statusDot.className = `dot ${state.paired ? state.status : 'disconnected'}`;
   statusText.textContent = !state.paired
@@ -91,6 +224,7 @@ async function refresh() {
 
   if (!state.paired) {
     setView(true);
+    pairBox.classList.remove('hidden');
   }
 
   renderHistory(state.history || []);
@@ -121,8 +255,13 @@ function renderHistory(items) {
     const os = item.senderOs || (item.direction === 'out' ? currentDeviceOs : 'other');
     sender.appendChild(createOsSvg(os, 12));
     const nameSpan = document.createElement('span');
-    nameSpan.textContent =
+    const baseName =
       item.senderName || (item.direction === 'out' ? currentDeviceName : 'Other device');
+    const toSuffix =
+      Array.isArray(item.targetNames) && item.targetNames.length > 0
+        ? ` → ${item.targetNames.join(', ')}`
+        : '';
+    nameSpan.textContent = `${baseName}${toSuffix}`;
     sender.appendChild(nameSpan);
     head.appendChild(sender);
 
@@ -173,25 +312,10 @@ toggleSettingsBtn.addEventListener('click', () => {
 
 devicePill.addEventListener('click', () => {
   setView(true);
-  deviceNameInput.focus();
-  deviceNameInput.select();
 });
 
-async function commitDeviceName() {
-  const next = deviceNameInput.value.trim() || defaultDeviceName(currentDeviceOs);
-  currentDeviceName = next;
-  deviceNameInput.value = next;
-  await chrome.storage.local.set({ deviceName: next });
-  renderDevicePill();
-  showToast(`Saved as "${next}"`);
-}
-
-saveNameBtn.addEventListener('click', commitDeviceName);
-deviceNameInput.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    commitDeviceName();
-  }
+togglePairBtn.addEventListener('click', () => {
+  pairBox.classList.toggle('hidden');
 });
 
 savePairBtn.addEventListener('click', async () => {
@@ -210,10 +334,11 @@ savePairBtn.addEventListener('click', async () => {
       keyB64,
     });
     pairInput.value = '';
+    pairBox.classList.add('hidden');
     await chrome.runtime.sendMessage({ type: 'RECONNECT' });
     setView(false);
     showToast('Paired!');
-    setTimeout(refresh, 500);
+    setTimeout(refresh, 600);
   } catch {
     showToast('Paste the full pair link');
   }
@@ -223,6 +348,14 @@ autoOpenEl.addEventListener('change', async () => {
   await chrome.storage.local.set({ autoOpen: autoOpenEl.checked });
   showToast(autoOpenEl.checked ? 'Auto-open on' : 'Auto-open off');
 });
+
+function getSelectedTargetsPayload() {
+  if (!selectedTargetIds.length) return {};
+  const names = pairedDevices
+    .filter((d) => selectedTargetIds.includes(d.deviceId))
+    .map((d) => d.name);
+  return { targetIds: selectedTargetIds, targetNames: names };
+}
 
 sendTabBtn.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -234,6 +367,7 @@ sendTabBtn.addEventListener('click', async () => {
     type: 'SEND',
     content: tab.url,
     title: tab.title,
+    ...getSelectedTargetsPayload(),
   });
   if (!res.ok) {
     showToast('Could not send right now');
@@ -246,7 +380,11 @@ sendTabBtn.addEventListener('click', async () => {
 async function submitDraft() {
   const content = draftEl.value.trim();
   if (!content) return;
-  const res = await chrome.runtime.sendMessage({ type: 'SEND', content });
+  const res = await chrome.runtime.sendMessage({
+    type: 'SEND',
+    content,
+    ...getSelectedTargetsPayload(),
+  });
   if (!res.ok) {
     showToast('Could not send right now');
     return;
@@ -270,4 +408,6 @@ clearBtn.addEventListener('click', async () => {
   refresh();
 });
 
+// Opening the popup clears unread badge counter
+chrome.runtime.sendMessage({ type: 'MARK_READ' }).catch(() => {});
 refresh();
