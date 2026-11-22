@@ -409,6 +409,27 @@ input[type='text'] {
   color: var(--cyan);
 }
 
+.version-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 0;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.update-pill {
+  background: rgba(245, 158, 11, 0.18);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  color: #fde68a;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
 .composer {
   display: flex;
   flex-direction: column;

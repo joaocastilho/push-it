@@ -1,3 +1,4 @@
+import pkg from '../package.json';
 import { RoomDO, VAPID_DO_NAME, type Env } from './room-do';
 
 export { RoomDO };
@@ -7,6 +8,13 @@ const ROOM_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    if (url.pathname === '/api/version' && request.method === 'GET') {
+      return Response.json(
+        { version: pkg.version },
+        { headers: { 'cache-control': 'no-store' } },
+      );
+    }
 
     if (url.pathname === '/api/vapid-public-key' && request.method === 'GET') {
       if (env.VAPID_PUBLIC_KEY) {

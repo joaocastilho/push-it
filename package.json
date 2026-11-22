@@ -1,6 +1,6 @@
 {
   "name": "push-it",
-  "version": "0.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,10 @@
     "preview": "vite build && wrangler dev",
     "deploy": "vite build && wrangler deploy",
     "gen:vapid": "bun run scripts/gen-vapid.ts",
+    "bump:patch": "bun run scripts/bump-version.ts patch",
+    "bump:minor": "bun run scripts/bump-version.ts minor",
+    "bump:major": "bun run scripts/bump-version.ts major",
+    "prepare": "git config core.hooksPath .githooks || true",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.worker.json --noEmit"
   },
   "dependencies": {

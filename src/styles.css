@@ -521,6 +521,16 @@ h2 {
   word-break: break-all;
 }
 
+.version-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 0 12px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
 .composer-bar {
   display: flex;
   align-items: flex-end;

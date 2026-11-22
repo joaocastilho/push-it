@@ -28,7 +28,11 @@ const attachBtn = document.getElementById('attachBtn');
 const draftEl = document.getElementById('draft');
 const sendDraftBtn = document.getElementById('sendDraft');
 const clearBtn = document.getElementById('clearBtn');
+const versionText = document.getElementById('versionText');
+const updateHint = document.getElementById('updateHint');
 const historyList = document.getElementById('historyList');
+const extVersion = chrome.runtime.getManifest().version;
+versionText.textContent = `Version v${extVersion}`;
 
 let myDeviceId = '';
 let currentDeviceOs = 'windows';
@@ -264,6 +268,18 @@ async function refresh() {
   if (!state.paired) {
     setView(true);
     pairBox.classList.remove('hidden');
+  } else if (currentServerUrl) {
+    fetch(`${new URL(currentServerUrl).origin}/api/version`, { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.version && d.version !== extVersion) {
+          updateHint.textContent = `v${d.version} available · reload extension`;
+          updateHint.classList.remove('hidden');
+        } else {
+          updateHint.classList.add('hidden');
+        }
+      })
+      .catch(() => {});
   }
 
   renderHistory(state.history || []);

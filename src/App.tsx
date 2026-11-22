@@ -76,6 +76,8 @@ export default function App() {
   const [toast, setToast] = createSignal<string>('');
   const [popupWarning, setPopupWarning] = createSignal<string>('');
   const [unreadCount, setUnreadCount] = createSignal<number>(0);
+  const [serverVersion, setServerVersion] = createSignal<string | null>(null);
+  const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0';
 
   let chatEndEl: HTMLDivElement | undefined;
   let fileInputEl: HTMLInputElement | undefined;
@@ -404,10 +406,18 @@ export default function App() {
     },
   );
 
-  // 2. Generate QR code when Add Device is open in Settings
+  // 2. Generate QR code & check server version when Settings is open
   createEffect(
     () => [view(), showAddDevice(), pairUrl()] as const,
     ([activeView, adding, url]) => {
+      if (activeView === 'settings') {
+        fetch('/api/version', { cache: 'no-store' })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d: { version?: string } | null) => {
+            if (d?.version) setServerVersion(d.version);
+          })
+          .catch(() => {});
+      }
       if (activeView !== 'settings' || !adding || !url) return;
       QRCode.toDataURL(url, {
         width: 220,
@@ -1119,6 +1129,18 @@ export default function App() {
                 </button>
               </div>
             </section>
+
+            <div class="version-footer">
+              <span>Version v{appVersion}</span>
+              <Show when={serverVersion() && serverVersion() !== appVersion}>
+                <button
+                  class="chip primary"
+                  onClick={() => window.location.reload()}
+                >
+                  v{serverVersion()} available · Refresh
+                </button>
+              </Show>
+            </div>
           </main>
         }
       >
