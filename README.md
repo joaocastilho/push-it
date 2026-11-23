@@ -33,7 +33,7 @@ Click your browser family below to download the ready-to-add extension:
 3. Click **Create New Room**.
 
 ### 2. Pair Your Other Devices
-1. On your first device, open **Settings → + Add Device** (or **+ Invite** in the extension).
+1. On your first device, open **Settings → + Add Device** (or tap **+ Add Device** in the banner when your room only has one device).
 2. You'll see a **single-use 6-digit code** (valid for 5 minutes) and a **QR code**.
 3. On your other device, simply **type the 6 digits** or **scan the QR code** — and enter your Room PIN if you set one.
 
@@ -42,10 +42,10 @@ Click your browser family below to download the ready-to-add extension:
   - With **1 other device**, it sends right away and shows a quick confirmation toast.
   - With **multiple devices**, it asks which device (or **All Devices**) to send to, then confirms with a toast.
 - **From iPhone / iPad:** Add Push It to your Home Screen for notifications, and use the 2-step **iOS Share Sheet** card in Settings to get the same share picker and toast.
-- **From your computer:** Click **Push This Tab**, paste text or screenshots (`Ctrl+V`), attach files (up to **7.5 MB**, with inline photo previews), or right-click any page/link → **Push It**.
-- **Auto-burn timer:** Pick a timer right above the message box (`30 sec`, `1 min`, `5 min`, or `10 min`) when sending sensitive notes or codes so they wipe automatically.
+- **From your computer:** Click **Share tab link**, paste text or screenshots (`Ctrl+V`), attach files (up to **7.5 MB**, with inline photo previews), or right-click any page/link → **Push It**.
+- **Auto-burn timer:** Pick a timer right above the message box (`30 sec`, `1 min`, `5 min`, or `10 min`) when sending sensitive notes, files, or shared tab links so they wipe automatically.
 - **Easy chat management:**
-  - Every device keeps its own consistent bubble color so you can tell who sent what at a glance.
+  - Every device keeps its own consistent bubble color (customizable in **Settings → Devices**) so you can tell who sent what at a glance.
   - Tap the **search icon** to find past links, notes, or files instantly.
   - Tap the **copy icon** (or tap a bubble on mobile) to copy to clipboard, and **press and hold** on text to select specific words.
   - Tap the **bin icon** (or **swipe left** on mobile) to delete any message with a quick confirmation.

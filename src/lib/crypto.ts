@@ -30,6 +30,7 @@ export interface EncryptedEnvelope {
 export interface DeviceMeta {
   name: string;
   os: DeviceOs;
+  color?: number;
 }
 
 export interface ParsedPairLink {

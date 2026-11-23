@@ -5,6 +5,7 @@ import {
   decryptBytes,
   defaultDeviceName,
   deriveRoomId,
+  DEVICE_COLOR_OPTIONS,
   deviceColorIndex,
   formatFileSize,
   formatRelativeTime,
@@ -62,7 +63,6 @@ const createRoomBtn = document.getElementById('createRoomBtn');
 const autoOpenEl = document.getElementById('autoOpen');
 const targetBar = document.getElementById('targetBar');
 const sendTabBtn = document.getElementById('sendTab');
-const sendTabLabel = document.getElementById('sendTabLabel');
 const burnControl = document.getElementById('burnControl');
 const burnLabelEl = document.getElementById('burnLabel');
 const burnSelect = document.getElementById('burnSelect');
@@ -270,6 +270,14 @@ function renderTargetBar() {
   }
 }
 
+function getDeviceColor(senderId, fallback) {
+  if (senderId) {
+    const match = pairedDevices.find((d) => d.deviceId === senderId);
+    if (typeof match?.color === 'number') return match.color;
+  }
+  return deviceColorIndex(senderId || fallback);
+}
+
 function renderDeviceList() {
   devicesHeading.textContent = `Devices (${pairedDevices.length})`;
   deviceList.innerHTML = '';
@@ -278,6 +286,9 @@ function renderDeviceList() {
     const isSelf = dev.deviceId === myDeviceId;
     const row = document.createElement('div');
     row.className = 'device-row';
+
+    const mainRow = document.createElement('div');
+    mainRow.className = 'device-row-main';
 
     const info = document.createElement('div');
     info.className = 'device-info';
@@ -310,7 +321,7 @@ function renderDeviceList() {
     renameBtn.className = 'chip';
     renameBtn.textContent = 'Rename';
     renameBtn.onclick = () => {
-      row.innerHTML = '';
+      mainRow.innerHTML = '';
       const input = document.createElement('input');
       input.type = 'text';
       input.maxLength = 24;
@@ -325,6 +336,7 @@ function renderDeviceList() {
           deviceId: dev.deviceId,
           name: nextName,
           os: dev.os,
+          color: dev.color,
         });
         showToast(`Renamed to "${nextName}"`);
         refresh();
@@ -333,8 +345,8 @@ function renderDeviceList() {
       input.onkeydown = (e) => {
         if (e.key === 'Enter') commit();
       };
-      row.appendChild(input);
-      row.appendChild(saveBtn);
+      mainRow.appendChild(input);
+      mainRow.appendChild(saveBtn);
       input.focus();
       input.select();
     };
@@ -355,8 +367,47 @@ function renderDeviceList() {
       actions.appendChild(removeBtn);
     }
 
-    row.appendChild(info);
-    row.appendChild(actions);
+    mainRow.appendChild(info);
+    mainRow.appendChild(actions);
+    row.appendChild(mainRow);
+
+    const colorRow = document.createElement('div');
+    colorRow.className = 'device-color-row';
+    const colorLbl = document.createElement('span');
+    colorLbl.className = 'device-color-label';
+    colorLbl.textContent = 'Chat color:';
+    colorRow.appendChild(colorLbl);
+
+    const swatches = document.createElement('div');
+    swatches.className = 'color-swatches';
+    const activeColor = typeof dev.color === 'number' ? dev.color : deviceColorIndex(dev.deviceId);
+    for (const opt of DEVICE_COLOR_OPTIONS) {
+      const sw = document.createElement('button');
+      sw.type = 'button';
+      sw.className = `color-swatch ${activeColor === opt.index ? 'active' : ''}`;
+      sw.style.setProperty('--swatch', opt.swatch);
+      sw.title = opt.name;
+      sw.setAttribute('aria-label', `${opt.name} color`);
+      sw.setAttribute('aria-pressed', String(activeColor === opt.index));
+      sw.onclick = async () => {
+        dev.color = opt.index;
+        renderDeviceList();
+        renderHistory(allHistory);
+        await chrome.runtime.sendMessage({
+          type: 'SET_DEVICE_COLOR',
+          deviceId: dev.deviceId,
+          name: dev.name,
+          os: dev.os,
+          color: opt.index,
+        });
+        showToast(`${dev.name} color set to ${opt.name}`);
+        refresh();
+      };
+      swatches.appendChild(sw);
+    }
+    colorRow.appendChild(swatches);
+    row.appendChild(colorRow);
+
     deviceList.appendChild(row);
   }
 }
@@ -557,7 +608,7 @@ function renderHistory(items) {
     const row = document.createElement('div');
     row.className = `bubble-row ${item.direction}`;
 
-    const colorIdx = deviceColorIndex(item.senderId || item.senderName);
+    const colorIdx = getDeviceColor(item.senderId, item.senderName);
     const bubble = document.createElement('div');
     bubble.className = `bubble ${item.direction} dev-c${colorIdx}`;
 
@@ -978,7 +1029,7 @@ function getSelectedTargetsPayload() {
 burnSelect.addEventListener('change', () => {
   burnMs = Number(burnSelect.value) || 0;
   burnControl.classList.toggle('active', burnMs > 0);
-  burnLabelEl.textContent = burnMs > 0 ? '🔥 Auto-burn next message:' : '⏱ Auto-burn:';
+  burnLabelEl.textContent = burnMs > 0 ? '🔥 Auto-burn:' : '⏱ Auto-burn:';
 });
 
 attachBtn.addEventListener('click', () => fileInput.click());
@@ -1033,19 +1084,6 @@ draftEl.addEventListener('paste', (e) => {
     }
   }
 });
-
-// Show active tab title/host in the quick Push This Tab bar
-chrome.tabs
-  .query({ active: true, currentWindow: true })
-  .then(([tab]) => {
-    if (tab?.url && isSafeHttpUrl(tab.url)) {
-      const label = tab.title
-        ? `Push tab: ${tab.title}`
-        : `Push tab: ${new URL(tab.url).host}`;
-      sendTabLabel.textContent = label;
-    }
-  })
-  .catch(() => {});
 
 sendTabBtn.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });

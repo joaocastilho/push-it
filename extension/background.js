@@ -24,6 +24,7 @@ import {
   isValidKeyB64,
   isValidSixDigitCode,
   makeAuthHeader,
+  normalizeDeviceColor,
   normalizeOs,
 } from './crypto.js';
 
@@ -190,12 +191,14 @@ async function setupContextMenus() {
   });
 }
 
-async function updateDeviceRecord(targetDevId, name, os) {
+async function updateDeviceRecord(targetDevId, name, os, color) {
   const cfg = await getConfig();
   if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken || !targetDevId) return;
   const roomId = await deriveRoomId(cfg.keyB64);
   const base = new URL(cfg.serverUrl);
-  const enc = await encryptJson(cfg.keyB64, { name, os }, deviceAad(roomId, targetDevId));
+  const safeColor = normalizeDeviceColor(color);
+  const meta = safeColor !== undefined ? { name, os, color: safeColor } : { name, os };
+  const enc = await encryptJson(cfg.keyB64, meta, deviceAad(roomId, targetDevId));
   const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/devices`, {
     method: 'POST',
     headers: authHeaders(cfg, { 'content-type': 'application/json' }),
@@ -236,10 +239,12 @@ async function refreshDevices() {
         );
         const os = normalizeOs(meta.os);
         const name = meta.name ? String(meta.name) : defaultDeviceName(os);
+        const color = normalizeDeviceColor(meta.color);
         list.push({
           deviceId: d.deviceId,
           name,
           os,
+          color,
           online: Boolean(d.online),
           updatedAt: d.updatedAt,
           lastSeenAt: d.lastSeenAt || d.updatedAt,
@@ -1149,7 +1154,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg.deviceId === cfg.deviceId) {
         await chrome.storage.local.set({ deviceName: msg.name });
       }
-      await updateDeviceRecord(msg.deviceId, msg.name, msg.os);
+      await updateDeviceRecord(msg.deviceId, msg.name, msg.os, msg.color);
+      const devices = await refreshDevices();
+      sendResponse({ ok: true, devices });
+      return;
+    }
+
+    if (msg.type === 'SET_DEVICE_COLOR') {
+      await updateDeviceRecord(msg.deviceId, msg.name, msg.os, msg.color);
       const devices = await refreshDevices();
       sendResponse({ ok: true, devices });
       return;

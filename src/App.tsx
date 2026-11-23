@@ -46,9 +46,11 @@ import {
 import {
   defaultDeviceName,
   detectOs,
+  DEVICE_COLOR_OPTIONS,
   deviceColorIndex,
   isIosDevice,
   isStandalonePwa,
+  normalizeDeviceColor,
   normalizeOs,
   type DeviceOs,
 } from './lib/device';
@@ -64,6 +66,7 @@ interface PairedDevice {
   deviceId: string;
   name: string;
   os: DeviceOs;
+  color?: number;
   online: boolean;
   updatedAt: number;
   lastSeenAt?: number;
@@ -338,15 +341,13 @@ export default function App() {
     targetDevId: string,
     name: string,
     os: DeviceOs,
+    color?: number,
     myId = deviceId(),
     tok = deviceToken(),
   ) {
     if (!rid || !k || !targetDevId || !myId || !tok) return;
-    const enc = await encryptJson(
-      k,
-      { name, os } satisfies DeviceMeta,
-      deviceAad(rid, targetDevId),
-    );
+    const meta: DeviceMeta = color !== undefined ? { name, os, color } : { name, os };
+    const enc = await encryptJson(k, meta, deviceAad(rid, targetDevId));
     const res = await fetch(`/api/room/${encodeURIComponent(rid)}/devices`, {
       method: 'POST',
       headers: authHeaders(myId, tok, { 'content-type': 'application/json' }),
@@ -399,10 +400,12 @@ export default function App() {
           );
           const os = normalizeOs(meta.os);
           const name = meta.name ? String(meta.name) : defaultDeviceName(os);
+          const color = normalizeDeviceColor(meta.color);
           decrypted.push({
             deviceId: d.deviceId,
             name,
             os,
+            color,
             online: d.online,
             updatedAt: d.updatedAt,
             lastSeenAt: d.lastSeenAt || d.updatedAt,
@@ -1546,6 +1549,14 @@ export default function App() {
     }
   }
 
+  function getDeviceColorIndex(senderId?: string, fallback?: string): number {
+    if (senderId) {
+      const match = devices().find((d) => d.deviceId === senderId);
+      if (match?.color !== undefined) return match.color;
+    }
+    return deviceColorIndex(senderId || fallback);
+  }
+
   async function saveEditedDevice(dev: PairedDevice) {
     const nextName = editDeviceDraft().trim() || defaultDeviceName(dev.os);
     setEditingDeviceId(null);
@@ -1553,9 +1564,19 @@ export default function App() {
       setDeviceName(nextName);
       await kvSet('deviceName', nextName);
     }
-    await updateDeviceRecord(roomId(), keyB64(), dev.deviceId, nextName, dev.os);
+    await updateDeviceRecord(roomId(), keyB64(), dev.deviceId, nextName, dev.os, dev.color);
     await refreshDevices();
     notify(`Renamed to "${nextName}"`);
+  }
+
+  async function setDeviceColor(dev: PairedDevice, colorIdx: number) {
+    setDevices((prev) =>
+      prev.map((d) => (d.deviceId === dev.deviceId ? { ...d, color: colorIdx } : d)),
+    );
+    await updateDeviceRecord(roomId(), keyB64(), dev.deviceId, dev.name, dev.os, colorIdx);
+    await refreshDevices();
+    const label = DEVICE_COLOR_OPTIONS.find((c) => c.index === colorIdx)?.name || 'Color';
+    notify(`${dev.name} color set to ${label}`);
   }
 
   async function removeDevice(dev: PairedDevice) {
@@ -2202,40 +2223,64 @@ export default function App() {
                                 </form>
                               }
                             >
-                              <div class="device-info">
-                                <span
-                                  class={`dot ${dev.online || isSelf ? 'connected' : 'disconnected'}`}
-                                />
-                                <OsIcon os={dev.os} size={15} />
-                                <div class="device-meta-col">
-                                  <div class="device-name-line">
-                                    <span class="device-name">{dev.name}</span>
-                                    <Show when={isSelf}>
-                                      <span class="self-tag">This device</span>
-                                    </Show>
+                              <div class="device-row-main">
+                                <div class="device-info">
+                                  <span
+                                    class={`dot ${dev.online || isSelf ? 'connected' : 'disconnected'}`}
+                                  />
+                                  <OsIcon os={dev.os} size={15} />
+                                  <div class="device-meta-col">
+                                    <div class="device-name-line">
+                                      <span class="device-name">{dev.name}</span>
+                                      <Show when={isSelf}>
+                                        <span class="self-tag">This device</span>
+                                      </Show>
+                                    </div>
+                                    <span class="device-activity">
+                                      {dev.online || isSelf
+                                        ? 'Online'
+                                        : formatRelativeTime(dev.lastSeenAt || dev.updatedAt)}
+                                    </span>
                                   </div>
-                                  <span class="device-activity">
-                                    {dev.online || isSelf
-                                      ? 'Online'
-                                      : formatRelativeTime(dev.lastSeenAt || dev.updatedAt)}
-                                  </span>
+                                </div>
+                                <div class="row gap">
+                                  <button
+                                    class="chip"
+                                    onClick={() => {
+                                      setEditingDeviceId(dev.deviceId);
+                                      setEditDeviceDraft(dev.name);
+                                    }}
+                                  >
+                                    Rename
+                                  </button>
+                                  <Show when={!isSelf}>
+                                    <button class="chip danger" onClick={() => removeDevice(dev)}>
+                                      Remove
+                                    </button>
+                                  </Show>
                                 </div>
                               </div>
-                              <div class="row gap">
-                                <button
-                                  class="chip"
-                                  onClick={() => {
-                                    setEditingDeviceId(dev.deviceId);
-                                    setEditDeviceDraft(dev.name);
-                                  }}
-                                >
-                                  Rename
-                                </button>
-                                <Show when={!isSelf}>
-                                  <button class="chip danger" onClick={() => removeDevice(dev)}>
-                                    Remove
-                                  </button>
-                                </Show>
+                              <div class="device-color-row" role="group" aria-label={`Chat color for ${dev.name}`}>
+                                <span class="device-color-label">Chat color:</span>
+                                <div class="color-swatches">
+                                  <For each={DEVICE_COLOR_OPTIONS}>
+                                    {(opt) => {
+                                      const activeColor = () =>
+                                        dev.color ?? deviceColorIndex(dev.deviceId);
+                                      return (
+                                        <button
+                                          type="button"
+                                          class={`color-swatch ${activeColor() === opt.index ? 'active' : ''}`}
+                                          style={{ '--swatch': opt.swatch }}
+                                          title={opt.name}
+                                          aria-label={`${opt.name} color`}
+                                          aria-pressed={activeColor() === opt.index ? 'true' : 'false'}
+                                          onClick={() => setDeviceColor(dev, opt.index)}
+                                        />
+                                      );
+                                    }}
+                                  </For>
+                                </div>
                               </div>
                             </Show>
                           </div>
@@ -2613,7 +2658,7 @@ export default function App() {
                     msg.targetNames && msg.targetNames.length > 0
                       ? ` → ${msg.targetNames.join(', ')}`
                       : '';
-                  const colorIdx = deviceColorIndex(msg.senderId || label);
+                  const colorIdx = () => getDeviceColorIndex(msg.senderId, label);
                   const isLink = msg.type === 'link' && isSafeHttpUrl(msg.content);
                   const isFile = msg.type === 'file';
                   const isImage = isFile && Boolean(msg.mimeType?.startsWith('image/'));
@@ -2648,7 +2693,7 @@ export default function App() {
                         }}
                       >
                         <article
-                          class={`bubble ${msg.direction} dev-c${colorIdx} ${!isFile ? 'tappable' : ''}`}
+                          class={`bubble ${msg.direction} dev-c${colorIdx()} ${!isFile ? 'tappable' : ''}`}
                           onClick={(e) => handleBubbleClick(msg, e)}
                         >
                           <div class="bubble-head">

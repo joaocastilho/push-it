@@ -42,7 +42,25 @@ export function normalizeOs(value) {
   return 'other';
 }
 
-export const DEVICE_COLOR_COUNT = 8;
+export const DEVICE_COLOR_OPTIONS = [
+  { index: 0, name: 'Indigo', swatch: '#6366f1' },
+  { index: 1, name: 'Sky', swatch: '#0ea5e9' },
+  { index: 2, name: 'Emerald', swatch: '#10b981' },
+  { index: 3, name: 'Amber', swatch: '#f59e0b' },
+  { index: 4, name: 'Rose', swatch: '#f43f5e' },
+  { index: 5, name: 'Violet', swatch: '#a855f7' },
+  { index: 6, name: 'Teal', swatch: '#14b8a6' },
+  { index: 7, name: 'Slate', swatch: '#64748b' },
+];
+
+export const DEVICE_COLOR_COUNT = DEVICE_COLOR_OPTIONS.length;
+
+export function normalizeDeviceColor(value) {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < DEVICE_COLOR_COUNT) {
+    return value;
+  }
+  return undefined;
+}
 
 export function deviceColorIndex(deviceId) {
   const s = String(deviceId || 'default');
