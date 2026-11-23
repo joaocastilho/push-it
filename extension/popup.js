@@ -1,3 +1,5 @@
+import { toDataURL as qrToDataURL } from './qrcode.js';
+import { clearExtBlobs, getExtBlob, saveExtBlob } from './db.js';
 import {
   blobAad,
   decryptBytes,
@@ -37,9 +39,13 @@ const inviteBox = document.getElementById('inviteBox');
 const inviteTimerEl = document.getElementById('inviteTimer');
 const inviteCodeDisplay = document.getElementById('inviteCodeDisplay');
 const copyCodeBtn = document.getElementById('copyCodeBtn');
+const inviteQrWrap = document.getElementById('inviteQrWrap');
+const inviteQrImg = document.getElementById('inviteQrImg');
 const inviteOutput = document.getElementById('inviteOutput');
 const copyInviteBtn = document.getElementById('copyInviteBtn');
 const cancelInviteBtn = document.getElementById('cancelInviteBtn');
+const soloBanner = document.getElementById('soloBanner');
+const soloAddDeviceBtn = document.getElementById('soloAddDeviceBtn');
 const toggleLinkModeBtn = document.getElementById('toggleLinkMode');
 const pairByCode = document.getElementById('pairByCode');
 const pairByLink = document.getElementById('pairByLink');
@@ -57,8 +63,9 @@ const autoOpenEl = document.getElementById('autoOpen');
 const targetBar = document.getElementById('targetBar');
 const sendTabBtn = document.getElementById('sendTab');
 const sendTabLabel = document.getElementById('sendTabLabel');
-const sendClipBtn = document.getElementById('sendClipBtn');
-const burnBtn = document.getElementById('burnBtn');
+const burnControl = document.getElementById('burnControl');
+const burnLabelEl = document.getElementById('burnLabel');
+const burnSelect = document.getElementById('burnSelect');
 const fileInput = document.getElementById('fileInput');
 const attachBtn = document.getElementById('attachBtn');
 const draftEl = document.getElementById('draft');
@@ -92,13 +99,7 @@ let searchQuery = '';
 let burnMs = 0;
 let toastTimer;
 let inviteInterval;
-
-const BURN_OPTIONS = [
-  { ms: 0, label: '⏱ Keep' },
-  { ms: 5 * 60 * 1000, label: '🔥 5m' },
-  { ms: 60 * 60 * 1000, label: '🔥 1h' },
-  { ms: 24 * 60 * 60 * 1000, label: '🔥 24h' },
-];
+const blobObjectUrls = new Map();
 
 const OS_PATHS = {
   windows:
@@ -360,45 +361,57 @@ function renderDeviceList() {
   }
 }
 
+async function ensureExtBlobUrl(item) {
+  if (!item.blobId || !item.blobIv || !currentServerUrl || !currentKeyB64 || !myDeviceId || !currentDeviceToken) {
+    return null;
+  }
+  if (blobObjectUrls.has(item.blobId)) {
+    return blobObjectUrls.get(item.blobId);
+  }
+  let cached = await getExtBlob(item.blobId).catch(() => null);
+  if (!cached) {
+    try {
+      const roomId = await deriveRoomId(currentKeyB64);
+      const base = new URL(currentServerUrl);
+      const res = await fetch(
+        `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(item.blobId)}`,
+        { headers: { authorization: makeAuthHeader(myDeviceId, currentDeviceToken) } },
+      );
+      if (!res.ok) return null;
+      const cipher = new Uint8Array(await res.arrayBuffer());
+      const plain = await decryptBytes(
+        currentKeyB64,
+        item.blobIv,
+        cipher,
+        blobAad(roomId, item.blobId),
+      );
+      const copyBuf = plain.buffer.slice(plain.byteOffset, plain.byteOffset + plain.byteLength);
+      cached = {
+        id: item.blobId,
+        data: copyBuf,
+        mimeType: item.mimeType || 'application/octet-stream',
+        fileName: item.fileName || 'file',
+      };
+      await saveExtBlob(cached).catch(() => {});
+    } catch {
+      return null;
+    }
+  }
+  const url = URL.createObjectURL(new Blob([cached.data], { type: cached.mimeType }));
+  blobObjectUrls.set(item.blobId, url);
+  return url;
+}
+
 async function downloadFileItem(item) {
-  if (
-    !item.blobId ||
-    !item.blobIv ||
-    !currentServerUrl ||
-    !currentKeyB64 ||
-    !myDeviceId ||
-    !currentDeviceToken
-  ) {
+  const url = await ensureExtBlobUrl(item);
+  if (!url) {
+    showToast('File already expired or downloaded');
     return;
   }
-  try {
-    const roomId = await deriveRoomId(currentKeyB64);
-    const base = new URL(currentServerUrl);
-    const res = await fetch(
-      `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(item.blobId)}`,
-      { headers: { authorization: makeAuthHeader(myDeviceId, currentDeviceToken) } },
-    );
-    if (!res.ok) {
-      showToast('File already expired or downloaded');
-      return;
-    }
-    const cipher = new Uint8Array(await res.arrayBuffer());
-    const plain = await decryptBytes(
-      currentKeyB64,
-      item.blobIv,
-      cipher,
-      blobAad(roomId, item.blobId),
-    );
-    const blob = new Blob([plain], { type: item.mimeType || 'application/octet-stream' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = item.fileName || 'file';
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
-  } catch {
-    showToast('Could not download file');
-  }
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = item.fileName || 'file';
+  a.click();
 }
 
 function clearInviteUi() {
@@ -408,6 +421,8 @@ function clearInviteUi() {
   }
   activeInviteCode = '';
   inviteCodeDisplay.textContent = '--- – ---';
+  inviteQrWrap.classList.add('hidden');
+  inviteQrImg.src = '';
   inviteBox.classList.add('hidden');
   inviteOutput.value = '';
 }
@@ -455,6 +470,7 @@ async function refresh() {
   renderDevicePill();
   renderDeviceList();
   renderTargetBar();
+  soloBanner.classList.toggle('hidden', !state.paired || pairedDevices.length !== 1);
 
   isPairedState = Boolean(state.paired);
   statusDot.className = `dot ${isPairedState ? state.status : 'disconnected'}`;
@@ -609,13 +625,39 @@ function renderHistory(items) {
         chrome.tabs.create({ url: item.content, active: true });
       };
       bubble.appendChild(link);
+    } else if (item.type === 'file') {
+      const fileWrap = document.createElement('div');
+      fileWrap.className = 'file-card';
+      if (item.mimeType?.startsWith('image/') && item.blobId) {
+        const imgLink = document.createElement('a');
+        imgLink.className = 'photo-link hidden';
+        const img = document.createElement('img');
+        img.className = 'photo-preview';
+        img.alt = item.fileName || 'Photo';
+        imgLink.appendChild(img);
+        imgLink.onclick = (e) => {
+          e.preventDefault();
+          if (imgLink.href) chrome.tabs.create({ url: imgLink.href, active: true });
+        };
+        fileWrap.appendChild(imgLink);
+        ensureExtBlobUrl(item).then((url) => {
+          if (url) {
+            img.src = url;
+            imgLink.href = url;
+            imgLink.classList.remove('hidden');
+            historyList.scrollTop = historyList.scrollHeight;
+          }
+        });
+      }
+      const text = document.createElement('div');
+      text.className = 'bubble-text';
+      text.textContent = `${item.fileName || item.content}${item.fileSize ? ` (${formatFileSize(item.fileSize)})` : ''}`;
+      fileWrap.appendChild(text);
+      bubble.appendChild(fileWrap);
     } else {
       const text = document.createElement('div');
       text.className = 'bubble-text';
-      text.textContent =
-        item.type === 'file'
-          ? `${item.fileName || item.content}${item.fileSize ? ` (${formatFileSize(item.fileSize)})` : ''}`
-          : item.content;
+      text.textContent = item.content;
       bubble.appendChild(text);
     }
 
@@ -787,7 +829,7 @@ createRoomBtn.addEventListener('click', async () => {
   }
 });
 
-inviteBtn.addEventListener('click', async () => {
+async function openAndGenerateInvite() {
   inviteBtn.disabled = true;
   try {
     const res = await chrome.runtime.sendMessage({ type: 'CREATE_INVITE' });
@@ -802,10 +844,28 @@ inviteBtn.addEventListener('click', async () => {
     inviteOutput.value = res.inviteUrl;
     inviteBox.classList.remove('hidden');
     startInviteCountdown(res.expiresAt);
+    try {
+      const qrData = await qrToDataURL(res.inviteUrl, {
+        width: 180,
+        margin: 2,
+        color: { dark: '#0b0f19', light: '#ffffff' },
+      });
+      inviteQrImg.src = qrData;
+      inviteQrWrap.classList.remove('hidden');
+    } catch {
+      inviteQrWrap.classList.add('hidden');
+    }
     showToast('Single-use invite ready');
   } finally {
     inviteBtn.disabled = false;
   }
+}
+
+inviteBtn.addEventListener('click', openAndGenerateInvite);
+
+soloAddDeviceBtn.addEventListener('click', () => {
+  setView(true);
+  openAndGenerateInvite();
 });
 
 copyCodeBtn.addEventListener('click', async () => {
@@ -915,52 +975,10 @@ function getSelectedTargetsPayload() {
   return { targetIds: selectedTargetIds, targetNames: names, ...extra };
 }
 
-burnBtn.addEventListener('click', () => {
-  const idx = BURN_OPTIONS.findIndex((o) => o.ms === burnMs);
-  const next = BURN_OPTIONS[(idx + 1) % BURN_OPTIONS.length];
-  burnMs = next.ms;
-  burnBtn.textContent = next.label;
-  burnBtn.classList.toggle('burn-active', burnMs > 0);
-  showToast(burnMs > 0 ? `Auto-burn: ${next.label.replace('🔥 ', '')}` : 'Auto-burn off');
-});
-
-sendClipBtn.addEventListener('click', async () => {
-  try {
-    if (navigator.clipboard?.read) {
-      try {
-        const items = await navigator.clipboard.read();
-        for (const item of items) {
-          const imgType = item.types.find((t) => t.startsWith('image/'));
-          if (imgType) {
-            const blob = await item.getType(imgType);
-            const ext = imgType.split('/')[1] || 'png';
-            await pushFileObject(new File([blob], `clipboard.${ext}`, { type: imgType }));
-            return;
-          }
-        }
-      } catch {
-        // fall through to readText
-      }
-    }
-    const text = (await navigator.clipboard.readText()).trim();
-    if (!text) {
-      showToast('Clipboard is empty');
-      return;
-    }
-    const res = await chrome.runtime.sendMessage({
-      type: 'SEND',
-      content: text,
-      ...getSelectedTargetsPayload(),
-    });
-    if (!res.ok) {
-      showToast(res.error || 'Could not send right now');
-      return;
-    }
-    showToast('Pushed clipboard!');
-    refresh();
-  } catch {
-    showToast('Could not read clipboard');
-  }
+burnSelect.addEventListener('change', () => {
+  burnMs = Number(burnSelect.value) || 0;
+  burnControl.classList.toggle('active', burnMs > 0);
+  burnLabelEl.textContent = burnMs > 0 ? '🔥 Auto-burn next message:' : '⏱ Auto-burn:';
 });
 
 attachBtn.addEventListener('click', () => fileInput.click());
@@ -1077,9 +1095,21 @@ draftEl.addEventListener('keydown', (e) => {
 
 clearBtn.addEventListener('click', async () => {
   await chrome.storage.local.set({ history: [] });
+  await clearExtBlobs().catch(() => {});
   showToast('History cleared');
   refresh();
 });
+
+setInterval(() => {
+  if (!allHistory.some((m) => m.expiresAt)) return;
+  const now = Date.now();
+  const next = allHistory.filter((m) => !m.expiresAt || m.expiresAt > now);
+  if (next.length !== allHistory.length) {
+    allHistory = next;
+    chrome.storage.local.set({ history: next }).catch(() => {});
+  }
+  renderHistory(allHistory);
+}, 5000);
 
 chrome.runtime.sendMessage({ type: 'MARK_READ' }).catch(() => {});
 refresh();

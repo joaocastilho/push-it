@@ -134,6 +134,9 @@
               <span id="inviteCodeDisplay" class="code-display">--- – ---</span>
               <button id="copyCodeBtn" class="btn secondary small">Copy Code</button>
             </div>
+            <div id="inviteQrWrap" class="qr-wrap hidden">
+              <img id="inviteQrImg" class="qr-img" alt="Pairing QR Code" />
+            </div>
             <input id="inviteOutput" type="text" readonly />
             <div class="item-actions">
               <button id="copyInviteBtn" class="btn primary small">Copy Link</button>
@@ -167,6 +170,10 @@
       </section>
 
       <section id="chatView" class="chat-view hidden">
+        <div id="soloBanner" class="solo-banner hidden">
+          <span>Only this device is in this room</span>
+          <button id="soloAddDeviceBtn" class="btn primary small" type="button">+ Add Device</button>
+        </div>
         <div id="searchBar" class="search-bar hidden">
           <input id="searchInput" type="search" placeholder="Search messages, links, or device..." />
           <span id="searchCount" class="search-count hidden"></span>
@@ -176,28 +183,34 @@
         <div id="targetBar" class="target-bar hidden"></div>
 
         <footer class="composer-area">
-          <div class="quick-actions">
-            <button id="sendTab" class="tab-bar-btn" title="Push the active browser tab">
-              <span class="tab-bar-icon">↗</span>
-              <span id="sendTabLabel" class="tab-bar-text">Push This Tab</span>
-            </button>
-            <button id="sendClipBtn" class="mini-pill" title="Push text or image from clipboard">
-              📋
-            </button>
-            <button id="burnBtn" class="mini-pill" title="Auto-expire timer for next push">
-              ⏱ Keep
-            </button>
-          </div>
+          <button id="sendTab" class="tab-bar-btn" title="Push the active browser tab">
+            <span class="tab-bar-icon">↗</span>
+            <span id="sendTabLabel" class="tab-bar-text">Push This Tab</span>
+          </button>
 
-          <div class="input-box">
-            <input id="fileInput" type="file" class="hidden" />
-            <button id="attachBtn" class="icon-action" title="Attach photo or file">+</button>
-            <textarea
-              id="draft"
-              rows="1"
-              placeholder="Write a note, paste a link or screenshot..."
-            ></textarea>
-            <button id="sendDraft" class="send-btn">Push It</button>
+          <div class="input-card">
+            <div class="input-card-top">
+              <label id="burnControl" class="burn-control" for="burnSelect">
+                <span id="burnLabel">⏱ Auto-burn:</span>
+                <select id="burnSelect" class="burn-select">
+                  <option value="0">Keep</option>
+                  <option value="30000">30 sec</option>
+                  <option value="60000">1 min</option>
+                  <option value="300000">5 min</option>
+                  <option value="600000">10 min</option>
+                </select>
+              </label>
+            </div>
+            <div class="input-box">
+              <input id="fileInput" type="file" class="hidden" />
+              <button id="attachBtn" class="icon-action" title="Attach photo or file">+</button>
+              <textarea
+                id="draft"
+                rows="1"
+                placeholder="Write a note, paste a link or screenshot..."
+              ></textarea>
+              <button id="sendDraft" class="send-btn">Push It</button>
+            </div>
           </div>
         </footer>
       </section>

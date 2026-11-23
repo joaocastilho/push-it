@@ -1,3 +1,4 @@
+import { clearExtBlobs, deleteExtBlob, saveExtBlob } from './db.js';
 import {
   blobAad,
   decryptBytes,
@@ -728,6 +729,12 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
   if (!res.ok) throw new Error('Could not send file');
 
   const result = await res.json();
+  await saveExtBlob({
+    id: blobId,
+    data: plainBytes.buffer.slice(plainBytes.byteOffset, plainBytes.byteOffset + plainBytes.byteLength),
+    mimeType: mimeType || 'application/octet-stream',
+    fileName: fileName || 'file',
+  }).catch(() => {});
   await appendHistory({
     id: envelope.id,
     senderId: cfg.deviceId,
@@ -821,10 +828,13 @@ async function createNewRoom(rawServerUrl, roomPin, accessKey) {
     throw new Error(data.error || 'Could not create room');
   }
 
+  await clearExtBlobs().catch(() => {});
   await chrome.storage.local.set({
     serverUrl: parsed.origin,
     keyB64: freshKey,
     deviceToken: data.deviceToken,
+    history: [],
+    unreadCount: 0,
     revokedNotice: '',
   });
   stopSocket();
@@ -1124,6 +1134,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     if (msg.type === 'DELETE_MESSAGE') {
       const { history } = await getConfig();
+      const target = history.find((m) => m.id === msg.id);
+      if (target?.blobId) {
+        await deleteExtBlob(target.blobId).catch(() => {});
+      }
       const next = history.filter((m) => m.id !== msg.id);
       await chrome.storage.local.set({ history: next });
       sendResponse({ ok: true });

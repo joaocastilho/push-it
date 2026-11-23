@@ -1402,7 +1402,7 @@ export class RoomDO extends DurableObject<Env> {
       delete envelope.expiresAt;
     }
     const pushTtl = envelope.expiresAt
-      ? Math.max(60, Math.min(MAX_TTL_SECONDS, Math.ceil((envelope.expiresAt - now) / 1000)))
+      ? Math.max(30, Math.min(MAX_TTL_SECONDS, Math.ceil((envelope.expiresAt - now) / 1000)))
       : MAX_TTL_SECONDS;
     await this.touchDeviceLastSeen(auth.deviceId, now);
 

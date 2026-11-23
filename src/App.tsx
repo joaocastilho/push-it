@@ -83,9 +83,10 @@ const MAX_FILE_BYTES = 7.5 * 1024 * 1024;
 const LONG_TEXT_THRESHOLD = 1800;
 const BURN_OPTIONS = [
   { ms: 0, label: 'Keep' },
-  { ms: 5 * 60 * 1000, label: '5m' },
-  { ms: 60 * 60 * 1000, label: '1h' },
-  { ms: 24 * 60 * 60 * 1000, label: '24h' },
+  { ms: 30 * 1000, label: '30 sec' },
+  { ms: 60 * 1000, label: '1 min' },
+  { ms: 5 * 60 * 1000, label: '5 min' },
+  { ms: 10 * 60 * 1000, label: '10 min' },
 ] as const;
 
 function formatCountdown(seconds: number): string {
@@ -547,7 +548,10 @@ export default function App() {
       await Promise.all([
         kvSet('keyB64', freshKey),
         kvSet('deviceToken', data.deviceToken),
+        clearMessages(),
       ]);
+      setMessages([]);
+      setBlobUrls({});
       setKeyB64(freshKey);
       setRoomId(rid);
       setDeviceToken(data.deviceToken);
@@ -882,7 +886,7 @@ export default function App() {
           const removedSet = new Set(removed);
           setMessages((prev) => prev.filter((m) => !removedSet.has(m.id)));
         }
-      }, 20000);
+      }, 5000);
 
       (async () => {
         await registerServiceWorker().catch(() => {});
@@ -1758,48 +1762,6 @@ export default function App() {
     }
   }
 
-  function cycleBurnOption() {
-    const idx = BURN_OPTIONS.findIndex((o) => o.ms === burnMs());
-    const next = BURN_OPTIONS[(idx + 1) % BURN_OPTIONS.length];
-    setBurnMs(next.ms);
-    notify(next.ms > 0 ? `Auto-burn: ${next.label}` : 'Auto-burn off');
-  }
-
-  const burnLabel = createMemo(() => {
-    const opt = BURN_OPTIONS.find((o) => o.ms === burnMs());
-    return opt?.ms ? `🔥 ${opt.label}` : '⏱ Keep';
-  });
-
-  async function pushClipboard() {
-    if (sending()) return;
-    try {
-      if (navigator.clipboard?.read) {
-        try {
-          const items = await navigator.clipboard.read();
-          for (const item of items) {
-            const imgType = item.types.find((t) => t.startsWith('image/'));
-            if (imgType) {
-              const blob = await item.getType(imgType);
-              const ext = imgType.split('/')[1] || 'png';
-              await sendFile(new File([blob], `clipboard.${ext}`, { type: imgType }));
-              return;
-            }
-          }
-        } catch {
-          // fall through to readText
-        }
-      }
-      const text = (await navigator.clipboard?.readText())?.trim();
-      if (!text) {
-        notify('Clipboard is empty');
-        return;
-      }
-      await sendText(text);
-    } catch {
-      notify('Allow clipboard permission to push directly');
-    }
-  }
-
   return (
     <div
       class="app-shell"
@@ -2568,6 +2530,22 @@ export default function App() {
               </main>
             }
           >
+            <Show when={devices().length === 1}>
+              <div class="solo-banner">
+                <span>Only this device is in this room</span>
+                <button
+                  class="btn primary small"
+                  onClick={() => {
+                    setView('settings');
+                    setShowAddDevice(true);
+                    createPairingInvite();
+                  }}
+                >
+                  + Add Device
+                </button>
+              </div>
+            </Show>
+
             <Show when={searchOpen()}>
               <div class="search-bar">
                 <div class="search-input-wrap">
@@ -2832,26 +2810,23 @@ export default function App() {
               </div>
             </Show>
 
-            <div class="quick-bar">
-              <button
-                class="quick-pill"
-                disabled={sending()}
-                title="Push text or image from clipboard"
-                onClick={pushClipboard}
-              >
-                📋 Push Clipboard
-              </button>
-              <button
-                class={`quick-pill ${burnMs() > 0 ? 'burn-active' : ''}`}
-                disabled={sending()}
-                title="Auto-expire timer for next push"
-                onClick={cycleBurnOption}
-              >
-                {burnLabel()}
-              </button>
-            </div>
-
-            <footer class="composer-bar">
+            <footer class="composer-wrap">
+              <div class="composer-meta-row">
+                <label class={`burn-control ${burnMs() > 0 ? 'active' : ''}`}>
+                  <span>{burnMs() > 0 ? '🔥 Auto-burn next message:' : '⏱ Auto-burn:'}</span>
+                  <select
+                    class="burn-select"
+                    value={String(burnMs())}
+                    disabled={sending()}
+                    onChange={(e) => setBurnMs(Number(e.currentTarget.value))}
+                  >
+                    <For each={BURN_OPTIONS}>
+                      {(opt) => <option value={String(opt.ms)}>{opt.label}</option>}
+                    </For>
+                  </select>
+                </label>
+              </div>
+              <div class="composer-bar">
               <input
                 ref={fileInputEl}
                 type="file"
@@ -2903,6 +2878,7 @@ export default function App() {
               >
                 {sending() ? '...' : 'Push It'}
               </button>
+              </div>
             </footer>
           </Show>
         </Show>
