@@ -14,6 +14,7 @@ import {
   encryptJson,
   encryptPairingBundle,
   encryptPayload,
+  generateRawKeyB64,
   generateSixDigitCode,
   hashPairCode,
   isSafeHttpUrl,
@@ -748,6 +749,89 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
   return result;
 }
 
+async function detectServerUrlFromTabs() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab.url || !isSafeServerOrigin(tab.url)) continue;
+      if (tab.title && /push it/i.test(tab.title)) {
+        return new URL(tab.url).origin;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return '';
+}
+
+async function createNewRoom(rawServerUrl, roomPin, accessKey) {
+  const cfg = await getConfig();
+  const candidate = String(rawServerUrl || cfg.serverUrl || '').trim();
+  if (!candidate) {
+    throw new Error('Open your Push It website once or enter its URL');
+  }
+  const normalizedUrl = /^https?:\/\//i.test(candidate) ? candidate : `https://${candidate}`;
+  const parsed = new URL(normalizedUrl);
+  if (!isSafeServerOrigin(parsed.origin)) {
+    throw new Error('Server URL must use HTTPS (or localhost)');
+  }
+
+  const cleanPin = roomPin ? String(roomPin).replace(/\D/g, '') : '';
+  if (cleanPin && !isValidSixDigitCode(cleanPin)) {
+    throw new Error('Room PIN must be 6 digits');
+  }
+
+  const freshKey = generateRawKeyB64();
+  const [roomId, roomAuth] = await Promise.all([
+    deriveRoomId(freshKey),
+    deriveRoomAuth(freshKey),
+  ]);
+  const enc = await encryptJson(
+    freshKey,
+    { name: cfg.deviceName, os: cfg.deviceOs },
+    deviceAad(roomId, cfg.deviceId),
+  );
+
+  const headers = { 'content-type': 'application/json' };
+  if (accessKey && String(accessKey).trim()) {
+    headers['x-access-key'] = String(accessKey).trim();
+  }
+
+  const res = await fetch(`${parsed.origin}/api/room/${encodeURIComponent(roomId)}/init`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      deviceId: cfg.deviceId,
+      roomAuth,
+      roomPin: cleanPin || undefined,
+      iv: enc.iv,
+      ciphertext: enc.ciphertext,
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.deviceToken) {
+    if (data.code === 'ACCESS_KEY_REQUIRED' || data.code === 'ACCESS_KEY_INVALID') {
+      return {
+        ok: false,
+        accessKeyRequired: true,
+        error: data.error || 'Server access code required',
+      };
+    }
+    throw new Error(data.error || 'Could not create room');
+  }
+
+  await chrome.storage.local.set({
+    serverUrl: parsed.origin,
+    keyB64: freshKey,
+    deviceToken: data.deviceToken,
+    revokedNotice: '',
+  });
+  stopSocket();
+  await connect();
+  return { ok: true };
+}
+
 async function completeRoomJoin(origin, keyB64, inviteToken, roomPin) {
   const cfg = await getConfig();
   const [roomId, roomAuth] = await Promise.all([
@@ -923,6 +1007,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     if (msg.type === 'GET_STATUS') {
       const cfg = await getConfig();
+      if (!cfg.serverUrl) {
+        const detected = await detectServerUrlFromTabs();
+        if (detected) {
+          await chrome.storage.local.set({ serverUrl: detected });
+        }
+      }
       const devices = await refreshDevices();
       const refreshedCfg = await getConfig();
       sendResponse({
@@ -939,6 +1029,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         revokedNotice: refreshedCfg.revokedNotice,
         devices,
       });
+      return;
+    }
+
+    if (msg.type === 'CREATE_ROOM') {
+      const res = await createNewRoom(msg.serverUrl, msg.roomPin, msg.accessKey);
+      sendResponse(res);
       return;
     }
 

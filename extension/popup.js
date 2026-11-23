@@ -20,6 +20,13 @@ const searchCount = document.getElementById('searchCount');
 const devicePill = document.getElementById('devicePill');
 const toggleSettingsBtn = document.getElementById('toggleSettings');
 const toastEl = document.getElementById('toast');
+const setupView = document.getElementById('setupView');
+const setupNoticeBanner = document.getElementById('setupNoticeBanner');
+const serverUrlCard = document.getElementById('serverUrlCard');
+const serverFooter = document.getElementById('serverFooter');
+const serverFooterHost = document.getElementById('serverFooterHost');
+const changeServerBtn = document.getElementById('changeServerBtn');
+const setupVersionText = document.getElementById('setupVersionText');
 const settingsView = document.getElementById('settingsView');
 const chatView = document.getElementById('chatView');
 const noticeBanner = document.getElementById('noticeBanner');
@@ -33,10 +40,7 @@ const copyCodeBtn = document.getElementById('copyCodeBtn');
 const inviteOutput = document.getElementById('inviteOutput');
 const copyInviteBtn = document.getElementById('copyInviteBtn');
 const cancelInviteBtn = document.getElementById('cancelInviteBtn');
-const togglePairBtn = document.getElementById('togglePairBtn');
-const pairBox = document.getElementById('pairBox');
-const tabCodeBtn = document.getElementById('tabCodeBtn');
-const tabLinkBtn = document.getElementById('tabLinkBtn');
+const toggleLinkModeBtn = document.getElementById('toggleLinkMode');
 const pairByCode = document.getElementById('pairByCode');
 const pairByLink = document.getElementById('pairByLink');
 const serverUrlInput = document.getElementById('serverUrlInput');
@@ -45,6 +49,10 @@ const pairInput = document.getElementById('pairInput');
 const roomPinBox = document.getElementById('roomPinBox');
 const roomPinInput = document.getElementById('roomPinInput');
 const savePairBtn = document.getElementById('savePair');
+const createPinToggle = document.getElementById('createPinToggle');
+const createPinInput = document.getElementById('createPinInput');
+const accessKeyInput = document.getElementById('accessKeyInput');
+const createRoomBtn = document.getElementById('createRoomBtn');
 const autoOpenEl = document.getElementById('autoOpen');
 const targetBar = document.getElementById('targetBar');
 const sendTabBtn = document.getElementById('sendTab');
@@ -63,6 +71,7 @@ const updateHint = document.getElementById('updateHint');
 const historyList = document.getElementById('historyList');
 const extVersion = chrome.runtime.getManifest().version;
 versionText.textContent = `Version v${extVersion}`;
+setupVersionText.textContent = `Version v${extVersion}`;
 
 let myDeviceId = '';
 let currentDeviceToken = '';
@@ -72,7 +81,9 @@ let currentServerUrl = '';
 let currentKeyB64 = '';
 let pairedDevices = [];
 let selectedTargetIds = [];
+let isPairedState = false;
 let showingSettings = false;
+let showingServerEditor = false;
 let pairMode = 'code';
 let activeInviteCode = '';
 let pendingResolved = null;
@@ -124,11 +135,39 @@ function showToast(msg) {
 
 function setView(showSettings) {
   showingSettings = showSettings;
+  if (!isPairedState) {
+    setupView.classList.remove('hidden');
+    settingsView.classList.add('hidden');
+    chatView.classList.add('hidden');
+    devicePill.classList.add('hidden');
+    toggleSearchBtn.classList.add('hidden');
+    toggleSettingsBtn.classList.add('hidden');
+    return;
+  }
+  setupView.classList.add('hidden');
   settingsView.classList.toggle('hidden', !showSettings);
   chatView.classList.toggle('hidden', showSettings);
   devicePill.classList.toggle('hidden', showSettings);
   toggleSearchBtn.classList.toggle('hidden', showSettings);
+  toggleSettingsBtn.classList.remove('hidden');
   toggleSettingsBtn.textContent = showSettings ? '← Back' : 'Settings';
+}
+
+function updateServerUrlVisibility() {
+  const hasServer = Boolean(currentServerUrl);
+  // Hide the Push It URL input completely when we already know the server (unless user clicks "Change server")
+  const needInput = (!hasServer && pairMode === 'code') || showingServerEditor;
+  serverUrlCard.classList.toggle('hidden', !needInput);
+  if (hasServer && !showingServerEditor) {
+    try {
+      serverFooterHost.textContent = new URL(currentServerUrl).host;
+    } catch {
+      serverFooterHost.textContent = currentServerUrl;
+    }
+    serverFooter.classList.remove('hidden');
+  } else {
+    serverFooter.classList.add('hidden');
+  }
 }
 
 function createCopySvg() {
@@ -380,8 +419,9 @@ function setPairMode(mode) {
   roomPinInput.value = '';
   pairByCode.classList.toggle('hidden', mode !== 'code');
   pairByLink.classList.toggle('hidden', mode !== 'link');
-  tabCodeBtn.classList.toggle('primary', mode === 'code');
-  tabLinkBtn.classList.toggle('primary', mode === 'link');
+  toggleLinkModeBtn.textContent =
+    mode === 'code' ? 'Or paste an invite link' : 'Use 6-digit pairing code instead';
+  updateServerUrlVisibility();
 }
 
 function startInviteCountdown(expiresAt) {
@@ -416,8 +456,9 @@ async function refresh() {
   renderDeviceList();
   renderTargetBar();
 
-  statusDot.className = `dot ${state.paired ? state.status : 'disconnected'}`;
-  statusText.textContent = !state.paired
+  isPairedState = Boolean(state.paired);
+  statusDot.className = `dot ${isPairedState ? state.status : 'disconnected'}`;
+  statusText.textContent = !isPairedState
     ? 'Not paired'
     : state.status === 'connected'
       ? 'Connected'
@@ -426,32 +467,35 @@ async function refresh() {
         : 'Offline';
   autoOpenEl.checked = Boolean(state.autoOpen);
 
-  inviteBtn.classList.toggle('hidden', !state.paired);
-  leaveRow.classList.toggle('hidden', !state.paired);
-
   if (state.revokedNotice) {
+    setupNoticeBanner.textContent = state.revokedNotice;
+    setupNoticeBanner.classList.remove('hidden');
     noticeBanner.textContent = state.revokedNotice;
     noticeBanner.classList.remove('hidden');
   } else {
+    setupNoticeBanner.classList.add('hidden');
     noticeBanner.classList.add('hidden');
   }
 
-  if (!state.paired) {
+  if (!isPairedState) {
     clearInviteUi();
-    setView(true);
-    pairBox.classList.remove('hidden');
-  } else if (currentServerUrl) {
-    fetch(`${new URL(currentServerUrl).origin}/api/version`, { cache: 'no-store' })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
-        if (d?.version && d.version !== extVersion) {
-          updateHint.textContent = `v${d.version} available · reload extension`;
-          updateHint.classList.remove('hidden');
-        } else {
-          updateHint.classList.add('hidden');
-        }
-      })
-      .catch(() => {});
+    updateServerUrlVisibility();
+    setView(false);
+  } else {
+    setView(showingSettings);
+    if (currentServerUrl) {
+      fetch(`${new URL(currentServerUrl).origin}/api/version`, { cache: 'no-store' })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (d?.version && d.version !== extVersion) {
+            updateHint.textContent = `v${d.version} available · reload extension`;
+            updateHint.classList.remove('hidden');
+          } else {
+            updateHint.classList.add('hidden');
+          }
+        })
+        .catch(() => {});
+    }
   }
 
   allHistory = Array.isArray(state.history) ? state.history : [];
@@ -680,12 +724,68 @@ devicePill.addEventListener('click', () => {
   setView(true);
 });
 
-togglePairBtn.addEventListener('click', () => {
-  pairBox.classList.toggle('hidden');
+toggleLinkModeBtn.addEventListener('click', () => {
+  setPairMode(pairMode === 'code' ? 'link' : 'code');
 });
 
-tabCodeBtn.addEventListener('click', () => setPairMode('code'));
-tabLinkBtn.addEventListener('click', () => setPairMode('link'));
+changeServerBtn.addEventListener('click', () => {
+  showingServerEditor = !showingServerEditor;
+  updateServerUrlVisibility();
+  if (showingServerEditor) serverUrlInput.focus();
+});
+
+createPinToggle.addEventListener('change', () => {
+  createPinInput.classList.toggle('hidden', !createPinToggle.checked);
+  if (!createPinToggle.checked) createPinInput.value = '';
+});
+
+createRoomBtn.addEventListener('click', async () => {
+  const serverUrl = (serverUrlInput.value || currentServerUrl || '').trim();
+  if (!serverUrl) {
+    showingServerEditor = true;
+    updateServerUrlVisibility();
+    serverUrlInput.focus();
+    showToast('Enter your Push It website URL once');
+    return;
+  }
+  const roomPin = createPinToggle.checked ? createPinInput.value.replace(/\D/g, '') : '';
+  if (createPinToggle.checked && roomPin.length !== 6) {
+    showToast('Enter a 6-digit Room PIN');
+    return;
+  }
+  const accessKey = accessKeyInput.value.trim();
+
+  createRoomBtn.disabled = true;
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: 'CREATE_ROOM',
+      serverUrl,
+      roomPin: roomPin || undefined,
+      accessKey: accessKey || undefined,
+    });
+    if (!res.ok) {
+      if (res.accessKeyRequired) {
+        accessKeyInput.classList.remove('hidden');
+        accessKeyInput.focus();
+      }
+      showToast(res.error || 'Could not create room');
+      return;
+    }
+    showingServerEditor = false;
+    createPinToggle.checked = false;
+    createPinInput.value = '';
+    createPinInput.classList.add('hidden');
+    accessKeyInput.value = '';
+    accessKeyInput.classList.add('hidden');
+    showingSettings = false;
+    showToast('New private room created!');
+    setTimeout(refresh, 350);
+  } catch {
+    showToast('Could not create room');
+  } finally {
+    createRoomBtn.disabled = false;
+  }
+});
 
 inviteBtn.addEventListener('click', async () => {
   inviteBtn.disabled = true;
@@ -740,10 +840,17 @@ savePairBtn.addEventListener('click', async () => {
         roomPin,
       });
     } else if (pairMode === 'code') {
-      const serverUrl = serverUrlInput.value.trim();
+      const serverUrl = (serverUrlInput.value || currentServerUrl || '').trim();
       const code = pairCodeInput.value.replace(/\D/g, '');
-      if (!serverUrl || code.length !== 6) {
-        showToast('Enter your Push It URL and 6-digit code');
+      if (!serverUrl) {
+        showingServerEditor = true;
+        updateServerUrlVisibility();
+        serverUrlInput.focus();
+        showToast('Enter your Push It website URL once');
+        return;
+      }
+      if (code.length !== 6) {
+        showToast('Enter all 6 digits of the pairing code');
         return;
       }
       res = await chrome.runtime.sendMessage({
@@ -773,14 +880,14 @@ savePairBtn.addEventListener('click', async () => {
     }
 
     pendingResolved = null;
+    showingServerEditor = false;
     pairInput.value = '';
     pairCodeInput.value = '';
     roomPinInput.value = '';
     roomPinBox.classList.add('hidden');
-    pairBox.classList.add('hidden');
-    setView(false);
+    showingSettings = false;
     showToast('Paired!');
-    setTimeout(refresh, 450);
+    setTimeout(refresh, 400);
   } catch {
     showToast('Could not pair right now');
   } finally {

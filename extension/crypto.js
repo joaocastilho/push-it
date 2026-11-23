@@ -77,6 +77,12 @@ export function isValidKeyB64(keyB64) {
   }
 }
 
+export function generateRawKeyB64() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return toBase64Url(bytes);
+}
+
 export function isValidInviteToken(token) {
   return TOKEN_RE.test(String(token || '').trim());
 }
