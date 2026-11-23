@@ -122,6 +122,9 @@ manifest.browser_specific_settings = {
   gecko: {
     id: 'push-it@push-it.app',
     strict_min_version: '121.0',
+    data_collection_permissions: {
+      required: ['none'],
+    },
   },
 };
 writeFileSync(ffManifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');

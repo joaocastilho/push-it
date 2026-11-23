@@ -8,20 +8,20 @@ No accounts, no local server, and works smoothly across Windows, macOS, Linux, A
 
 ## 🧩 Browser Extensions
 
-Click your browser family below to download the ready-to-add extension:
+Click your browser family below to install Push It:
 
 <p>
   <a href="https://github.com/joaocastilho/push-it/releases/latest/download/push-it-chromium.zip">
-    <img src="docs/banner-chromium.svg" alt="Get Push It for Chromium-based browsers" width="360" />
+    <img src="docs/banner-chromium.svg" alt="Install Push It for Chromium-based browsers" width="360" />
   </a>
   &nbsp;
   <a href="https://github.com/joaocastilho/push-it/releases/latest/download/push-it-firefox.xpi">
-    <img src="docs/banner-firefox.svg" alt="Get Push It for Firefox-based browsers" width="360" />
+    <img src="docs/banner-firefox.svg" alt="Install Push It for Firefox-based browsers" width="360" />
   </a>
 </p>
 
-- **Chromium-based browsers:** Unzip `push-it-chromium.zip` → open your extensions page → turn on **Developer mode** → **Load unpacked**.
-- **Firefox-based browsers:** Open `about:debugging` → **This Firefox** → **Load Temporary Add-on** → select `push-it-firefox.xpi` *(when Mozilla signing secrets are configured in GitHub Actions, the `.xpi` installs directly on click)*.
+- **Firefox-based browsers:** Clicking the banner installs the signed `.xpi` directly in **1 click** *(requires Mozilla AMO signing secrets in GitHub Actions; otherwise load via `about:debugging`)*.
+- **Chromium-based browsers:** Clicking downloads `push-it-chromium.zip` — unzip and load via your browser's Extensions page (**Developer mode → Load unpacked**). Once published to the Web Store, swap the Chromium banner link above to your store URL for **1-click install**.
 
 ---
 
