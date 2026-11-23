@@ -44,6 +44,11 @@ Click your browser family below to download the ready-to-add extension:
 - **From iPhone / iPad:** Add Push It to your Home Screen for notifications, and use the 2-step **iOS Share Sheet** card in Settings to get the same share picker and toast.
 - **From your computer:** Click **Push This Tab**, tap **Push Clipboard** for 1-click clipboard sending, paste screenshots, attach files (up to **7.5 MB**), or right-click any page/link → **Push It**.
 - **Self-destruct timer:** Tap the timer button in the composer (`5m`, `1h`, or `24h`) when sending sensitive notes or codes so they wipe automatically.
+- **Easy chat management:**
+  - Every device keeps its own consistent bubble color so you can tell who sent what at a glance.
+  - Tap the **search icon** to find past links, notes, or files instantly.
+  - Tap the **copy icon** (or tap a bubble on mobile) to copy to clipboard, and **press and hold** on text to select specific words.
+  - Tap the **bin icon** (or **swipe left** on mobile) to delete any message with a quick confirmation.
 
 ---
 

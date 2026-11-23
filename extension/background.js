@@ -26,7 +26,7 @@ import {
 } from './crypto.js';
 
 const KEEPALIVE_ALARM = 'push-it-keepalive';
-const MAX_HISTORY = 40;
+const MAX_HISTORY = 200;
 const LONG_TEXT_THRESHOLD = 1800;
 const LOCAL_OS = detectOs();
 
@@ -1022,6 +1022,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'MARK_READ') {
       await chrome.storage.local.set({ unreadCount: 0 });
       await updateBadge();
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (msg.type === 'DELETE_MESSAGE') {
+      const { history } = await getConfig();
+      const next = history.filter((m) => m.id !== msg.id);
+      await chrome.storage.local.set({ history: next });
       sendResponse({ ok: true });
       return;
     }

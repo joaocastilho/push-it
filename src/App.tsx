@@ -31,6 +31,7 @@ import {
 } from './lib/crypto';
 import {
   clearMessages,
+  deleteMessage,
   getBlob,
   kvDelete,
   kvGet,
@@ -45,6 +46,7 @@ import {
 import {
   defaultDeviceName,
   detectOs,
+  deviceColorIndex,
   isIosDevice,
   isStandalonePwa,
   normalizeOs,
@@ -138,6 +140,16 @@ export default function App() {
   const [editDeviceDraft, setEditDeviceDraft] = createSignal<string>('');
 
   const [pendingShare, setPendingShare] = createSignal<PendingSharePayload | null>(null);
+  const [pendingDelete, setPendingDelete] = createSignal<StoredMessage | null>(null);
+  const [searchOpen, setSearchOpen] = createSignal<boolean>(false);
+  const [searchQuery, setSearchQuery] = createSignal<string>('');
+  const [copiedId, setCopiedId] = createSignal<string | null>(null);
+  const [swipeState, setSwipeState] = createSignal<{
+    id: string;
+    offset: number;
+    armed: boolean;
+    snapping: boolean;
+  } | null>(null);
 
   const [messages, setMessages] = createSignal<StoredMessage[]>([]);
   const [blobUrls, setBlobUrls] = createSignal<Record<string, string>>({});
@@ -159,7 +171,19 @@ export default function App() {
 
   let chatEndEl: HTMLDivElement | undefined;
   let fileInputEl: HTMLInputElement | undefined;
+  let searchInputEl: HTMLInputElement | undefined;
   let toastTimer: number | undefined;
+  let copiedTimer: number | undefined;
+  let activeTouch: {
+    id: string;
+    startX: number;
+    startY: number;
+    startTime: number;
+    swiping: boolean;
+    moved: boolean;
+  } | null = null;
+  let lastSwipeEndTs = 0;
+  let lastTouchDuration = 0;
 
   const isPaired = createMemo(() =>
     Boolean(keyB64() && roomId() && deviceId() && deviceToken()),
@@ -1192,7 +1216,7 @@ export default function App() {
   function addOrUpdateMessage(item: StoredMessage) {
     setMessages((prev) => {
       if (prev.some((m) => m.id === item.id)) return prev;
-      return [...prev, item].slice(-60);
+      return [...prev, item].slice(-500);
     });
     scrollToBottom();
   }
@@ -1584,13 +1608,130 @@ export default function App() {
     await joinRoomWithInvite(parsed.keyB64, parsed.inviteToken);
   }
 
-  async function copyToClipboard(text: string, label = 'Copied') {
+  async function copyToClipboard(text: string, label = 'Copied', msgId?: string) {
     try {
       await navigator.clipboard.writeText(text);
       notify(label);
+      if (msgId) {
+        setCopiedId(msgId);
+        if (copiedTimer) window.clearTimeout(copiedTimer);
+        copiedTimer = window.setTimeout(() => setCopiedId(null), 1600);
+      }
     } catch {
       notify('Could not copy');
     }
+  }
+
+  const filteredMessages = createMemo(() => {
+    const q = searchQuery().trim().toLowerCase();
+    if (!q) return messages();
+    return messages().filter((m) => {
+      const haystack = [
+        m.content,
+        m.title,
+        m.fileName,
+        m.senderName,
+        ...(m.targetNames || []),
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  });
+
+  async function confirmDeleteMessage() {
+    const target = pendingDelete();
+    if (!target) return;
+    setPendingDelete(null);
+    await deleteMessage(target.id, target.blobId).catch(() => {});
+    if (target.blobId) {
+      const existingUrl = blobUrls()[target.blobId];
+      if (existingUrl) {
+        URL.revokeObjectURL(existingUrl);
+        setBlobUrls((prev) => {
+          const next = { ...prev };
+          delete next[target.blobId!];
+          return next;
+        });
+      }
+    }
+    setMessages((prev) => prev.filter((m) => m.id !== target.id));
+    notify('Message deleted');
+  }
+
+  function handleBubbleTouchStart(msg: StoredMessage, e: TouchEvent) {
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    activeTouch = {
+      id: msg.id,
+      startX: t.clientX,
+      startY: t.clientY,
+      startTime: Date.now(),
+      swiping: false,
+      moved: false,
+    };
+  }
+
+  function handleBubbleTouchMove(msg: StoredMessage, e: TouchEvent) {
+    if (!activeTouch || activeTouch.id !== msg.id || e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const dx = t.clientX - activeTouch.startX;
+    const dy = t.clientY - activeTouch.startY;
+    if (Math.abs(dx) > 8 || Math.abs(dy) > 8) {
+      activeTouch.moved = true;
+    }
+    // Start horizontal left swipe only if clearly swiping left (never fight vertical scroll or text selection)
+    if (!activeTouch.swiping) {
+      if (dx < -14 && Math.abs(dx) > Math.abs(dy) * 1.4 && !window.getSelection()?.toString()) {
+        activeTouch.swiping = true;
+      } else {
+        return;
+      }
+    }
+    const clamped = Math.max(-116, Math.min(0, dx));
+    setSwipeState({
+      id: msg.id,
+      offset: clamped,
+      armed: clamped <= -72,
+      snapping: false,
+    });
+  }
+
+  function handleBubbleTouchEnd(msg: StoredMessage) {
+    if (!activeTouch || activeTouch.id !== msg.id) return;
+    lastTouchDuration = Date.now() - activeTouch.startTime;
+    const wasSwiping = activeTouch.swiping;
+    activeTouch = null;
+
+    if (wasSwiping) {
+      lastSwipeEndTs = Date.now();
+      const cur = swipeState();
+      const shouldAskDelete = Boolean(cur && cur.id === msg.id && cur.armed);
+      setSwipeState({ id: msg.id, offset: 0, armed: false, snapping: true });
+      window.setTimeout(() => {
+        if (swipeState()?.id === msg.id) setSwipeState(null);
+      }, 200);
+      if (shouldAskDelete) {
+        setPendingDelete(msg);
+      }
+    }
+  }
+
+  function handleBubbleClick(msg: StoredMessage, e: MouseEvent) {
+    if (msg.type === 'file') return;
+    if (Date.now() - lastSwipeEndTs < 350) return;
+    // If user held down to select text (>= 320ms) or has text selected, don't override selection
+    if (lastTouchDuration >= 320) {
+      lastTouchDuration = 0;
+      return;
+    }
+    lastTouchDuration = 0;
+    const selection = window.getSelection()?.toString().trim();
+    if (selection) return;
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl?.closest('a, button, input, textarea')) return;
+    copyToClipboard(msg.content, 'Copied to clipboard', msg.id);
   }
 
   async function triggerInstall() {
@@ -1699,6 +1840,25 @@ export default function App() {
               }
             >
               <button
+                class={`icon-toggle-btn ${searchOpen() ? 'active' : ''}`}
+                title="Search messages"
+                aria-label="Search messages"
+                onClick={() => {
+                  const next = !searchOpen();
+                  setSearchOpen(next);
+                  if (!next) {
+                    setSearchQuery('');
+                  } else {
+                    requestAnimationFrame(() => searchInputEl?.focus());
+                  }
+                }}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="11" cy="11" r="8" />
+                  <path d="m21 21-4.35-4.35" />
+                </svg>
+              </button>
+              <button
                 class="device-pill"
                 title="Manage devices"
                 onClick={() => setView('settings')}
@@ -1724,6 +1884,32 @@ export default function App() {
 
       <Show when={popupWarning() && view() === 'chat' && isPaired()}>
         <div class="banner warning">{popupWarning()}</div>
+      </Show>
+
+      <Show when={pendingDelete()}>
+        {(target) => (
+          <div class="modal-backdrop" onClick={() => setPendingDelete(null)}>
+            <div class="confirm-modal" onClick={(e) => e.stopPropagation()}>
+              <h2>Delete this message?</h2>
+              <div class="share-preview">
+                <div class="share-preview-body">
+                  {target().type === 'file'
+                    ? target().fileName || target().content
+                    : target().content.slice(0, 160)}
+                </div>
+              </div>
+              <p class="muted">This removes the message from this device.</p>
+              <div class="row gap">
+                <button class="btn danger" onClick={confirmDeleteMessage}>
+                  Delete
+                </button>
+                <button class="btn secondary" onClick={() => setPendingDelete(null)}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </Show>
 
       <Show when={pendingShare()}>
@@ -2382,15 +2568,62 @@ export default function App() {
               </main>
             }
           >
+            <Show when={searchOpen()}>
+              <div class="search-bar">
+                <div class="search-input-wrap">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="11" cy="11" r="8" />
+                    <path d="m21 21-4.35-4.35" />
+                  </svg>
+                  <input
+                    ref={searchInputEl}
+                    type="search"
+                    placeholder="Search messages, links, files, or device..."
+                    value={searchQuery()}
+                    onInput={(e) => setSearchQuery(e.currentTarget.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') {
+                        setSearchQuery('');
+                        setSearchOpen(false);
+                      }
+                    }}
+                  />
+                  <Show when={searchQuery()}>
+                    <span class="search-count">
+                      {filteredMessages().length}/{messages().length}
+                    </span>
+                  </Show>
+                </div>
+                <button
+                  class="btn secondary small"
+                  onClick={() => {
+                    setSearchQuery('');
+                    setSearchOpen(false);
+                  }}
+                >
+                  Close
+                </button>
+              </div>
+            </Show>
+
             <main class="chat-stream">
               <For
-                each={messages()}
+                each={filteredMessages()}
                 fallback={
                   <div class="empty">
-                    <p>Nothing pushed yet.</p>
-                    <p class="muted">
-                      Send a link, note, or photo below—or share straight from Android’s Share menu.
-                    </p>
+                    <Show
+                      when={searchQuery().trim()}
+                      fallback={
+                        <>
+                          <p>Nothing pushed yet.</p>
+                          <p class="muted">
+                            Send a link, note, or photo below—or share straight from your phone’s Share menu.
+                          </p>
+                        </>
+                      }
+                    >
+                      <p>No messages matching “{searchQuery().trim()}”.</p>
+                    </Show>
                   </div>
                 }
               >
@@ -2402,107 +2635,173 @@ export default function App() {
                     msg.targetNames && msg.targetNames.length > 0
                       ? ` → ${msg.targetNames.join(', ')}`
                       : '';
+                  const colorIdx = deviceColorIndex(msg.senderId || label);
                   const isLink = msg.type === 'link' && isSafeHttpUrl(msg.content);
                   const isFile = msg.type === 'file';
                   const isImage = isFile && Boolean(msg.mimeType?.startsWith('image/'));
                   const fileUrl = () => (msg.blobId ? blobUrls()[msg.blobId] : undefined);
+                  const swipe = () => {
+                    const s = swipeState();
+                    return s && s.id === msg.id ? s : null;
+                  };
 
                   return (
-                    <div class={`bubble-row ${msg.direction}`}>
-                      <article class={`bubble ${msg.direction}`}>
-                        <div class="bubble-head">
-                          <span class="sender-tag">
-                            <OsIcon os={os} size={13} />
-                            <span>
-                              {label}
-                              {targetLabel}
+                    <div
+                      class="swipe-row"
+                      onTouchStart={(e) => handleBubbleTouchStart(msg, e)}
+                      onTouchMove={(e) => handleBubbleTouchMove(msg, e)}
+                      onTouchEnd={() => handleBubbleTouchEnd(msg)}
+                      onTouchCancel={() => handleBubbleTouchEnd(msg)}
+                    >
+                      <div
+                        class={`swipe-delete-bg ${swipe() && swipe()!.offset < -10 ? 'visible' : ''} ${swipe()?.armed ? 'armed' : ''}`}
+                      >
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M3 6h18" />
+                          <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                        </svg>
+                        <span>{swipe()?.armed ? 'Release to delete' : 'Swipe to delete'}</span>
+                      </div>
+                      <div
+                        class={`swipe-content ${msg.direction} ${swipe()?.snapping ? 'snapping' : ''}`}
+                        style={{
+                          transform: swipe() ? `translateX(${swipe()!.offset}px)` : undefined,
+                        }}
+                      >
+                        <article
+                          class={`bubble ${msg.direction} dev-c${colorIdx} ${!isFile ? 'tappable' : ''}`}
+                          onClick={(e) => handleBubbleClick(msg, e)}
+                        >
+                          <div class="bubble-head">
+                            <span class="sender-tag">
+                              <OsIcon os={os} size={13} />
+                              <span>
+                                {label}
+                                {targetLabel}
+                              </span>
                             </span>
-                          </span>
-                          <span class="meta-right">
-                            <Show when={msg.expiresAt && nowTick() < msg.expiresAt}>
-                              <span class="burn-badge" title="Auto-expires">
-                                🔥 {formatRemainingTime(msg.expiresAt)}
-                              </span>
-                            </Show>
-                            <time>
-                              {new Date(msg.ts).toLocaleTimeString([], {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                              })}
-                            </time>
-                            <Show when={msg.direction === 'out'}>
-                              <span
-                                class={`check ${msg.status === 'delivered' ? 'delivered' : ''}`}
-                                title={msg.status === 'delivered' ? 'Delivered' : 'Queued'}
-                              >
-                                {msg.status === 'delivered' ? '✓✓' : '✓'}
-                              </span>
-                            </Show>
-                          </span>
-                        </div>
+                            <span class="meta-right">
+                              <Show when={msg.expiresAt && nowTick() < msg.expiresAt}>
+                                <span class="burn-badge" title="Auto-expires">
+                                  🔥 {formatRemainingTime(msg.expiresAt)}
+                                </span>
+                              </Show>
+                              <time>
+                                {new Date(msg.ts).toLocaleTimeString([], {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })}
+                              </time>
+                              <Show when={msg.direction === 'out'}>
+                                <span
+                                  class={`check ${msg.status === 'delivered' ? 'delivered' : ''}`}
+                                  title={msg.status === 'delivered' ? 'Delivered' : 'Queued'}
+                                >
+                                  {msg.status === 'delivered' ? '✓✓' : '✓'}
+                                </span>
+                              </Show>
+                            </span>
+                          </div>
 
-                        <Show when={msg.title}>
-                          <div class="bubble-title">{msg.title}</div>
-                        </Show>
+                          <Show when={msg.title}>
+                            <div class="bubble-title">{msg.title}</div>
+                          </Show>
 
-                        <div class="bubble-body">
-                          {isFile ? (
-                            <div class="file-card">
-                              <Show when={isImage && fileUrl()}>
-                                <a href={fileUrl()} target="_blank" rel="noopener noreferrer">
-                                  <img
-                                    src={fileUrl()}
-                                    alt={msg.fileName || 'Photo'}
-                                    class="photo-preview"
-                                  />
+                          <div class="bubble-body">
+                            {isFile ? (
+                              <div class="file-card">
+                                <Show when={isImage && fileUrl()}>
+                                  <a href={fileUrl()} target="_blank" rel="noopener noreferrer">
+                                    <img
+                                      src={fileUrl()}
+                                      alt={msg.fileName || 'Photo'}
+                                      class="photo-preview"
+                                    />
+                                  </a>
+                                </Show>
+                                <div class="file-meta">
+                                  <span class="file-name">{msg.fileName || msg.content}</span>
+                                  <Show when={msg.fileSize}>
+                                    <span class="muted">{formatFileSize(msg.fileSize)}</span>
+                                  </Show>
+                                </div>
+                              </div>
+                            ) : isLink ? (
+                              <a href={msg.content} target="_blank" rel="noopener noreferrer">
+                                {msg.content}
+                              </a>
+                            ) : (
+                              <pre>{msg.content}</pre>
+                            )}
+                          </div>
+
+                          <div class="bubble-actions">
+                            <div class="bubble-actions-left">
+                              <Show when={isLink}>
+                                <a
+                                  class="chip primary"
+                                  href={msg.content}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                >
+                                  Open
                                 </a>
                               </Show>
-                              <div class="file-meta">
-                                <span class="file-name">{msg.fileName || msg.content}</span>
-                                <Show when={msg.fileSize}>
-                                  <span class="muted">{formatFileSize(msg.fileSize)}</span>
-                                </Show>
-                              </div>
+                              <Show when={isFile && fileUrl()}>
+                                <a
+                                  class="chip primary"
+                                  href={fileUrl()}
+                                  download={msg.fileName || 'file'}
+                                >
+                                  Download
+                                </a>
+                              </Show>
+                              <Show when={!isFile}>
+                                <button
+                                  class="icon-chip"
+                                  title="Copy to clipboard"
+                                  aria-label="Copy to clipboard"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    copyToClipboard(msg.content, 'Copied to clipboard', msg.id);
+                                  }}
+                                >
+                                  <Show
+                                    when={copiedId() === msg.id}
+                                    fallback={
+                                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                                      </svg>
+                                    }
+                                  >
+                                    <span>✓</span>
+                                  </Show>
+                                  <span>{copiedId() === msg.id ? 'Copied' : 'Copy'}</span>
+                                </button>
+                              </Show>
                             </div>
-                          ) : isLink ? (
-                            <a href={msg.content} target="_blank" rel="noopener noreferrer">
-                              {msg.content}
-                            </a>
-                          ) : (
-                            <pre>{msg.content}</pre>
-                          )}
-                        </div>
-
-                        <div class="bubble-actions">
-                          <Show when={isLink}>
-                            <a
-                              class="chip primary"
-                              href={msg.content}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                            >
-                              Open
-                            </a>
-                          </Show>
-                          <Show when={isFile && fileUrl()}>
-                            <a
-                              class="chip primary"
-                              href={fileUrl()}
-                              download={msg.fileName || 'file'}
-                            >
-                              Download
-                            </a>
-                          </Show>
-                          <Show when={!isFile}>
-                            <button
-                              class="chip"
-                              onClick={() => copyToClipboard(msg.content, 'Copied')}
-                            >
-                              Copy
-                            </button>
-                          </Show>
-                        </div>
-                      </article>
+                            <div class="bubble-actions-right">
+                              <button
+                                class="icon-chip danger"
+                                title="Delete message"
+                                aria-label="Delete message"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setPendingDelete(msg);
+                                }}
+                              >
+                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                  <path d="M3 6h18" />
+                                  <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                                </svg>
+                              </button>
+                            </div>
+                          </div>
+                        </article>
+                      </div>
                     </div>
                   );
                 }}

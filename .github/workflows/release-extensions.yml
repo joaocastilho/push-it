@@ -24,19 +24,22 @@ jobs:
       - name: Build Chromium-based and Firefox-based extension packages
         run: bun run build:extensions
 
-      - name: Sign Firefox-based add-on with Mozilla AMO (when credentials are configured)
-        if: ${{ secrets.AMO_JWT_ISSUER != '' && secrets.AMO_JWT_SECRET != '' }}
+      - name: Sign Firefox-based add-on with Mozilla AMO (optional)
         env:
           WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
           WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
         run: |
-          bunx web-ext sign \
-            --channel=unlisted \
-            --source-dir=extension-firefox \
-            --artifacts-dir=dist-signed
-          SIGNED=$(ls dist-signed/*.xpi | head -n 1)
-          cp "$SIGNED" dist-extensions/push-it-firefox.xpi
-          echo "Signed Firefox add-on ready: $SIGNED"
+          if [ -n "$WEB_EXT_API_KEY" ] && [ -n "$WEB_EXT_API_SECRET" ]; then
+            bunx web-ext sign \
+              --channel=unlisted \
+              --source-dir=extension-firefox \
+              --artifacts-dir=dist-signed
+            SIGNED=$(ls dist-signed/*.xpi | head -n 1)
+            cp "$SIGNED" dist-extensions/push-it-firefox.xpi
+            echo "Signed Firefox add-on ready: $SIGNED"
+          else
+            echo "AMO signing secrets not configured; publishing unsigned .xpi"
+          fi
 
       - name: Read version
         id: meta

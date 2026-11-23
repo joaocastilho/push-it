@@ -3,6 +3,7 @@ import {
   decryptBytes,
   defaultDeviceName,
   deriveRoomId,
+  deviceColorIndex,
   formatFileSize,
   formatRelativeTime,
   formatRemainingTime,
@@ -12,6 +13,10 @@ import {
 
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
+const toggleSearchBtn = document.getElementById('toggleSearch');
+const searchBar = document.getElementById('searchBar');
+const searchInput = document.getElementById('searchInput');
+const searchCount = document.getElementById('searchCount');
 const devicePill = document.getElementById('devicePill');
 const toggleSettingsBtn = document.getElementById('toggleSettings');
 const toastEl = document.getElementById('toast');
@@ -71,6 +76,8 @@ let showingSettings = false;
 let pairMode = 'code';
 let activeInviteCode = '';
 let pendingResolved = null;
+let allHistory = [];
+let searchQuery = '';
 let burnMs = 0;
 let toastTimer;
 let inviteInterval;
@@ -120,7 +127,55 @@ function setView(showSettings) {
   settingsView.classList.toggle('hidden', !showSettings);
   chatView.classList.toggle('hidden', showSettings);
   devicePill.classList.toggle('hidden', showSettings);
+  toggleSearchBtn.classList.toggle('hidden', showSettings);
   toggleSettingsBtn.textContent = showSettings ? '← Back' : 'Settings';
+}
+
+function createCopySvg() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', '12');
+  svg.setAttribute('height', '12');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  const rect = document.createElementNS(ns, 'rect');
+  rect.setAttribute('x', '9');
+  rect.setAttribute('y', '9');
+  rect.setAttribute('width', '13');
+  rect.setAttribute('height', '13');
+  rect.setAttribute('rx', '2');
+  const path = document.createElementNS(ns, 'path');
+  path.setAttribute('d', 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1');
+  svg.appendChild(rect);
+  svg.appendChild(path);
+  return svg;
+}
+
+function createTrashSvg() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('width', '12');
+  svg.setAttribute('height', '12');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  for (const d of [
+    'M3 6h18',
+    'M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2',
+    'M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6',
+  ]) {
+    const p = document.createElementNS(ns, 'path');
+    p.setAttribute('d', d);
+    svg.appendChild(p);
+  }
+  return svg;
 }
 
 function renderDevicePill() {
@@ -399,25 +454,61 @@ async function refresh() {
       .catch(() => {});
   }
 
-  renderHistory(state.history || []);
+  allHistory = Array.isArray(state.history) ? state.history : [];
+  renderHistory(allHistory);
 }
 
 function renderHistory(items) {
   historyList.innerHTML = '';
-  if (!items.length) {
+  const q = searchQuery.trim().toLowerCase();
+  const filtered = q
+    ? items.filter((m) => {
+        const hay = [
+          m.content,
+          m.title,
+          m.fileName,
+          m.senderName,
+          ...(Array.isArray(m.targetNames) ? m.targetNames : []),
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        return hay.includes(q);
+      })
+    : items;
+
+  if (q) {
+    searchCount.textContent = `${filtered.length}/${items.length}`;
+    searchCount.classList.remove('hidden');
+  } else {
+    searchCount.classList.add('hidden');
+  }
+
+  if (!filtered.length) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = 'Nothing pushed yet.';
+    empty.textContent = q ? `No messages matching "${searchQuery.trim()}".` : 'Nothing pushed yet.';
     historyList.appendChild(empty);
     return;
   }
 
-  for (const item of items.slice(-20)) {
+  const visible = q ? filtered : filtered.slice(-40);
+  for (const item of visible) {
     const row = document.createElement('div');
     row.className = `bubble-row ${item.direction}`;
 
+    const colorIdx = deviceColorIndex(item.senderId || item.senderName);
     const bubble = document.createElement('div');
-    bubble.className = `bubble ${item.direction}`;
+    bubble.className = `bubble ${item.direction} dev-c${colorIdx}`;
+
+    if (item.type !== 'file') {
+      bubble.addEventListener('click', async (e) => {
+        if (window.getSelection()?.toString().trim()) return;
+        if (e.target.closest('a, button, input')) return;
+        await navigator.clipboard.writeText(item.content).catch(() => {});
+        showToast('Copied to clipboard');
+      });
+    }
 
     const head = document.createElement('div');
     head.className = 'bubble-head';
@@ -487,31 +578,74 @@ function renderHistory(items) {
     const actions = document.createElement('div');
     actions.className = 'bubble-actions';
 
+    const leftGroup = document.createElement('div');
+    leftGroup.className = 'bubble-actions-group';
+
     if (item.type === 'file') {
       const dlBtn = document.createElement('button');
       dlBtn.className = 'chip primary';
       dlBtn.textContent = 'Download';
       dlBtn.onclick = () => downloadFileItem(item);
-      actions.appendChild(dlBtn);
+      leftGroup.appendChild(dlBtn);
     } else if (item.type === 'link' && isSafeHttpUrl(item.content)) {
       const openBtn = document.createElement('button');
       openBtn.className = 'chip primary';
       openBtn.textContent = 'Open';
       openBtn.onclick = () => chrome.tabs.create({ url: item.content, active: true });
-      actions.appendChild(openBtn);
+      leftGroup.appendChild(openBtn);
     }
 
     if (item.type !== 'file') {
       const copyBtn = document.createElement('button');
-      copyBtn.className = 'chip';
-      copyBtn.textContent = 'Copy';
-      copyBtn.onclick = async () => {
+      copyBtn.className = 'icon-chip';
+      copyBtn.title = 'Copy to clipboard';
+      copyBtn.appendChild(createCopySvg());
+      const copyLbl = document.createElement('span');
+      copyLbl.textContent = 'Copy';
+      copyBtn.appendChild(copyLbl);
+      copyBtn.onclick = async (e) => {
+        e.stopPropagation();
         await navigator.clipboard.writeText(item.content);
-        showToast('Copied');
+        showToast('Copied to clipboard');
       };
-      actions.appendChild(copyBtn);
+      leftGroup.appendChild(copyBtn);
     }
 
+    const rightGroup = document.createElement('div');
+    rightGroup.className = 'bubble-actions-group';
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'icon-chip danger';
+    delBtn.title = 'Delete message';
+    delBtn.setAttribute('aria-label', 'Delete message');
+    delBtn.appendChild(createTrashSvg());
+    delBtn.onclick = (e) => {
+      e.stopPropagation();
+      rightGroup.innerHTML = '';
+      const confirmBtn = document.createElement('button');
+      confirmBtn.className = 'icon-chip danger';
+      confirmBtn.textContent = 'Delete?';
+      confirmBtn.onclick = async (ev) => {
+        ev.stopPropagation();
+        await chrome.runtime.sendMessage({ type: 'DELETE_MESSAGE', id: item.id });
+        allHistory = allHistory.filter((m) => m.id !== item.id);
+        showToast('Message deleted');
+        renderHistory(allHistory);
+      };
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'icon-chip';
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.onclick = (ev) => {
+        ev.stopPropagation();
+        renderHistory(allHistory);
+      };
+      rightGroup.appendChild(confirmBtn);
+      rightGroup.appendChild(cancelBtn);
+    };
+    rightGroup.appendChild(delBtn);
+
+    actions.appendChild(leftGroup);
+    actions.appendChild(rightGroup);
     bubble.appendChild(actions);
     row.appendChild(bubble);
     historyList.appendChild(row);
@@ -522,6 +656,24 @@ function renderHistory(items) {
 
 toggleSettingsBtn.addEventListener('click', () => {
   setView(!showingSettings);
+});
+
+toggleSearchBtn.addEventListener('click', () => {
+  const willOpen = searchBar.classList.contains('hidden');
+  searchBar.classList.toggle('hidden', !willOpen);
+  toggleSearchBtn.classList.toggle('active', willOpen);
+  if (willOpen) {
+    searchInput.focus();
+  } else {
+    searchQuery = '';
+    searchInput.value = '';
+    renderHistory(allHistory);
+  }
+});
+
+searchInput.addEventListener('input', () => {
+  searchQuery = searchInput.value;
+  renderHistory(allHistory);
 });
 
 devicePill.addEventListener('click', () => {

@@ -42,6 +42,18 @@ export function normalizeOs(value) {
   return 'other';
 }
 
+export const DEVICE_COLOR_COUNT = 8;
+
+export function deviceColorIndex(deviceId) {
+  const s = String(deviceId || 'default');
+  let hash = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % DEVICE_COLOR_COUNT;
+}
+
 export function toBase64Url(bytes) {
   let bin = '';
   for (const b of bytes) bin += String.fromCharCode(b);

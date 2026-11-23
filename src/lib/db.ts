@@ -111,7 +111,7 @@ export async function markMessagesDelivered(ids: string[]): Promise<void> {
   });
 }
 
-export async function listMessages(limit = 60): Promise<StoredMessage[]> {
+export async function listMessages(limit = 500): Promise<StoredMessage[]> {
   await pruneExpiredMessages().catch(() => {});
   const db = await openDb();
   return new Promise((resolve, reject) => {
@@ -126,6 +126,19 @@ export async function listMessages(limit = 60): Promise<StoredMessage[]> {
       resolve(all.slice(-limit));
     };
     req.onerror = () => reject(req.error);
+  });
+}
+
+export async function deleteMessage(id: string, blobId?: string): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['messages', 'blobs'], 'readwrite');
+    tx.objectStore('messages').delete(id);
+    if (blobId) {
+      tx.objectStore('blobs').delete(blobId);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
   });
 }
 
