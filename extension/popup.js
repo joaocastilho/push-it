@@ -4,6 +4,8 @@ import {
   defaultDeviceName,
   deriveRoomId,
   formatFileSize,
+  formatRelativeTime,
+  formatRemainingTime,
   isSafeHttpUrl,
   makeAuthHeader,
 } from './crypto.js';
@@ -42,6 +44,8 @@ const autoOpenEl = document.getElementById('autoOpen');
 const targetBar = document.getElementById('targetBar');
 const sendTabBtn = document.getElementById('sendTab');
 const sendTabLabel = document.getElementById('sendTabLabel');
+const sendClipBtn = document.getElementById('sendClipBtn');
+const burnBtn = document.getElementById('burnBtn');
 const fileInput = document.getElementById('fileInput');
 const attachBtn = document.getElementById('attachBtn');
 const draftEl = document.getElementById('draft');
@@ -67,8 +71,16 @@ let showingSettings = false;
 let pairMode = 'code';
 let activeInviteCode = '';
 let pendingResolved = null;
+let burnMs = 0;
 let toastTimer;
 let inviteInterval;
+
+const BURN_OPTIONS = [
+  { ms: 0, label: '⏱ Keep' },
+  { ms: 5 * 60 * 1000, label: '🔥 5m' },
+  { ms: 60 * 60 * 1000, label: '🔥 1h' },
+  { ms: 24 * 60 * 60 * 1000, label: '🔥 24h' },
+];
 
 const OS_PATHS = {
   windows:
@@ -180,10 +192,21 @@ function renderDeviceList() {
     info.appendChild(dot);
     info.appendChild(createOsSvg(dev.os, 13));
 
+    const textCol = document.createElement('div');
+    textCol.className = 'device-meta-col';
+
     const nameEl = document.createElement('span');
     nameEl.className = 'device-name';
     nameEl.textContent = isSelf ? `${dev.name} (You)` : dev.name;
-    info.appendChild(nameEl);
+    textCol.appendChild(nameEl);
+
+    const actEl = document.createElement('span');
+    actEl.className = 'device-activity';
+    actEl.textContent =
+      dev.online || isSelf ? 'Online' : formatRelativeTime(dev.lastSeenAt || dev.updatedAt);
+    textCol.appendChild(actEl);
+
+    info.appendChild(textCol);
 
     const actions = document.createElement('div');
     actions.className = 'item-actions';
@@ -416,6 +439,13 @@ function renderHistory(items) {
 
     const metaRight = document.createElement('span');
     metaRight.className = 'meta-right';
+    if (item.expiresAt && item.expiresAt > Date.now()) {
+      const burn = document.createElement('span');
+      burn.className = 'burn-badge';
+      burn.textContent = `🔥 ${formatRemainingTime(item.expiresAt)}`;
+      burn.title = 'Auto-expires';
+      metaRight.appendChild(burn);
+    }
     const time = document.createElement('time');
     time.textContent = new Date(item.ts).toLocaleTimeString([], {
       hour: '2-digit',
@@ -618,12 +648,61 @@ autoOpenEl.addEventListener('change', async () => {
 });
 
 function getSelectedTargetsPayload() {
-  if (!selectedTargetIds.length) return {};
+  const extra = burnMs > 0 ? { expiresInMs: burnMs } : {};
+  if (!selectedTargetIds.length) return extra;
   const names = pairedDevices
     .filter((d) => selectedTargetIds.includes(d.deviceId))
     .map((d) => d.name);
-  return { targetIds: selectedTargetIds, targetNames: names };
+  return { targetIds: selectedTargetIds, targetNames: names, ...extra };
 }
+
+burnBtn.addEventListener('click', () => {
+  const idx = BURN_OPTIONS.findIndex((o) => o.ms === burnMs);
+  const next = BURN_OPTIONS[(idx + 1) % BURN_OPTIONS.length];
+  burnMs = next.ms;
+  burnBtn.textContent = next.label;
+  burnBtn.classList.toggle('burn-active', burnMs > 0);
+  showToast(burnMs > 0 ? `Auto-burn: ${next.label.replace('🔥 ', '')}` : 'Auto-burn off');
+});
+
+sendClipBtn.addEventListener('click', async () => {
+  try {
+    if (navigator.clipboard?.read) {
+      try {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          const imgType = item.types.find((t) => t.startsWith('image/'));
+          if (imgType) {
+            const blob = await item.getType(imgType);
+            const ext = imgType.split('/')[1] || 'png';
+            await pushFileObject(new File([blob], `clipboard.${ext}`, { type: imgType }));
+            return;
+          }
+        }
+      } catch {
+        // fall through to readText
+      }
+    }
+    const text = (await navigator.clipboard.readText()).trim();
+    if (!text) {
+      showToast('Clipboard is empty');
+      return;
+    }
+    const res = await chrome.runtime.sendMessage({
+      type: 'SEND',
+      content: text,
+      ...getSelectedTargetsPayload(),
+    });
+    if (!res.ok) {
+      showToast(res.error || 'Could not send right now');
+      return;
+    }
+    showToast('Pushed clipboard!');
+    refresh();
+  } catch {
+    showToast('Could not read clipboard');
+  }
+});
 
 attachBtn.addEventListener('click', () => fileInput.click());
 

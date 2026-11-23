@@ -17,6 +17,8 @@ import {
   encryptPairingBundle,
   encryptPayload,
   formatFileSize,
+  formatRelativeTime,
+  formatRemainingTime,
   generateRawKeyB64,
   generateSixDigitCode,
   hashPairCode,
@@ -35,6 +37,7 @@ import {
   kvSet,
   listMessages,
   markMessagesDelivered,
+  pruneExpiredMessages,
   saveBlob,
   saveMessage,
   type StoredMessage,
@@ -61,6 +64,7 @@ interface PairedDevice {
   os: DeviceOs;
   online: boolean;
   updatedAt: number;
+  lastSeenAt?: number;
 }
 
 interface PendingSharePayload {
@@ -75,6 +79,12 @@ interface BeforeInstallPromptEvent extends Event {
 
 const MAX_FILE_BYTES = 7.5 * 1024 * 1024;
 const LONG_TEXT_THRESHOLD = 1800;
+const BURN_OPTIONS = [
+  { ms: 0, label: 'Keep' },
+  { ms: 5 * 60 * 1000, label: '5m' },
+  { ms: 60 * 60 * 1000, label: '1h' },
+  { ms: 24 * 60 * 60 * 1000, label: '24h' },
+] as const;
 
 function formatCountdown(seconds: number): string {
   const m = Math.floor(seconds / 60);
@@ -132,6 +142,8 @@ export default function App() {
   const [messages, setMessages] = createSignal<StoredMessage[]>([]);
   const [blobUrls, setBlobUrls] = createSignal<Record<string, string>>({});
   const [draft, setDraft] = createSignal<string>('');
+  const [burnMs, setBurnMs] = createSignal<number>(0);
+  const [nowTick, setNowTick] = createSignal<number>(Date.now());
   const [sending, setSending] = createSignal(false);
   const [wsStatus, setWsStatus] = createSignal<'disconnected' | 'connecting' | 'connected'>('disconnected');
   const [autoOpen, setAutoOpen] = createSignal<boolean>(true);
@@ -343,6 +355,7 @@ export default function App() {
           iv: string;
           ciphertext: string;
           updatedAt: number;
+          lastSeenAt?: number;
           online: boolean;
         }>;
       };
@@ -367,6 +380,7 @@ export default function App() {
             os,
             online: d.online,
             updatedAt: d.updatedAt,
+            lastSeenAt: d.lastSeenAt || d.updatedAt,
           });
           if (d.deviceId === myId && name !== deviceName()) {
             setDeviceName(name);
@@ -427,8 +441,10 @@ export default function App() {
             fileName: decrypted.fileName,
             mimeType: decrypted.mimeType,
             fileSize: decrypted.fileSize,
+            expiresAt: decrypted.expiresAt,
             direction: 'in',
           };
+          if (item.expiresAt && item.expiresAt <= Date.now()) continue;
           if (item.ts > maxTs) maxTs = item.ts;
           const existed = messages().some((m) => m.id === item.id);
           await saveMessage(item);
@@ -834,6 +850,16 @@ export default function App() {
       window.addEventListener('beforeinstallprompt', onBeforeInstall);
       window.addEventListener('appinstalled', onAppInstalled);
 
+      const expiryTimer = window.setInterval(async () => {
+        const now = Date.now();
+        setNowTick(now);
+        const removed = await pruneExpiredMessages().catch(() => [] as string[]);
+        if (removed.length > 0) {
+          const removedSet = new Set(removed);
+          setMessages((prev) => prev.filter((m) => !removedSet.has(m.id)));
+        }
+      }, 20000);
+
       (async () => {
         await registerServiceWorker().catch(() => {});
 
@@ -963,6 +989,7 @@ export default function App() {
         document.removeEventListener('visibilitychange', onVisibility);
         window.removeEventListener('beforeinstallprompt', onBeforeInstall);
         window.removeEventListener('appinstalled', onAppInstalled);
+        window.clearInterval(expiryTimer);
       };
     },
   );
@@ -1114,8 +1141,10 @@ export default function App() {
               fileName: decrypted.fileName,
               mimeType: decrypted.mimeType,
               fileSize: decrypted.fileSize,
+              expiresAt: decrypted.expiresAt,
               direction: 'in',
             };
+            if (item.expiresAt && item.expiresAt <= Date.now()) return;
 
             await saveMessage(item);
             await kvSet('lastSeenTs', item.ts);
@@ -1217,6 +1246,7 @@ export default function App() {
     tok: string,
     plainBytes: Uint8Array<ArrayBuffer>,
     targetIds?: string[],
+    expiresAt?: number,
   ): Promise<{ blobId: string; blobIv: string }> {
     const blobId = crypto.randomUUID().replace(/-/g, '');
     const { iv: blobIv, ciphertext } = await encryptBytes(
@@ -1226,6 +1256,7 @@ export default function App() {
     );
     const params = new URLSearchParams();
     if (targetIds && targetIds.length > 0) params.set('targetIds', targetIds.join(','));
+    if (expiresAt) params.set('expiresAt', String(expiresAt));
     const qs = params.toString();
 
     const res = await fetch(
@@ -1272,6 +1303,7 @@ export default function App() {
     const defaults = getTargetInfo();
     const targetIds = opts && 'targetIds' in opts ? opts.targetIds : defaults.targetIds;
     const targetNames = opts && 'targetNames' in opts ? opts.targetNames : defaults.targetNames;
+    const expiresAt = burnMs() > 0 ? Date.now() + burnMs() : undefined;
 
     setSending(true);
     try {
@@ -1289,6 +1321,7 @@ export default function App() {
           tok,
           new Uint8Array(buf),
           targetIds,
+          expiresAt,
         );
         envelope = await encryptPayload(
           k,
@@ -1304,6 +1337,7 @@ export default function App() {
             blobId,
             blobIv,
             fileSize: buf.byteLength,
+            expiresAt,
           },
           targetIds,
         );
@@ -1320,6 +1354,7 @@ export default function App() {
             senderName: dName,
             senderOs: localOs,
             targetNames,
+            expiresAt,
           },
           targetIds,
         );
@@ -1351,6 +1386,7 @@ export default function App() {
         type: isLong ? 'text' : detectPayloadType(content),
         content,
         title,
+        expiresAt,
         direction: 'out',
         status: result.delivered ? 'delivered' : 'queued',
       };
@@ -1382,6 +1418,7 @@ export default function App() {
     }
 
     const { targetIds, targetNames } = getTargetInfo();
+    const expiresAt = burnMs() > 0 ? Date.now() + burnMs() : undefined;
     setSending(true);
     try {
       const fileBuf = await file.arrayBuffer();
@@ -1392,6 +1429,7 @@ export default function App() {
         tok,
         new Uint8Array(fileBuf),
         targetIds,
+        expiresAt,
       );
 
       const mimeType = file.type || 'application/octet-stream';
@@ -1412,6 +1450,7 @@ export default function App() {
           fileName,
           mimeType,
           fileSize: file.size,
+          expiresAt,
         },
         targetIds,
       );
@@ -1450,6 +1489,7 @@ export default function App() {
         fileName,
         mimeType,
         fileSize: file.size,
+        expiresAt,
         direction: 'out',
         status: result.delivered ? 'delivered' : 'queued',
       };
@@ -1574,6 +1614,48 @@ export default function App() {
       });
     } catch {
       // user cancelled share sheet
+    }
+  }
+
+  function cycleBurnOption() {
+    const idx = BURN_OPTIONS.findIndex((o) => o.ms === burnMs());
+    const next = BURN_OPTIONS[(idx + 1) % BURN_OPTIONS.length];
+    setBurnMs(next.ms);
+    notify(next.ms > 0 ? `Auto-burn: ${next.label}` : 'Auto-burn off');
+  }
+
+  const burnLabel = createMemo(() => {
+    const opt = BURN_OPTIONS.find((o) => o.ms === burnMs());
+    return opt?.ms ? `🔥 ${opt.label}` : '⏱ Keep';
+  });
+
+  async function pushClipboard() {
+    if (sending()) return;
+    try {
+      if (navigator.clipboard?.read) {
+        try {
+          const items = await navigator.clipboard.read();
+          for (const item of items) {
+            const imgType = item.types.find((t) => t.startsWith('image/'));
+            if (imgType) {
+              const blob = await item.getType(imgType);
+              const ext = imgType.split('/')[1] || 'png';
+              await sendFile(new File([blob], `clipboard.${ext}`, { type: imgType }));
+              return;
+            }
+          }
+        } catch {
+          // fall through to readText
+        }
+      }
+      const text = (await navigator.clipboard?.readText())?.trim();
+      if (!text) {
+        notify('Clipboard is empty');
+        return;
+      }
+      await sendText(text);
+    } catch {
+      notify('Allow clipboard permission to push directly');
     }
   }
 
@@ -1977,10 +2059,19 @@ export default function App() {
                                   class={`dot ${dev.online || isSelf ? 'connected' : 'disconnected'}`}
                                 />
                                 <OsIcon os={dev.os} size={15} />
-                                <span class="device-name">{dev.name}</span>
-                                <Show when={isSelf}>
-                                  <span class="self-tag">This device</span>
-                                </Show>
+                                <div class="device-meta-col">
+                                  <div class="device-name-line">
+                                    <span class="device-name">{dev.name}</span>
+                                    <Show when={isSelf}>
+                                      <span class="self-tag">This device</span>
+                                    </Show>
+                                  </div>
+                                  <span class="device-activity">
+                                    {dev.online || isSelf
+                                      ? 'Online'
+                                      : formatRelativeTime(dev.lastSeenAt || dev.updatedAt)}
+                                  </span>
+                                </div>
                               </div>
                               <div class="row gap">
                                 <button
@@ -2328,6 +2419,11 @@ export default function App() {
                             </span>
                           </span>
                           <span class="meta-right">
+                            <Show when={msg.expiresAt && nowTick() < msg.expiresAt}>
+                              <span class="burn-badge" title="Auto-expires">
+                                🔥 {formatRemainingTime(msg.expiresAt)}
+                              </span>
+                            </Show>
                             <time>
                               {new Date(msg.ts).toLocaleTimeString([], {
                                 hour: '2-digit',
@@ -2436,6 +2532,25 @@ export default function App() {
                 </For>
               </div>
             </Show>
+
+            <div class="quick-bar">
+              <button
+                class="quick-pill"
+                disabled={sending()}
+                title="Push text or image from clipboard"
+                onClick={pushClipboard}
+              >
+                📋 Push Clipboard
+              </button>
+              <button
+                class={`quick-pill ${burnMs() > 0 ? 'burn-active' : ''}`}
+                disabled={sending()}
+                title="Auto-expire timer for next push"
+                onClick={cycleBurnOption}
+              >
+                {burnLabel()}
+              </button>
+            </div>
 
             <footer class="composer-bar">
               <input

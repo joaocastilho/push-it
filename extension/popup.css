@@ -658,3 +658,60 @@ input[type='text']:focus {
   letter-spacing: 0.18em;
   text-align: center;
 }
+
+.quick-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.quick-actions .tab-bar-btn {
+  flex: 1;
+  min-width: 0;
+}
+
+.mini-pill {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: #cbd5e1;
+  border-radius: 9px;
+  padding: 6px 9px;
+  font: inherit;
+  font-size: 0.74rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.mini-pill:hover {
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.mini-pill.burn-active {
+  background: rgba(249, 115, 22, 0.18);
+  border-color: rgba(249, 115, 22, 0.5);
+  color: #fdba74;
+}
+
+.device-meta-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.device-activity {
+  font-size: 0.68rem;
+  color: var(--muted);
+}
+
+.burn-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  color: #fdba74;
+  background: rgba(249, 115, 22, 0.16);
+  border: 1px solid rgba(249, 115, 22, 0.35);
+  border-radius: 999px;
+  padding: 1px 5px;
+}

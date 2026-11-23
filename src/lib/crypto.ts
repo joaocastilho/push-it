@@ -14,6 +14,7 @@ export interface DecryptedPayload {
   fileName?: string;
   mimeType?: string;
   fileSize?: number;
+  expiresAt?: number;
 }
 
 export interface EncryptedEnvelope {
@@ -23,6 +24,7 @@ export interface EncryptedEnvelope {
   iv: string;
   ciphertext: string;
   ts: number;
+  expiresAt?: number;
 }
 
 export interface DeviceMeta {
@@ -223,6 +225,7 @@ export async function encryptPayload(
     iv,
     ciphertext,
     ts: Date.now(),
+    expiresAt: payload.expiresAt,
   };
 }
 
@@ -255,6 +258,12 @@ export async function decryptEnvelope(
     fileName: parsed.fileName ? String(parsed.fileName) : undefined,
     mimeType: parsed.mimeType ? String(parsed.mimeType) : undefined,
     fileSize: typeof parsed.fileSize === 'number' ? parsed.fileSize : undefined,
+    expiresAt:
+      typeof parsed.expiresAt === 'number'
+        ? parsed.expiresAt
+        : typeof envelope.expiresAt === 'number'
+          ? envelope.expiresAt
+          : undefined,
   };
 }
 
@@ -280,6 +289,29 @@ export function formatFileSize(bytes?: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function formatRelativeTime(ts?: number): string {
+  if (!ts) return '';
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 60) return 'Active just now';
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `Active ${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `Active ${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `Active ${diffDay}d ago`;
+}
+
+export function formatRemainingTime(expiresAt?: number): string {
+  if (!expiresAt) return '';
+  const remSec = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+  if (remSec <= 0) return 'Expired';
+  if (remSec < 60) return `${remSec}s`;
+  const remMin = Math.ceil(remSec / 60);
+  if (remMin < 60) return `${remMin}m`;
+  const remHr = Math.ceil(remMin / 60);
+  return `${remHr}h`;
 }
 
 export function isValidSixDigitCode(code: string): boolean {

@@ -76,7 +76,9 @@ async function getConfig() {
     deviceName,
     deviceOs: LOCAL_OS,
     autoOpen: typeof data.autoOpen === 'boolean' ? data.autoOpen : true,
-    history: Array.isArray(data.history) ? data.history : [],
+    history: Array.isArray(data.history)
+      ? data.history.filter((m) => !m.expiresAt || m.expiresAt > Date.now())
+      : [],
     lastSeenTs: typeof data.lastSeenTs === 'number' ? data.lastSeenTs : 0,
     unreadCount: typeof data.unreadCount === 'number' ? data.unreadCount : 0,
     revokedNotice,
@@ -238,6 +240,7 @@ async function refreshDevices() {
           os,
           online: Boolean(d.online),
           updatedAt: d.updatedAt,
+          lastSeenAt: d.lastSeenAt || d.updatedAt,
         });
         if (d.deviceId === cfg.deviceId && name !== cfg.deviceName) {
           await chrome.storage.local.set({ deviceName: name });
@@ -322,8 +325,10 @@ async function syncPending() {
           fileName: decrypted.fileName,
           mimeType: decrypted.mimeType,
           fileSize: decrypted.fileSize,
+          expiresAt: decrypted.expiresAt,
           direction: 'in',
         };
+        if (item.expiresAt && item.expiresAt <= Date.now()) continue;
         if (item.ts > maxTs) maxTs = item.ts;
         item = await hydrateLongTextIfNeeded(item, cfg);
         const added = await appendHistory(item);
@@ -476,8 +481,10 @@ async function connect() {
           fileName: decrypted.fileName,
           mimeType: decrypted.mimeType,
           fileSize: decrypted.fileSize,
+          expiresAt: decrypted.expiresAt,
           direction: 'in',
         };
+        if (item.expiresAt && item.expiresAt <= Date.now()) return;
 
         item = await hydrateLongTextIfNeeded(item, latestCfg);
         const added = await appendHistory(item);
@@ -550,7 +557,7 @@ async function handleIncoming(item, autoOpen) {
   });
 }
 
-async function uploadEncryptedBlob(cfg, roomId, plainBytes, targetIds) {
+async function uploadEncryptedBlob(cfg, roomId, plainBytes, targetIds, expiresAt) {
   const blobId = crypto.randomUUID().replace(/-/g, '');
   const { iv: blobIv, ciphertext } = await encryptBytes(
     cfg.keyB64,
@@ -560,6 +567,7 @@ async function uploadEncryptedBlob(cfg, roomId, plainBytes, targetIds) {
   const base = new URL(cfg.serverUrl);
   const params = new URLSearchParams();
   if (targetIds && targetIds.length > 0) params.set('targetIds', targetIds.join(','));
+  if (expiresAt) params.set('expiresAt', String(expiresAt));
   const qs = params.toString();
 
   const res = await fetch(
@@ -578,7 +586,7 @@ async function uploadEncryptedBlob(cfg, roomId, plainBytes, targetIds) {
   return { blobId, blobIv };
 }
 
-async function sendContent(rawContent, title, targetIds, targetNames) {
+async function sendContent(rawContent, title, targetIds, targetNames, expiresInMs) {
   const content = String(rawContent || '').trim();
   const cfg = await getConfig();
   if (!content) throw new Error('Nothing to send');
@@ -588,11 +596,18 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
 
   const roomId = await deriveRoomId(cfg.keyB64);
   const isLong = content.length > LONG_TEXT_THRESHOLD;
+  const expiresAt = expiresInMs > 0 ? Date.now() + expiresInMs : undefined;
   let envelope;
 
   if (isLong) {
     const plain = new TextEncoder().encode(content);
-    const { blobId, blobIv } = await uploadEncryptedBlob(cfg, roomId, plain, targetIds);
+    const { blobId, blobIv } = await uploadEncryptedBlob(
+      cfg,
+      roomId,
+      plain,
+      targetIds,
+      expiresAt,
+    );
     envelope = await encryptPayload(
       cfg.keyB64,
       roomId,
@@ -607,6 +622,7 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
         blobId,
         blobIv,
         fileSize: plain.byteLength,
+        expiresAt,
       },
       targetIds?.length ? targetIds : undefined,
     );
@@ -623,6 +639,7 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
         senderName: cfg.deviceName,
         senderOs: cfg.deviceOs,
         targetNames: targetNames?.length ? targetNames : undefined,
+        expiresAt,
       },
       targetIds?.length ? targetIds : undefined,
     );
@@ -652,13 +669,14 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
     type: isLong ? 'text' : detectPayloadType(content),
     content,
     title,
+    expiresAt,
     direction: 'out',
     status: result.delivered ? 'delivered' : 'queued',
   });
   return result;
 }
 
-async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNames) {
+async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNames, expiresInMs) {
   const cfg = await getConfig();
   if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken) {
     throw new Error('Pair this device first');
@@ -666,7 +684,14 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
 
   const plainBytes = new Uint8Array(bytesArray);
   const roomId = await deriveRoomId(cfg.keyB64);
-  const { blobId, blobIv } = await uploadEncryptedBlob(cfg, roomId, plainBytes, targetIds);
+  const expiresAt = expiresInMs > 0 ? Date.now() + expiresInMs : undefined;
+  const { blobId, blobIv } = await uploadEncryptedBlob(
+    cfg,
+    roomId,
+    plainBytes,
+    targetIds,
+    expiresAt,
+  );
 
   const envelope = await encryptPayload(
     cfg.keyB64,
@@ -683,6 +708,7 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
       fileName,
       mimeType,
       fileSize: plainBytes.byteLength,
+      expiresAt,
     },
     targetIds?.length ? targetIds : undefined,
   );
@@ -715,6 +741,7 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
     fileName,
     mimeType,
     fileSize: plainBytes.byteLength,
+    expiresAt,
     direction: 'out',
     status: result.delivered ? 'delivered' : 'queued',
   });
@@ -1034,7 +1061,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
 
     if (msg.type === 'SEND') {
-      const res = await sendContent(msg.content, msg.title, msg.targetIds, msg.targetNames);
+      const res = await sendContent(
+        msg.content,
+        msg.title,
+        msg.targetIds,
+        msg.targetNames,
+        msg.expiresInMs,
+      );
       sendResponse({ ok: true, result: res });
       return;
     }
@@ -1046,6 +1079,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         msg.mimeType,
         msg.targetIds,
         msg.targetNames,
+        msg.expiresInMs,
       );
       sendResponse({ ok: true, result: res });
       return;

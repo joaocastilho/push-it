@@ -18,6 +18,7 @@ export interface StoredMessage {
   fileName?: string;
   mimeType?: string;
   fileSize?: number;
+  expiresAt?: number;
 }
 
 export interface StoredBlob {
@@ -111,16 +112,44 @@ export async function markMessagesDelivered(ids: string[]): Promise<void> {
 }
 
 export async function listMessages(limit = 60): Promise<StoredMessage[]> {
+  await pruneExpiredMessages().catch(() => {});
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction('messages', 'readonly');
     const req = tx.objectStore('messages').getAll();
     req.onsuccess = () => {
-      const all = (req.result as StoredMessage[]) || [];
+      const now = Date.now();
+      const all = ((req.result as StoredMessage[]) || []).filter(
+        (m) => !m.expiresAt || m.expiresAt > now,
+      );
       all.sort((a, b) => a.ts - b.ts);
       resolve(all.slice(-limit));
     };
     req.onerror = () => reject(req.error);
+  });
+}
+
+export async function pruneExpiredMessages(): Promise<string[]> {
+  const db = await openDb();
+  const now = Date.now();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['messages', 'blobs'], 'readwrite');
+    const msgStore = tx.objectStore('messages');
+    const blobStore = tx.objectStore('blobs');
+    const removedIds: string[] = [];
+    const req = msgStore.getAll();
+    req.onsuccess = () => {
+      const all = (req.result as StoredMessage[]) || [];
+      for (const m of all) {
+        if (m.expiresAt && m.expiresAt <= now) {
+          msgStore.delete(m.id);
+          if (m.blobId) blobStore.delete(m.blobId);
+          removedIds.push(m.id);
+        }
+      }
+    };
+    tx.oncomplete = () => resolve(removedIds);
+    tx.onerror = () => reject(tx.error);
   });
 }
 

@@ -21,6 +21,7 @@ export interface EncryptedEnvelope {
   iv: string;
   ciphertext: string;
   ts: number;
+  expiresAt?: number;
 }
 
 interface RoomMeta {
@@ -67,6 +68,7 @@ interface StoredDevice {
   ciphertext: string;
   createdAt?: number;
   updatedAt: number;
+  lastSeenAt?: number;
 }
 
 interface StoredMessage {
@@ -190,6 +192,7 @@ export class RoomDO extends DurableObject<Env> {
         ts INTEGER NOT NULL,
         sender_id TEXT NOT NULL DEFAULT '',
         remaining TEXT NOT NULL,
+        expires_at INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (id, chunk_index)
       )
     `);
@@ -200,7 +203,25 @@ export class RoomDO extends DurableObject<Env> {
     } catch {
       // Column already exists
     }
+    try {
+      this.ctx.storage.sql.exec(
+        'ALTER TABLE blobs ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0',
+      );
+    } catch {
+      // Column already exists
+    }
     this.sqlReady = true;
+  }
+
+  private async touchDeviceLastSeen(deviceId: string, now = Date.now()): Promise<void> {
+    const dev = await this.ctx.storage.get<StoredDevice>(`${DEV_PREFIX}${deviceId}`);
+    if (!dev || !dev.tokenHash) return;
+    // Throttle writes to at most once every 30 seconds per device
+    if (dev.lastSeenAt && now - dev.lastSeenAt < 30_000) return;
+    await this.ctx.storage.put(`${DEV_PREFIX}${deviceId}`, {
+      ...dev,
+      lastSeenAt: now,
+    });
   }
 
   private async authenticateRequest(request: Request): Promise<AuthContext | null> {
@@ -619,6 +640,7 @@ export class RoomDO extends DurableObject<Env> {
       ciphertext: body.ciphertext,
       createdAt: now,
       updatedAt: now,
+      lastSeenAt: now,
     };
 
     await Promise.all([
@@ -848,6 +870,7 @@ export class RoomDO extends DurableObject<Env> {
       ciphertext: body.ciphertext,
       createdAt: now,
       updatedAt: now,
+      lastSeenAt: now,
     };
 
     await this.ctx.storage.put(`${DEV_PREFIX}${body.deviceId}`, record);
@@ -908,6 +931,7 @@ export class RoomDO extends DurableObject<Env> {
     const [client, server] = Object.values(pair);
 
     this.ctx.acceptWebSocket(server, [stored.deviceId]);
+    await this.touchDeviceLastSeen(stored.deviceId);
     this.broadcastJson({ type: 'devices_updated' });
 
     return new Response(null, { status: 101, webSocket: client });
@@ -917,11 +941,18 @@ export class RoomDO extends DurableObject<Env> {
     if (typeof message !== 'string') return;
     if (message === 'ping') {
       ws.send('pong');
+      for (const tag of this.ctx.getTags(ws)) {
+        await this.touchDeviceLastSeen(tag);
+      }
     }
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    const tags = this.ctx.getTags(ws);
     ws.close(code, reason);
+    for (const tag of tags) {
+      await this.touchDeviceLastSeen(tag);
+    }
     this.broadcastJson({ type: 'devices_updated' });
   }
 
@@ -938,7 +969,11 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     const now = Date.now();
-    this.ctx.storage.sql.exec('DELETE FROM blobs WHERE ts < ?', now - MESSAGE_TTL_MS);
+    this.ctx.storage.sql.exec(
+      'DELETE FROM blobs WHERE ts < ? OR (expires_at > 0 AND expires_at <= ?)',
+      now - MESSAGE_TTL_MS,
+      now,
+    );
 
     const existing = this.ctx.storage.sql
       .exec('SELECT 1 FROM blobs WHERE id = ? LIMIT 1', blobId)
@@ -951,6 +986,11 @@ export class RoomDO extends DurableObject<Env> {
     const targetParam = url.searchParams.get('targetIds') || '';
     const targetIds = targetParam ? targetParam.split(',').filter(Boolean) : [];
     const targetSet = targetIds.length > 0 ? new Set(targetIds) : null;
+    const rawExpires = Number(url.searchParams.get('expiresAt') || '0');
+    const expiresAt =
+      Number.isFinite(rawExpires) && rawExpires > now
+        ? Math.min(rawExpires, now + MESSAGE_TTL_MS)
+        : 0;
 
     const allDevices = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
     const remaining: string[] = [];
@@ -968,23 +1008,31 @@ export class RoomDO extends DurableObject<Env> {
     for (let offset = 0; offset < bytes.byteLength; offset += BLOB_CHUNK_SIZE) {
       const slice = bytes.slice(offset, offset + BLOB_CHUNK_SIZE);
       this.ctx.storage.sql.exec(
-        'INSERT INTO blobs (id, chunk_index, data, ts, sender_id, remaining) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO blobs (id, chunk_index, data, ts, sender_id, remaining, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
         blobId,
         chunkIndex,
         slice,
         now,
         senderId,
         remainingJson,
+        expiresAt,
       );
       chunkIndex++;
     }
 
+    await this.touchDeviceLastSeen(senderId, now);
     return Response.json({ ok: true, blobId, bytes: bytes.byteLength });
   }
 
   private handleDownloadBlob(blobId: string, auth: AuthContext): Response {
     this.ensureBlobTable();
     const deviceId = auth.deviceId;
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      'DELETE FROM blobs WHERE ts < ? OR (expires_at > 0 AND expires_at <= ?)',
+      now - MESSAGE_TTL_MS,
+      now,
+    );
 
     const rows = this.ctx.storage.sql
       .exec(
@@ -1061,9 +1109,10 @@ export class RoomDO extends DurableObject<Env> {
         iv: d.iv,
         ciphertext: d.ciphertext,
         updatedAt: d.updatedAt,
+        lastSeenAt: d.lastSeenAt || d.updatedAt,
         online: onlineIds.has(d.deviceId),
       }))
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+      .sort((a, b) => b.lastSeenAt - a.lastSeenAt);
 
     return Response.json({ devices, pinEnabled: Boolean(auth.meta.roomPinHash) });
   }
@@ -1212,7 +1261,7 @@ export class RoomDO extends DurableObject<Env> {
 
     for (const [key, entry] of entries) {
       const env = 'envelope' in entry ? entry.envelope : entry;
-      if (now - env.ts > MESSAGE_TTL_MS) {
+      if (now - env.ts > MESSAGE_TTL_MS || (env.expiresAt && now >= env.expiresAt)) {
         toDelete.push(key);
       }
     }
@@ -1281,7 +1330,7 @@ export class RoomDO extends DurableObject<Env> {
       const env = isWrapped ? entry.envelope : entry;
       const remaining = isWrapped ? entry.remaining : [];
 
-      if (now - env.ts > MESSAGE_TTL_MS) {
+      if (now - env.ts > MESSAGE_TTL_MS || (env.expiresAt && now >= env.expiresAt)) {
         toDelete.push(key);
         continue;
       }
@@ -1344,6 +1393,18 @@ export class RoomDO extends DurableObject<Env> {
 
     const now = Date.now();
     envelope.ts = envelope.ts || now;
+    if (typeof envelope.expiresAt === 'number' && Number.isFinite(envelope.expiresAt)) {
+      if (envelope.expiresAt <= now) {
+        return Response.json({ error: 'Message already expired' }, { status: 400 });
+      }
+      envelope.expiresAt = Math.min(envelope.expiresAt, now + MESSAGE_TTL_MS);
+    } else {
+      delete envelope.expiresAt;
+    }
+    const pushTtl = envelope.expiresAt
+      ? Math.max(60, Math.min(MAX_TTL_SECONDS, Math.ceil((envelope.expiresAt - now) / 1000)))
+      : MAX_TTL_SECONDS;
+    await this.touchDeviceLastSeen(auth.deviceId, now);
 
     const allDevices = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
     const registeredIds = new Set<string>();
@@ -1418,7 +1479,7 @@ export class RoomDO extends DurableObject<Env> {
                 {
                   data: envelope as unknown as Record<string, string | number>,
                   options: {
-                    ttl: MAX_TTL_SECONDS,
+                    ttl: pushTtl,
                     urgency: 'high',
                   },
                 },

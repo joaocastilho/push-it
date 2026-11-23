@@ -134,6 +134,6 @@ createZip(FIREFOX_UNPACKED_DIR, join(DIST_EXT_DIR, 'push-it-firefox.xpi'));
 
 const version = String(manifest.version || '1.0.0');
 console.log(`Built extensions v${version}:`);
-console.log(`  - ${DIST_EXT_DIR}/push-it-chromium.zip (Chrome, Edge, Brave, Arc, Vivaldi)`);
-console.log(`  - ${DIST_EXT_DIR}/push-it-firefox.xpi  (Firefox, Zen, Floorp, LibreWolf)`);
-console.log(`  - ${FIREFOX_UNPACKED_DIR}/             (Unpacked Firefox dev folder)`);
+console.log(`  - ${DIST_EXT_DIR}/push-it-chromium.zip (Chromium-based browsers)`);
+console.log(`  - ${DIST_EXT_DIR}/push-it-firefox.xpi  (Firefox-based browsers)`);
+console.log(`  - ${FIREFOX_UNPACKED_DIR}/             (Unpacked Firefox-based dev folder)`);

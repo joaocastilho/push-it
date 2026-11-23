@@ -21,8 +21,22 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
-      - name: Build Chromium and Firefox extension packages
+      - name: Build Chromium-based and Firefox-based extension packages
         run: bun run build:extensions
+
+      - name: Sign Firefox-based add-on with Mozilla AMO (when credentials are configured)
+        if: ${{ secrets.AMO_JWT_ISSUER != '' && secrets.AMO_JWT_SECRET != '' }}
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          bunx web-ext sign \
+            --channel=unlisted \
+            --source-dir=extension-firefox \
+            --artifacts-dir=dist-signed
+          SIGNED=$(ls dist-signed/*.xpi | head -n 1)
+          cp "$SIGNED" dist-extensions/push-it-firefox.xpi
+          echo "Signed Firefox add-on ready: $SIGNED"
 
       - name: Read version
         id: meta
@@ -47,6 +61,6 @@ jobs:
               dist-extensions/push-it-chromium.zip \
               dist-extensions/push-it-firefox.xpi \
               --title "Push It $TAG" \
-              --notes "Ready-to-install Chromium (.zip) and Firefox (.xpi) browser extension packages for Push It $TAG." \
+              --notes "Ready-to-install Chromium-based (.zip) and Firefox-based (.xpi) browser extension packages for Push It $TAG." \
               --latest
           fi

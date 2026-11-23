@@ -1,8 +1,9 @@
-// Push It Service Worker — E2EE Web Push decrypt + authenticated Android Share Target with picker & toast
+// Push It Service Worker — E2EE Web Push decrypt + Android/iOS Share Target (links, text, photos & files)
 
 const DB_NAME = 'push-it-db';
 const DB_VERSION = 2;
 const LONG_TEXT_THRESHOLD = 1800;
+const MAX_FILE_BYTES = 7.5 * 1024 * 1024;
 
 self.addEventListener('install', () => {
   self.skipWaiting();
@@ -67,6 +68,36 @@ async function saveMessage(msg) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction('messages', 'readwrite');
     tx.objectStore('messages').put(msg);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function saveBlob(blob) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('blobs', 'readwrite');
+    tx.objectStore('blobs').put(blob);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getBlob(id) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('blobs', 'readonly');
+    const req = tx.objectStore('blobs').get(id);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function deleteBlob(id) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('blobs', 'readwrite');
+    tx.objectStore('blobs').delete(id);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -151,6 +182,7 @@ async function encryptPayload(keyB64, roomId, senderId, payload, targetIds) {
     iv,
     ciphertext: toBase64Url(ciphertext),
     ts: Date.now(),
+    expiresAt: payload.expiresAt,
   };
 }
 
@@ -180,6 +212,13 @@ function detectPayloadType(input) {
   return 'text';
 }
 
+function formatFileSize(bytes) {
+  if (!bytes || bytes <= 0) return '';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function normalizeOs(value) {
   if (
     value === 'android' ||
@@ -200,7 +239,7 @@ function defaultDeviceName(os) {
     case 'windows':
       return 'Windows';
     case 'macos':
-      return 'macOS';
+      return 'Mac';
     case 'ios':
       return 'iOS';
     case 'linux':
@@ -266,6 +305,7 @@ async function fetchRoomDevices(roomId, keyB64, deviceId, deviceToken) {
           os,
           online: Boolean(d.online),
           updatedAt: d.updatedAt,
+          lastSeenAt: d.lastSeenAt || d.updatedAt,
         });
       } catch {
         // ignore unreadable device record
@@ -279,6 +319,138 @@ async function fetchRoomDevices(roomId, keyB64, deviceId, deviceToken) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function dispatchShareFile({ fileBuf, fileName, mimeType, targetIds, targetNames }) {
+  const [keyB64, deviceId, deviceToken, deviceName, deviceOs] = await Promise.all([
+    kvGet('keyB64'),
+    kvGet('deviceId'),
+    kvGet('deviceToken'),
+    kvGet('deviceName'),
+    kvGet('deviceOs'),
+  ]);
+
+  if (!keyB64 || !deviceId || !deviceToken) {
+    return { ok: false, revoked: true, error: 'Device not paired' };
+  }
+
+  if (!fileBuf || fileBuf.byteLength === 0) {
+    return { ok: false, error: 'Empty file' };
+  }
+  if (fileBuf.byteLength > MAX_FILE_BYTES) {
+    return { ok: false, error: 'File is too large (max 7.5 MB)' };
+  }
+
+  const roomId = await deriveRoomId(keyB64);
+  const authHeader = makeAuthHeader(deviceId, deviceToken);
+  const senderName = deviceName || 'Android';
+  const senderOs = deviceOs || 'android';
+  const cleanTargetIds =
+    Array.isArray(targetIds) && targetIds.length > 0
+      ? targetIds.map((id) => String(id))
+      : undefined;
+  const cleanTargetNames =
+    Array.isArray(targetNames) && targetNames.length > 0
+      ? targetNames.map((n) => String(n))
+      : undefined;
+
+  const blobId = crypto.randomUUID().replace(/-/g, '');
+  const { iv: blobIv, ciphertext } = await encryptBytes(
+    keyB64,
+    new Uint8Array(fileBuf),
+    blobAad(roomId, blobId),
+  );
+  const params = new URLSearchParams();
+  if (cleanTargetIds && cleanTargetIds.length > 0) {
+    params.set('targetIds', cleanTargetIds.join(','));
+  }
+  const qs = params.toString();
+
+  const uploadRes = await fetch(
+    `/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(blobId)}${qs ? `?${qs}` : ''}`,
+    {
+      method: 'PUT',
+      headers: {
+        'content-type': 'application/octet-stream',
+        authorization: authHeader,
+      },
+      body: ciphertext,
+    },
+  );
+  if (uploadRes.status === 401) {
+    await kvDelete('deviceToken');
+    return { ok: false, revoked: true, error: 'This device was removed from the room' };
+  }
+  if (!uploadRes.ok) {
+    return { ok: false, error: 'Could not upload file (max 7.5 MB)' };
+  }
+
+  const safeMime = mimeType || 'application/octet-stream';
+  const safeName = fileName || (safeMime.startsWith('image/') ? 'photo.png' : 'file');
+
+  const envelope = await encryptPayload(
+    keyB64,
+    roomId,
+    deviceId,
+    {
+      type: 'file',
+      content: safeName,
+      senderName,
+      senderOs,
+      targetNames: cleanTargetNames,
+      blobId,
+      blobIv,
+      fileName: safeName,
+      mimeType: safeMime,
+      fileSize: fileBuf.byteLength,
+    },
+    cleanTargetIds,
+  );
+
+  const res = await fetch(`/api/room/${encodeURIComponent(roomId)}/send`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: authHeader,
+    },
+    body: JSON.stringify(envelope),
+  });
+
+  if (res.status === 401) {
+    await kvDelete('deviceToken');
+    return { ok: false, revoked: true, error: 'This device was removed from the room' };
+  }
+  if (!res.ok) {
+    return { ok: false, error: `Could not send (${res.status})` };
+  }
+
+  const result = await res.json().catch(() => ({}));
+  await saveBlob({ id: blobId, data: fileBuf, mimeType: safeMime, fileName: safeName });
+  const item = {
+    id: envelope.id,
+    senderId: deviceId,
+    senderName,
+    senderOs,
+    targetNames: cleanTargetNames,
+    ts: envelope.ts,
+    type: 'file',
+    content: safeName,
+    blobId,
+    blobIv,
+    fileName: safeName,
+    mimeType: safeMime,
+    fileSize: fileBuf.byteLength,
+    direction: 'out',
+    status: result.delivered ? 'delivered' : 'queued',
+  };
+  await saveMessage(item);
+
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  for (const c of clients) {
+    c.postMessage({ type: 'PUSH_RECEIVED', item });
+  }
+
+  return { ok: true, delivered: Boolean(result.delivered) };
 }
 
 async function dispatchShareMessage({ content, title, targetIds, targetNames }) {
@@ -517,13 +689,17 @@ function renderToastHtml({ ok, title, subtitle, preview, revoked }) {
 </html>`;
 }
 
-function renderPickerHtml({ content, title, otherDevices }) {
+function renderPickerHtml({ content, title, pendingFileId, fileLabel, otherDevices }) {
   const sorted = [...otherDevices].sort((a, b) => {
     if (a.online !== b.online) return a.online ? -1 : 1;
-    return (b.updatedAt || 0) - (a.updatedAt || 0);
+    return (b.lastSeenAt || b.updatedAt || 0) - (a.lastSeenAt || a.updatedAt || 0);
   });
 
-  const payloadJson = JSON.stringify({ content, title: title || '' })
+  const payloadJson = JSON.stringify({
+    content: content || '',
+    title: title || '',
+    pendingFileId: pendingFileId || '',
+  })
     .replace(/</g, '\\u003c')
     .replace(/>/g, '\\u003e')
     .replace(/&/g, '\\u0026');
@@ -655,7 +831,7 @@ function renderPickerHtml({ content, title, otherDevices }) {
 
     <div class="preview">
       ${title ? `<div class="preview-title">${escapeHtml(title)}</div>` : ''}
-      <div class="preview-content">${escapeHtml(content.slice(0, 240))}</div>
+      <div class="preview-content">${escapeHtml(fileLabel || (content || '').slice(0, 240))}</div>
     </div>
 
     <div class="list" id="destList">
@@ -709,7 +885,16 @@ function renderPickerHtml({ content, title, otherDevices }) {
       toastSub.textContent = sub || '';
     }
 
-    document.getElementById('cancelBtn').addEventListener('click', closeShare);
+    document.getElementById('cancelBtn').addEventListener('click', function() {
+      if (SHARE_PAYLOAD.pendingFileId) {
+        fetch('/share-cancel', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-push-it-share': '1' },
+          body: JSON.stringify({ pendingFileId: SHARE_PAYLOAD.pendingFileId }),
+        }).catch(function() {});
+      }
+      closeShare();
+    });
     toast.addEventListener('click', closeShare);
 
     buttons.forEach(function(btn) {
@@ -722,8 +907,9 @@ function renderPickerHtml({ content, title, otherDevices }) {
         if (arrow) arrow.textContent = '…';
 
         var body = {
-          content: SHARE_PAYLOAD.content,
+          content: SHARE_PAYLOAD.content || undefined,
           title: SHARE_PAYLOAD.title || undefined,
+          pendingFileId: SHARE_PAYLOAD.pendingFileId || undefined,
           targetIds: isAll ? undefined : [devId],
           targetNames: isAll ? undefined : [devName],
         };
@@ -765,20 +951,40 @@ function renderPickerHtml({ content, title, otherDevices }) {
 </html>`;
 }
 
-// Intercept Android Share Target (/share?...) and picker dispatch (/share-dispatch)
+// Intercept Share Target (POST /share for photos/files/text, GET /share for iOS Shortcut/links)
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
 
-  if (event.request.method === 'GET' && url.pathname === '/share') {
-    event.respondWith(handleSharePage(url));
+  if (url.pathname === '/share' && (event.request.method === 'GET' || event.request.method === 'POST')) {
+    event.respondWith(handleSharePage(event.request, url));
     return;
   }
 
   if (event.request.method === 'POST' && url.pathname === '/share-dispatch') {
     event.respondWith(handleShareDispatch(event.request));
+    return;
+  }
+
+  if (event.request.method === 'POST' && url.pathname === '/share-cancel') {
+    event.respondWith(handleShareCancel(event.request));
   }
 });
+
+async function handleShareCancel(request) {
+  if (request.headers.get('x-push-it-share') !== '1') {
+    return Response.json({ ok: false }, { status: 403 });
+  }
+  try {
+    const body = await request.json();
+    if (body.pendingFileId && String(body.pendingFileId).startsWith('pending-share:')) {
+      await deleteBlob(String(body.pendingFileId));
+    }
+  } catch {
+    // ignore
+  }
+  return Response.json({ ok: true });
+}
 
 async function handleShareDispatch(request) {
   if (request.headers.get('x-push-it-share') !== '1') {
@@ -786,12 +992,30 @@ async function handleShareDispatch(request) {
   }
   try {
     const body = await request.json();
-    const result = await dispatchShareMessage({
-      content: body.content,
-      title: body.title,
-      targetIds: body.targetIds,
-      targetNames: body.targetNames,
-    });
+    let result;
+    if (body.pendingFileId && String(body.pendingFileId).startsWith('pending-share:')) {
+      const staged = await getBlob(String(body.pendingFileId));
+      if (!staged) {
+        return Response.json({ ok: false, error: 'Shared file expired, please share again' }, { status: 410 });
+      }
+      result = await dispatchShareFile({
+        fileBuf: staged.data,
+        fileName: staged.fileName,
+        mimeType: staged.mimeType,
+        targetIds: body.targetIds,
+        targetNames: body.targetNames,
+      });
+      if (result.ok) {
+        await deleteBlob(String(body.pendingFileId)).catch(() => {});
+      }
+    } else {
+      result = await dispatchShareMessage({
+        content: body.content,
+        title: body.title,
+        targetIds: body.targetIds,
+        targetNames: body.targetNames,
+      });
+    }
     return Response.json(result, {
       status: result.ok ? 200 : result.revoked ? 401 : 500,
       headers: { 'cache-control': 'no-store' },
@@ -801,10 +1025,31 @@ async function handleShareDispatch(request) {
   }
 }
 
-async function handleSharePage(url) {
-  const sharedUrl = (url.searchParams.get('url') || '').trim();
-  const sharedText = (url.searchParams.get('text') || '').trim();
-  const sharedTitle = (url.searchParams.get('title') || '').trim() || undefined;
+async function handleSharePage(request, url) {
+  let sharedUrl = '';
+  let sharedText = '';
+  let sharedTitle;
+  let sharedFile = null;
+
+  if (request.method === 'POST') {
+    try {
+      const form = await request.formData();
+      sharedUrl = String(form.get('url') || '').trim();
+      sharedText = String(form.get('text') || '').trim();
+      sharedTitle = String(form.get('title') || '').trim() || undefined;
+      const maybeFile = form.get('files');
+      if (maybeFile && typeof maybeFile !== 'string' && maybeFile.size > 0) {
+        sharedFile = maybeFile;
+      }
+    } catch {
+      // fall through
+    }
+  } else {
+    sharedUrl = (url.searchParams.get('url') || '').trim();
+    sharedText = (url.searchParams.get('text') || '').trim();
+    sharedTitle = (url.searchParams.get('title') || '').trim() || undefined;
+  }
+
   const content = sharedUrl || sharedText;
 
   const [keyB64, deviceId, deviceToken] = await Promise.all([
@@ -817,8 +1062,20 @@ async function handleSharePage(url) {
     return Response.redirect('/', 302);
   }
 
-  if (!content) {
+  if (!sharedFile && !content) {
     return Response.redirect('/', 302);
+  }
+
+  if (sharedFile && sharedFile.size > MAX_FILE_BYTES) {
+    return new Response(
+      renderToastHtml({
+        ok: false,
+        title: 'File is too large',
+        subtitle: 'Maximum file size is 7.5 MB.',
+        preview: `${sharedFile.name || 'File'} (${formatFileSize(sharedFile.size)})`,
+      }),
+      { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } },
+    );
   }
 
   const roomId = await deriveRoomId(keyB64);
@@ -830,7 +1087,7 @@ async function handleSharePage(url) {
         ok: false,
         revoked: true,
         title: 'Device removed from room',
-        subtitle: 'Pair this phone again with a new invite link to share.',
+        subtitle: 'Pair this device again with a new 6-digit code to share.',
       }),
       { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } },
     );
@@ -838,8 +1095,26 @@ async function handleSharePage(url) {
 
   const otherDevices = devices.filter((d) => d.deviceId !== deviceId);
 
-  // If multiple other devices are in the room, ask which device (or All) to send to
+  // Multiple other devices: ask which device or All Devices (Room)
   if (otherDevices.length > 1) {
+    if (sharedFile) {
+      const pendingFileId = `pending-share:${crypto.randomUUID()}`;
+      const fileBuf = await sharedFile.arrayBuffer();
+      const mimeType = sharedFile.type || 'application/octet-stream';
+      const fileName = sharedFile.name || (mimeType.startsWith('image/') ? 'photo.png' : 'file');
+      await saveBlob({ id: pendingFileId, data: fileBuf, mimeType, fileName });
+      const kind = mimeType.startsWith('image/') ? 'Photo' : 'File';
+      return new Response(
+        renderPickerHtml({
+          pendingFileId,
+          title: `${kind} · ${formatFileSize(fileBuf.byteLength)}`,
+          fileLabel: fileName,
+          otherDevices,
+        }),
+        { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } },
+      );
+    }
+
     return new Response(
       renderPickerHtml({
         content,
@@ -850,19 +1125,28 @@ async function handleSharePage(url) {
     );
   }
 
-  // 0 or 1 other device: send immediately and show a clear confirmation Toast
+  // 0 or 1 other device: send immediately and show confirmation Toast
   const singleTarget = otherDevices.length === 1 ? otherDevices[0] : null;
-  const result = await dispatchShareMessage({
-    content,
-    title: sharedTitle,
-  });
+  let result;
+  let previewText = '';
+
+  if (sharedFile) {
+    const fileBuf = await sharedFile.arrayBuffer();
+    const mimeType = sharedFile.type || 'application/octet-stream';
+    const fileName = sharedFile.name || (mimeType.startsWith('image/') ? 'photo.png' : 'file');
+    previewText = `${fileName} (${formatFileSize(fileBuf.byteLength)})`;
+    result = await dispatchShareFile({ fileBuf, fileName, mimeType });
+  } else {
+    previewText = sharedTitle || content.slice(0, 120);
+    result = await dispatchShareMessage({ content, title: sharedTitle });
+  }
 
   const html = result.ok
     ? renderToastHtml({
         ok: true,
         title: singleTarget ? `Sent to ${singleTarget.name}` : 'Pushed to room',
         subtitle: result.delivered ? 'Delivered now' : 'Queued for delivery',
-        preview: sharedTitle || content.slice(0, 120),
+        preview: previewText,
       })
     : renderToastHtml({
         ok: false,
@@ -901,7 +1185,7 @@ async function handlePush(event) {
   if (!keyB64 || !myDeviceId || !deviceToken) {
     await self.registration.showNotification('Push It', {
       body: 'Open Push It to pair this device',
-      icon: '/icon.svg',
+      icon: '/icon-192.png',
       data: { type: 'app' },
     });
     return;
@@ -915,9 +1199,20 @@ async function handlePush(event) {
   } catch {
     await self.registration.showNotification('Push It', {
       body: 'Re-pair this device to read this message',
-      icon: '/icon.svg',
+      icon: '/icon-192.png',
       data: { type: 'app' },
     });
+    return;
+  }
+
+  const expiresAt =
+    typeof payload.expiresAt === 'number'
+      ? payload.expiresAt
+      : typeof envelope.expiresAt === 'number'
+        ? envelope.expiresAt
+        : undefined;
+
+  if (expiresAt && expiresAt <= Date.now()) {
     return;
   }
 
@@ -943,6 +1238,7 @@ async function handlePush(event) {
     fileName: payload.fileName ? String(payload.fileName) : undefined,
     mimeType: payload.mimeType ? String(payload.mimeType) : undefined,
     fileSize: typeof payload.fileSize === 'number' ? payload.fileSize : undefined,
+    expiresAt,
     direction: 'in',
   };
 
@@ -952,7 +1248,6 @@ async function handlePush(event) {
     await kvSet('lastSeenTs', item.ts);
   }
 
-  // Send authenticated delivery receipt back so sender sees ✓✓
   fetch(`/api/room/${encodeURIComponent(rid)}/ack`, {
     method: 'POST',
     headers: {
@@ -996,8 +1291,8 @@ async function handlePush(event) {
 
   await self.registration.showNotification(notifTitle, {
     body: notifBody,
-    icon: '/icon.svg',
-    badge: '/icon.svg',
+    icon: '/icon-192.png',
+    badge: '/icon-192.png',
     tag: item.id,
     data: {
       id: item.id,
