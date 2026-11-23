@@ -1,6 +1,6 @@
 {
   "name": "push-it",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "private": true,
   "type": "module",
   "scripts": {
@@ -20,6 +20,7 @@
   "dependencies": {
     "@block65/webcrypto-web-push": "^2.0.0",
     "@solidjs/web": "^2.0.3",
+    "lucide": "^1.78.0",
     "qrcode": "^1.5.4",
     "solid-js": "^2.0.3"
   },

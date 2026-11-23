@@ -1,4 +1,12 @@
 import { toDataURL as qrToDataURL } from './qrcode.js';
+import {
+  Check,
+  Copy,
+  createElement as createLucideElement,
+  Download,
+  ExternalLink,
+  Trash2,
+} from './icons.js';
 import { clearExtBlobs, getExtBlob, saveExtBlob } from './db.js';
 import {
   blobAad,
@@ -79,6 +87,24 @@ const historyList = document.getElementById('historyList');
 const extVersion = chrome.runtime.getManifest().version;
 versionText.textContent = `Version v${extVersion}`;
 setupVersionText.textContent = `Version v${extVersion}`;
+
+function isNewerVersion(candidate, current) {
+  if (!candidate) return false;
+  const parse = (v) =>
+    String(v)
+      .replace(/^v/i, '')
+      .split('-')[0]
+      .split('.')
+      .map((n) => parseInt(n, 10) || 0);
+  const a = parse(candidate);
+  const b = parse(current);
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (a[i] || 0) - (b[i] || 0);
+    if (diff !== 0) return diff > 0;
+  }
+  return false;
+}
 
 let myDeviceId = '';
 let currentDeviceToken = '';
@@ -171,51 +197,13 @@ function updateServerUrlVisibility() {
   }
 }
 
-function createCopySvg() {
-  const ns = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(ns, 'svg');
-  svg.setAttribute('width', '12');
-  svg.setAttribute('height', '12');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('fill', 'none');
-  svg.setAttribute('stroke', 'currentColor');
-  svg.setAttribute('stroke-width', '2');
-  svg.setAttribute('stroke-linecap', 'round');
-  svg.setAttribute('stroke-linejoin', 'round');
-  const rect = document.createElementNS(ns, 'rect');
-  rect.setAttribute('x', '9');
-  rect.setAttribute('y', '9');
-  rect.setAttribute('width', '13');
-  rect.setAttribute('height', '13');
-  rect.setAttribute('rx', '2');
-  const path = document.createElementNS(ns, 'path');
-  path.setAttribute('d', 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1');
-  svg.appendChild(rect);
-  svg.appendChild(path);
-  return svg;
-}
-
-function createTrashSvg() {
-  const ns = 'http://www.w3.org/2000/svg';
-  const svg = document.createElementNS(ns, 'svg');
-  svg.setAttribute('width', '12');
-  svg.setAttribute('height', '12');
-  svg.setAttribute('viewBox', '0 0 24 24');
-  svg.setAttribute('fill', 'none');
-  svg.setAttribute('stroke', 'currentColor');
-  svg.setAttribute('stroke-width', '2');
-  svg.setAttribute('stroke-linecap', 'round');
-  svg.setAttribute('stroke-linejoin', 'round');
-  for (const d of [
-    'M3 6h18',
-    'M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2',
-    'M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6',
-  ]) {
-    const p = document.createElementNS(ns, 'path');
-    p.setAttribute('d', d);
-    svg.appendChild(p);
-  }
-  return svg;
+function renderLucide(iconNode, size = 14) {
+  return createLucideElement(iconNode, {
+    width: size,
+    height: size,
+    'stroke-width': 2,
+    'aria-hidden': 'true',
+  });
 }
 
 function renderDevicePill() {
@@ -554,7 +542,7 @@ async function refresh() {
       fetch(`${new URL(currentServerUrl).origin}/api/version`, { cache: 'no-store' })
         .then((r) => (r.ok ? r.json() : null))
         .then((d) => {
-          if (d?.version && d.version !== extVersion) {
+          if (isNewerVersion(d?.version, extVersion)) {
             updateHint.textContent = `v${d.version} available · reload extension`;
             updateHint.classList.remove('hidden');
           } else {
@@ -720,15 +708,25 @@ function renderHistory(items) {
 
     if (item.type === 'file') {
       const dlBtn = document.createElement('button');
-      dlBtn.className = 'chip primary';
-      dlBtn.textContent = 'Download';
-      dlBtn.onclick = () => downloadFileItem(item);
+      dlBtn.className = 'icon-chip primary';
+      dlBtn.title = 'Download file';
+      dlBtn.setAttribute('aria-label', 'Download file');
+      dlBtn.appendChild(renderLucide(Download, 14));
+      dlBtn.onclick = (e) => {
+        e.stopPropagation();
+        downloadFileItem(item);
+      };
       leftGroup.appendChild(dlBtn);
     } else if (item.type === 'link' && isSafeHttpUrl(item.content)) {
       const openBtn = document.createElement('button');
-      openBtn.className = 'chip primary';
-      openBtn.textContent = 'Open';
-      openBtn.onclick = () => chrome.tabs.create({ url: item.content, active: true });
+      openBtn.className = 'icon-chip primary';
+      openBtn.title = 'Open link';
+      openBtn.setAttribute('aria-label', 'Open link');
+      openBtn.appendChild(renderLucide(ExternalLink, 14));
+      openBtn.onclick = (e) => {
+        e.stopPropagation();
+        chrome.tabs.create({ url: item.content, active: true });
+      };
       leftGroup.appendChild(openBtn);
     }
 
@@ -736,13 +734,13 @@ function renderHistory(items) {
       const copyBtn = document.createElement('button');
       copyBtn.className = 'icon-chip';
       copyBtn.title = 'Copy to clipboard';
-      copyBtn.appendChild(createCopySvg());
-      const copyLbl = document.createElement('span');
-      copyLbl.textContent = 'Copy';
-      copyBtn.appendChild(copyLbl);
+      copyBtn.setAttribute('aria-label', 'Copy to clipboard');
+      copyBtn.appendChild(renderLucide(Copy, 14));
       copyBtn.onclick = async (e) => {
         e.stopPropagation();
         await navigator.clipboard.writeText(item.content);
+        copyBtn.replaceChildren(renderLucide(Check, 14));
+        setTimeout(() => copyBtn.replaceChildren(renderLucide(Copy, 14)), 1400);
         showToast('Copied to clipboard');
       };
       leftGroup.appendChild(copyBtn);
@@ -755,7 +753,7 @@ function renderHistory(items) {
     delBtn.className = 'icon-chip danger';
     delBtn.title = 'Delete message';
     delBtn.setAttribute('aria-label', 'Delete message');
-    delBtn.appendChild(createTrashSvg());
+    delBtn.appendChild(renderLucide(Trash2, 14));
     delBtn.onclick = (e) => {
       e.stopPropagation();
       rightGroup.innerHTML = '';

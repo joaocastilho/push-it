@@ -1,6 +1,8 @@
 import { createEffect, createMemo, createSignal, For, Show } from 'solid-js';
+import { Check, Copy, Download, ExternalLink, Trash2 } from 'lucide';
 import QRCode from 'qrcode';
 import { DigitCodeInput } from './components/DigitCodeInput';
+import { LucideIcon } from './components/LucideIcon';
 import { OsIcon } from './components/OsIcon';
 import {
   blobAad,
@@ -96,6 +98,24 @@ function formatCountdown(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function isNewerVersion(candidate: string | null | undefined, current: string): boolean {
+  if (!candidate) return false;
+  const parse = (v: string) =>
+    v
+      .replace(/^v/i, '')
+      .split('-')[0]
+      .split('.')
+      .map((n) => parseInt(n, 10) || 0);
+  const a = parse(candidate);
+  const b = parse(current);
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (a[i] || 0) - (b[i] || 0);
+    if (diff !== 0) return diff > 0;
+  }
+  return false;
 }
 
 export default function App() {
@@ -2563,7 +2583,7 @@ export default function App() {
 
                 <div class="version-footer">
                   <span>Version v{appVersion}</span>
-                  <Show when={serverVersion() && serverVersion() !== appVersion}>
+                  <Show when={isNewerVersion(serverVersion(), appVersion)}>
                     <button
                       class="chip primary"
                       onClick={() => window.location.reload()}
@@ -2763,28 +2783,34 @@ export default function App() {
                             <div class="bubble-actions-left">
                               <Show when={isLink}>
                                 <a
-                                  class="chip primary"
+                                  class="icon-chip primary"
                                   href={msg.content}
                                   target="_blank"
                                   rel="noopener noreferrer"
+                                  title="Open link"
+                                  aria-label="Open link"
+                                  onClick={(e) => e.stopPropagation()}
                                 >
-                                  Open
+                                  <LucideIcon icon={ExternalLink} size={15} />
                                 </a>
                               </Show>
                               <Show when={isFile && fileUrl()}>
                                 <a
-                                  class="chip primary"
+                                  class="icon-chip primary"
                                   href={fileUrl()}
                                   download={msg.fileName || 'file'}
+                                  title="Download file"
+                                  aria-label="Download file"
+                                  onClick={(e) => e.stopPropagation()}
                                 >
-                                  Download
+                                  <LucideIcon icon={Download} size={15} />
                                 </a>
                               </Show>
                               <Show when={!isFile}>
                                 <button
                                   class="icon-chip"
-                                  title="Copy to clipboard"
-                                  aria-label="Copy to clipboard"
+                                  title={copiedId() === msg.id ? 'Copied' : 'Copy to clipboard'}
+                                  aria-label={copiedId() === msg.id ? 'Copied' : 'Copy to clipboard'}
                                   onClick={(e) => {
                                     e.stopPropagation();
                                     copyToClipboard(msg.content, 'Copied to clipboard', msg.id);
@@ -2792,16 +2818,10 @@ export default function App() {
                                 >
                                   <Show
                                     when={copiedId() === msg.id}
-                                    fallback={
-                                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-                                      </svg>
-                                    }
+                                    fallback={<LucideIcon icon={Copy} size={15} />}
                                   >
-                                    <span>✓</span>
+                                    <LucideIcon icon={Check} size={15} />
                                   </Show>
-                                  <span>{copiedId() === msg.id ? 'Copied' : 'Copy'}</span>
                                 </button>
                               </Show>
                             </div>
@@ -2815,11 +2835,7 @@ export default function App() {
                                   setPendingDelete(msg);
                                 }}
                               >
-                                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                  <path d="M3 6h18" />
-                                  <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                                </svg>
+                                <LucideIcon icon={Trash2} size={15} />
                               </button>
                             </div>
                           </div>

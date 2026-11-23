@@ -842,24 +842,41 @@ input[type='text']:focus {
   align-items: center;
   justify-content: center;
   gap: 4px;
+  min-width: 28px;
+  height: 26px;
   background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   color: var(--text);
   border-radius: 999px;
-  padding: 2px 8px;
+  padding: 0 8px;
   font: inherit;
   font-size: 0.71rem;
   font-weight: 600;
   cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
 }
 
 .icon-chip:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.icon-chip.primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+
+.icon-chip.primary:hover {
+  background: var(--accent-hover);
 }
 
 .icon-chip.danger {
   color: #fca5a5;
   border-color: rgba(239, 68, 68, 0.35);
+}
+
+.icon-chip.danger:hover {
+  background: rgba(239, 68, 68, 0.22);
 }
 
 .icon-toggle-btn {
