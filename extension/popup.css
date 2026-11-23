@@ -620,3 +620,41 @@ input[type='text']:focus {
   padding: 2px 8px;
   border-radius: 999px;
 }
+
+.pair-tabs {
+  display: flex;
+  gap: 6px;
+}
+
+.pair-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.code-display-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--bg);
+  border: 1px solid rgba(99, 102, 241, 0.45);
+  border-radius: 9px;
+  padding: 8px 10px;
+}
+
+.code-display {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1.25rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  color: var(--text);
+}
+
+.code-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
+  font-size: 1.05rem !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.18em;
+  text-align: center;
+}

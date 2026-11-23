@@ -3,6 +3,7 @@ import {
   decryptBytes,
   decryptEnvelope,
   decryptJson,
+  decryptPairingBundle,
   defaultDeviceName,
   deriveRoomAuth,
   deriveRoomId,
@@ -11,11 +12,15 @@ import {
   deviceAad,
   encryptBytes,
   encryptJson,
+  encryptPairingBundle,
   encryptPayload,
+  generateSixDigitCode,
+  hashPairCode,
   isSafeHttpUrl,
   isSafeServerOrigin,
   isValidInviteToken,
   isValidKeyB64,
+  isValidSixDigitCode,
   makeAuthHeader,
   normalizeOs,
 } from './crypto.js';
@@ -716,18 +721,7 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
   return result;
 }
 
-async function joinRoomWithInvite(rawLink) {
-  const parsed = new URL(String(rawLink || '').trim());
-  if (!isSafeServerOrigin(parsed.origin)) {
-    throw new Error('Server URL must use HTTPS (or localhost)');
-  }
-  const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ''));
-  const keyB64 = hashParams.get('key')?.trim() || '';
-  const inviteToken = hashParams.get('invite')?.trim() || '';
-  if (!isValidKeyB64(keyB64) || !isValidInviteToken(inviteToken)) {
-    throw new Error('Paste a valid single-use invite link from Push It');
-  }
-
+async function completeRoomJoin(origin, keyB64, inviteToken, roomPin) {
   const cfg = await getConfig();
   const [roomId, roomAuth] = await Promise.all([
     deriveRoomId(keyB64),
@@ -739,13 +733,14 @@ async function joinRoomWithInvite(rawLink) {
     deviceAad(roomId, cfg.deviceId),
   );
 
-  const res = await fetch(`${parsed.origin}/api/room/${encodeURIComponent(roomId)}/join`, {
+  const res = await fetch(`${origin}/api/room/${encodeURIComponent(roomId)}/join`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       deviceId: cfg.deviceId,
       roomAuth,
       inviteToken,
+      roomPin: roomPin ? String(roomPin).replace(/\D/g, '') : undefined,
       iv: enc.iv,
       ciphertext: enc.ciphertext,
     }),
@@ -753,11 +748,18 @@ async function joinRoomWithInvite(rawLink) {
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.deviceToken) {
-    throw new Error(data.error || 'Invite link is invalid or expired');
+    if (data.code === 'ROOM_PIN_REQUIRED' || data.code === 'ROOM_PIN_INVALID') {
+      return {
+        ok: false,
+        pinRequired: true,
+        error: data.error || 'Enter the 6-digit room PIN',
+      };
+    }
+    throw new Error(data.error || 'Invite is invalid or expired');
   }
 
   await chrome.storage.local.set({
-    serverUrl: parsed.origin,
+    serverUrl: origin,
     keyB64,
     deviceToken: data.deviceToken,
     revokedNotice: '',
@@ -765,6 +767,73 @@ async function joinRoomWithInvite(rawLink) {
   stopSocket();
   await connect();
   return { ok: true };
+}
+
+async function joinRoomWithInvite(rawLink, roomPin) {
+  const parsed = new URL(String(rawLink || '').trim());
+  if (!isSafeServerOrigin(parsed.origin)) {
+    throw new Error('Server URL must use HTTPS (or localhost)');
+  }
+  const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ''));
+  const keyB64 = hashParams.get('key')?.trim() || '';
+  const inviteToken = hashParams.get('invite')?.trim() || '';
+  if (!isValidKeyB64(keyB64) || !isValidInviteToken(inviteToken)) {
+    throw new Error('Paste a valid single-use invite link from Push It');
+  }
+  return completeRoomJoin(parsed.origin, keyB64, inviteToken, roomPin);
+}
+
+async function joinRoomWithCode(rawServerUrl, rawCode, roomPin) {
+  const trimmedUrl = String(rawServerUrl || '').trim();
+  const normalizedUrl = /^https?:\/\//i.test(trimmedUrl) ? trimmedUrl : `https://${trimmedUrl}`;
+  const parsed = new URL(normalizedUrl);
+  if (!isSafeServerOrigin(parsed.origin)) {
+    throw new Error('Server URL must use HTTPS (or localhost)');
+  }
+  const code = String(rawCode || '').replace(/\D/g, '');
+  if (!isValidSixDigitCode(code)) {
+    throw new Error('Enter a 6-digit pairing code');
+  }
+
+  const codeHash = await hashPairCode(code);
+  const res = await fetch(`${parsed.origin}/api/pair/resolve`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ codeHash }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (
+    !res.ok ||
+    !data.roomId ||
+    !data.inviteToken ||
+    !data.salt ||
+    !data.bundleIv ||
+    !data.bundleCiphertext
+  ) {
+    throw new Error(data.error || 'Invalid or expired 6-digit code');
+  }
+
+  const keyB64 = await decryptPairingBundle(
+    code,
+    data.salt,
+    data.bundleIv,
+    data.bundleCiphertext,
+  );
+  const derivedRid = await deriveRoomId(keyB64);
+  if (derivedRid !== data.roomId) {
+    throw new Error('Pairing bundle verification failed');
+  }
+
+  if (data.pinRequired && !roomPin) {
+    return {
+      ok: false,
+      pinRequired: true,
+      resolved: { origin: parsed.origin, keyB64, inviteToken: data.inviteToken },
+      error: 'This room is protected by a 6-digit PIN',
+    };
+  }
+
+  return completeRoomJoin(parsed.origin, keyB64, data.inviteToken, roomPin);
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -847,7 +916,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
 
     if (msg.type === 'JOIN_ROOM') {
-      const res = await joinRoomWithInvite(msg.rawLink);
+      const res = await joinRoomWithInvite(msg.rawLink, msg.roomPin);
+      sendResponse(res);
+      return;
+    }
+
+    if (msg.type === 'JOIN_BY_CODE') {
+      const res = await joinRoomWithCode(msg.serverUrl, msg.code, msg.roomPin);
+      sendResponse(res);
+      return;
+    }
+
+    if (msg.type === 'JOIN_RESOLVED') {
+      const res = await completeRoomJoin(msg.origin, msg.keyB64, msg.inviteToken, msg.roomPin);
       sendResponse(res);
       return;
     }
@@ -859,19 +940,26 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
       const roomId = await deriveRoomId(cfg.keyB64);
       const base = new URL(cfg.serverUrl);
-      const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/invites`, {
-        method: 'POST',
-        headers: authHeaders(cfg),
-      });
-      if (res.status === 401) {
-        await handleRevoked('This device was removed from the room.');
-        throw new Error('This device was removed from the room');
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const pairCode = generateSixDigitCode();
+        const bundle = await encryptPairingBundle(pairCode, cfg.keyB64);
+        const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/invites`, {
+          method: 'POST',
+          headers: authHeaders(cfg, { 'content-type': 'application/json' }),
+          body: JSON.stringify(bundle),
+        });
+        if (res.status === 401) {
+          await handleRevoked('This device was removed from the room.');
+          throw new Error('This device was removed from the room');
+        }
+        if (res.status === 409) continue;
+        if (!res.ok) throw new Error('Could not create invite');
+        const data = await res.json();
+        const inviteUrl = `${base.origin}/#key=${encodeURIComponent(cfg.keyB64)}&invite=${encodeURIComponent(data.inviteToken)}`;
+        sendResponse({ ok: true, pairCode, inviteUrl, expiresAt: data.expiresAt });
+        return;
       }
-      if (!res.ok) throw new Error('Could not create invite');
-      const data = await res.json();
-      const inviteUrl = `${base.origin}/#key=${encodeURIComponent(cfg.keyB64)}&invite=${encodeURIComponent(data.inviteToken)}`;
-      sendResponse({ ok: true, inviteUrl, expiresAt: data.expiresAt });
-      return;
+      throw new Error('Could not create invite');
     }
 
     if (msg.type === 'CANCEL_INVITE') {

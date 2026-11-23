@@ -1,5 +1,7 @@
 node_modules
 dist
+dist-extensions
+extension-firefox
 .wrangler
 .dev.vars
 *.log

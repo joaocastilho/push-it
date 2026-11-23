@@ -281,3 +281,102 @@ export function formatFileSize(bytes?: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+export function isValidSixDigitCode(code: string): boolean {
+  return /^\d{6}$/.test(code.trim());
+}
+
+export function generateSixDigitCode(): string {
+  // Rejection sampling over uint32 for completely unbiased 000000-999999 codes
+  const maxValid = 4294000000;
+  const arr = new Uint32Array(1);
+  while (true) {
+    crypto.getRandomValues(arr);
+    if (arr[0] < maxValid) {
+      return String(arr[0] % 1_000_000).padStart(6, '0');
+    }
+  }
+}
+
+export async function hashPairCode(code: string): Promise<string> {
+  const data = new TextEncoder().encode(`pair-code:${code.trim()}`);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  return toBase64Url(hash);
+}
+
+async function derivePairWrappingKey(code: string, saltBytes: Uint8Array<ArrayBuffer>): Promise<CryptoKey> {
+  const rawCode = new TextEncoder().encode(code.trim());
+  const baseKey = await crypto.subtle.importKey('raw', rawCode, 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltBytes,
+      iterations: 100_000,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+export async function encryptPairingBundle(
+  pairCode: string,
+  keyB64: string,
+): Promise<{
+  codeHash: string;
+  salt: string;
+  bundleIv: string;
+  bundleCiphertext: string;
+}> {
+  const saltBuf = new ArrayBuffer(16);
+  const saltBytes = new Uint8Array(saltBuf);
+  crypto.getRandomValues(saltBytes);
+  const ivBuf = new ArrayBuffer(12);
+  const ivBytes = new Uint8Array(ivBuf);
+  crypto.getRandomValues(ivBytes);
+
+  const [codeHash, wrapKey] = await Promise.all([
+    hashPairCode(pairCode),
+    derivePairWrappingKey(pairCode, saltBytes),
+  ]);
+
+  const plain = new TextEncoder().encode(JSON.stringify({ keyB64 }));
+  const aad = new TextEncoder().encode('push-it-pair-bundle-v1');
+  const cipherBuf = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: ivBytes, additionalData: aad },
+    wrapKey,
+    plain,
+  );
+
+  return {
+    codeHash,
+    salt: toBase64Url(saltBytes),
+    bundleIv: toBase64Url(ivBytes),
+    bundleCiphertext: toBase64Url(new Uint8Array(cipherBuf)),
+  };
+}
+
+export async function decryptPairingBundle(
+  pairCode: string,
+  saltB64: string,
+  bundleIvB64: string,
+  bundleCiphertextB64: string,
+): Promise<string> {
+  const saltBytes = fromBase64Url(saltB64);
+  const ivBytes = fromBase64Url(bundleIvB64);
+  const cipherBytes = fromBase64Url(bundleCiphertextB64);
+  const wrapKey = await derivePairWrappingKey(pairCode, saltBytes);
+  const aad = new TextEncoder().encode('push-it-pair-bundle-v1');
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: ivBytes, additionalData: aad },
+    wrapKey,
+    cipherBytes,
+  );
+  const parsed = JSON.parse(new TextDecoder().decode(plainBuf)) as { keyB64?: string };
+  if (!parsed.keyB64 || !isValidKeyB64(parsed.keyB64)) {
+    throw new Error('Invalid pairing bundle');
+  }
+  return parsed.keyB64;
+}

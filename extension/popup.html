@@ -41,19 +41,57 @@
 
           <div id="inviteBox" class="pair-box hidden">
             <div class="toggle">
-              <span class="label">Single-use invite link</span>
+              <span class="label">Single-use pairing code</span>
               <span id="inviteTimer" class="invite-timer">5:00</span>
+            </div>
+            <div class="code-display-row">
+              <span id="inviteCodeDisplay" class="code-display">--- – ---</span>
+              <button id="copyCodeBtn" class="btn secondary small">Copy Code</button>
             </div>
             <input id="inviteOutput" type="text" readonly />
             <div class="item-actions">
-              <button id="copyInviteBtn" class="btn primary small">Copy Invite</button>
+              <button id="copyInviteBtn" class="btn primary small">Copy Link</button>
               <button id="cancelInviteBtn" class="btn secondary small">Cancel</button>
             </div>
           </div>
 
           <div id="pairBox" class="pair-box hidden">
-            <label class="label" for="pairInput">Paste single-use invite link from Push It</label>
-            <input id="pairInput" type="text" placeholder="Paste invite link here..." />
+            <div class="pair-tabs">
+              <button id="tabCodeBtn" class="chip primary" type="button">6-Digit Code</button>
+              <button id="tabLinkBtn" class="chip" type="button">Invite Link</button>
+            </div>
+
+            <div id="pairByCode" class="pair-sub">
+              <label class="label" for="serverUrlInput">Your Push It URL</label>
+              <input id="serverUrlInput" type="text" placeholder="https://push-it.your-name.workers.dev" />
+              <label class="label" for="pairCodeInput">6-digit pairing code</label>
+              <input
+                id="pairCodeInput"
+                class="code-input"
+                type="text"
+                inputmode="numeric"
+                maxlength="7"
+                placeholder="482 917"
+              />
+            </div>
+
+            <div id="pairByLink" class="pair-sub hidden">
+              <label class="label" for="pairInput">Paste single-use invite link</label>
+              <input id="pairInput" type="text" placeholder="https://.../#key=...&invite=..." />
+            </div>
+
+            <div id="roomPinBox" class="pair-sub hidden">
+              <label class="label" for="roomPinInput">Room 6-digit PIN</label>
+              <input
+                id="roomPinInput"
+                class="code-input"
+                type="text"
+                inputmode="numeric"
+                maxlength="7"
+                placeholder="Enter 6-digit PIN"
+              />
+            </div>
+
             <button id="savePair" class="btn primary">Join &amp; Connect</button>
           </div>
         </div>

@@ -2,8 +2,10 @@ const TOKEN_RE = /^[A-Za-z0-9_-]{24,128}$/;
 
 export function detectOs() {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  const touchPoints = typeof navigator !== 'undefined' ? navigator.maxTouchPoints || 0 : 0;
   if (/Android/i.test(ua)) return 'android';
   if (/iPhone|iPad|iPod/i.test(ua)) return 'ios';
+  if (/Macintosh|Mac OS X/i.test(ua) && touchPoints > 1) return 'ios';
   if (/Windows/i.test(ua)) return 'windows';
   if (/Macintosh|Mac OS X/i.test(ua)) return 'macos';
   if (/Linux/i.test(ua)) return 'linux';
@@ -219,4 +221,84 @@ export function formatFileSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function isValidSixDigitCode(code) {
+  return /^\d{6}$/.test(String(code || '').trim());
+}
+
+export function generateSixDigitCode() {
+  const maxValid = 4294000000;
+  const arr = new Uint32Array(1);
+  while (true) {
+    crypto.getRandomValues(arr);
+    if (arr[0] < maxValid) {
+      return String(arr[0] % 1_000_000).padStart(6, '0');
+    }
+  }
+}
+
+export async function hashPairCode(code) {
+  const data = new TextEncoder().encode(`pair-code:${String(code).trim()}`);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  return toBase64Url(hash);
+}
+
+async function derivePairWrappingKey(code, saltBytes) {
+  const rawCode = new TextEncoder().encode(String(code).trim());
+  const baseKey = await crypto.subtle.importKey('raw', rawCode, 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {
+      name: 'PBKDF2',
+      salt: saltBytes,
+      iterations: 100_000,
+      hash: 'SHA-256',
+    },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+export async function encryptPairingBundle(pairCode, keyB64) {
+  const saltBytes = new Uint8Array(16);
+  crypto.getRandomValues(saltBytes);
+  const ivBytes = new Uint8Array(12);
+  crypto.getRandomValues(ivBytes);
+  const [codeHash, wrapKey] = await Promise.all([
+    hashPairCode(pairCode),
+    derivePairWrappingKey(pairCode, saltBytes),
+  ]);
+  const plain = new TextEncoder().encode(JSON.stringify({ keyB64 }));
+  const aad = new TextEncoder().encode('push-it-pair-bundle-v1');
+  const cipherBuf = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: ivBytes, additionalData: aad },
+    wrapKey,
+    plain,
+  );
+  return {
+    codeHash,
+    salt: toBase64Url(saltBytes),
+    bundleIv: toBase64Url(ivBytes),
+    bundleCiphertext: toBase64Url(new Uint8Array(cipherBuf)),
+  };
+}
+
+export async function decryptPairingBundle(pairCode, saltB64, bundleIvB64, bundleCiphertextB64) {
+  const saltBytes = fromBase64Url(saltB64);
+  const ivBytes = fromBase64Url(bundleIvB64);
+  const cipherBytes = fromBase64Url(bundleCiphertextB64);
+  const wrapKey = await derivePairWrappingKey(pairCode, saltBytes);
+  const aad = new TextEncoder().encode('push-it-pair-bundle-v1');
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: ivBytes, additionalData: aad },
+    wrapKey,
+    cipherBytes,
+  );
+  const parsed = JSON.parse(new TextDecoder().decode(plainBuf));
+  if (!parsed.keyB64 || !isValidKeyB64(parsed.keyB64)) {
+    throw new Error('Invalid pairing bundle');
+  }
+  return parsed.keyB64;
 }

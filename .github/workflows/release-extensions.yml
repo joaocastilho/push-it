@@ -1,0 +1,52 @@
+name: Release Browser Extensions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'extension/**'
+      - 'package.json'
+      - 'scripts/build-extensions.ts'
+      - '.github/workflows/release-extensions.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Build Chromium and Firefox extension packages
+        run: bun run build:extensions
+
+      - name: Read version
+        id: meta
+        run: |
+          VERSION=$(bun -e "console.log(JSON.parse(await Bun.file('package.json').text()).version)")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release with extension downloads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              dist-extensions/push-it-chromium.zip \
+              dist-extensions/push-it-firefox.xpi \
+              --clobber
+          else
+            gh release create "$TAG" \
+              dist-extensions/push-it-chromium.zip \
+              dist-extensions/push-it-firefox.xpi \
+              --title "Push It $TAG" \
+              --notes "Ready-to-install Chromium (.zip) and Firefox (.xpi) browser extension packages for Push It $TAG." \
+              --latest
+          fi

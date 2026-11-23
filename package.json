@@ -1,12 +1,13 @@
 {
   "name": "push-it",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "dev:worker": "wrangler dev",
     "build": "vite build",
+    "build:extensions": "bun run scripts/build-extensions.ts",
     "preview": "vite build && wrangler dev",
     "deploy": "vite build && wrangler deploy",
     "gen:vapid": "bun run scripts/gen-vapid.ts",

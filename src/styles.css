@@ -748,3 +748,124 @@ input:focus {
   gap: 2px;
   min-width: 0;
 }
+
+.setup-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.setup-name-badge {
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  color: #c7d2fe;
+}
+
+.steps-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.steps-list strong {
+  color: var(--text);
+}
+
+.code-chip {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.74rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  color: #7dd3fc;
+  word-break: break-all;
+}
+
+.digit-code-group {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin: 2px 0;
+}
+
+.digit-sep {
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 1rem;
+  user-select: none;
+}
+
+.digit-box {
+  width: 42px;
+  height: 48px;
+  text-align: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1.35rem;
+  font-weight: 700;
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  color: var(--text);
+  caret-color: var(--accent);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+
+.digit-box:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.22);
+}
+
+.pair-code-display {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--bg);
+  border: 1px solid rgba(99, 102, 241, 0.45);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+
+.pair-code-digits {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 1.75rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: #eef2ff;
+}
+
+.setup-toggle-link {
+  background: none;
+  border: none;
+  color: #7dd3fc;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  padding: 2px 0;
+  align-self: flex-start;
+}
+
+.setup-toggle-link:hover {
+  text-decoration: underline;
+}
+
+.pin-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 6px;
+}

@@ -1,21 +1,27 @@
 import { createEffect, createMemo, createSignal, For, Show } from 'solid-js';
 import QRCode from 'qrcode';
+import { DigitCodeInput } from './components/DigitCodeInput';
 import { OsIcon } from './components/OsIcon';
 import {
   blobAad,
   decryptBytes,
   decryptEnvelope,
   decryptJson,
+  decryptPairingBundle,
   deriveRoomAuth,
   deriveRoomId,
   detectPayloadType,
   deviceAad,
   encryptBytes,
   encryptJson,
+  encryptPairingBundle,
   encryptPayload,
   formatFileSize,
   generateRawKeyB64,
+  generateSixDigitCode,
+  hashPairCode,
   isSafeHttpUrl,
+  isValidSixDigitCode,
   makeAuthHeader,
   parsePairLink,
   type DeviceMeta,
@@ -33,7 +39,14 @@ import {
   saveMessage,
   type StoredMessage,
 } from './lib/db';
-import { defaultDeviceName, detectOs, normalizeOs, type DeviceOs } from './lib/device';
+import {
+  defaultDeviceName,
+  detectOs,
+  isIosDevice,
+  isStandalonePwa,
+  normalizeOs,
+  type DeviceOs,
+} from './lib/device';
 import {
   getCurrentPushSubscription,
   isPushSupported,
@@ -55,6 +68,11 @@ interface PendingSharePayload {
   title?: string;
 }
 
+interface BeforeInstallPromptEvent extends Event {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
+}
+
 const MAX_FILE_BYTES = 7.5 * 1024 * 1024;
 const LONG_TEXT_THRESHOLD = 1800;
 
@@ -66,8 +84,12 @@ function formatCountdown(seconds: number): string {
 
 export default function App() {
   const localOs: DeviceOs = detectOs();
+  const isIos = isIosDevice();
+  const canWebShare = typeof navigator !== 'undefined' && typeof navigator.share === 'function';
 
   const [booting, setBooting] = createSignal<boolean>(true);
+  const [standalone, setStandalone] = createSignal<boolean>(isStandalonePwa());
+  const [installPrompt, setInstallPrompt] = createSignal<BeforeInstallPromptEvent | null>(null);
   const [view, setView] = createSignal<'chat' | 'settings'>('chat');
   const [showAddDevice, setShowAddDevice] = createSignal<boolean>(false);
   const [keyB64, setKeyB64] = createSignal<string>('');
@@ -82,6 +104,19 @@ export default function App() {
   const [setupNotice, setSetupNotice] = createSignal<string>('');
   const [confirmLeave, setConfirmLeave] = createSignal<boolean>(false);
 
+  const [pairCodeInput, setPairCodeInput] = createSignal<string>('');
+  const [showLinkImport, setShowLinkImport] = createSignal<boolean>(false);
+  const [pendingJoin, setPendingJoin] = createSignal<{ keyB64: string; inviteToken: string } | null>(null);
+  const [joinPinInput, setJoinPinInput] = createSignal<string>('');
+  const [createWithPin, setCreateWithPin] = createSignal<boolean>(false);
+  const [createPinInput, setCreatePinInput] = createSignal<string>('');
+
+  const [roomPinEnabled, setRoomPinEnabled] = createSignal<boolean>(false);
+  const [editingRoomPin, setEditingRoomPin] = createSignal<boolean>(false);
+  const [roomPinDraft, setRoomPinDraft] = createSignal<string>('');
+  const [pinBusy, setPinBusy] = createSignal<boolean>(false);
+
+  const [inviteCode, setInviteCode] = createSignal<string>('');
   const [inviteToken, setInviteToken] = createSignal<string>('');
   const [inviteExpiresAt, setInviteExpiresAt] = createSignal<number>(0);
   const [inviteSecondsLeft, setInviteSecondsLeft] = createSignal<number>(0);
@@ -302,6 +337,7 @@ export default function App() {
       }
       if (!res.ok) return devices();
       const data = (await res.json()) as {
+        pinEnabled?: boolean;
         devices: Array<{
           deviceId: string;
           iv: string;
@@ -310,6 +346,9 @@ export default function App() {
           online: boolean;
         }>;
       };
+      if (typeof data.pinEnabled === 'boolean') {
+        setRoomPinEnabled(data.pinEnabled);
+      }
 
       const decrypted: PairedDevice[] = [];
       for (const d of data.devices) {
@@ -413,6 +452,16 @@ export default function App() {
 
   async function createNewRoom(devId = deviceId(), devName = deviceName()): Promise<boolean> {
     if (!devId) return false;
+    const cleanName = devName.trim() || defaultDeviceName(localOs);
+    setDeviceName(cleanName);
+    await kvSet('deviceName', cleanName);
+
+    const pin = createWithPin() ? createPinInput().trim() : '';
+    if (createWithPin() && !isValidSixDigitCode(pin)) {
+      setSetupNotice('Enter a 6-digit PIN or turn off Room PIN protection.');
+      return false;
+    }
+
     setSetupBusy(true);
     setSetupNotice('');
     try {
@@ -423,7 +472,7 @@ export default function App() {
       ]);
       const enc = await encryptJson(
         freshKey,
-        { name: devName, os: localOs } satisfies DeviceMeta,
+        { name: cleanName, os: localOs } satisfies DeviceMeta,
         deviceAad(rid, devId),
       );
       const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -436,6 +485,7 @@ export default function App() {
         body: JSON.stringify({
           deviceId: devId,
           roomAuth,
+          roomPin: pin || undefined,
           iv: enc.iv,
           ciphertext: enc.ciphertext,
         }),
@@ -461,11 +511,14 @@ export default function App() {
       setKeyB64(freshKey);
       setRoomId(rid);
       setDeviceToken(data.deviceToken);
+      setRoomPinEnabled(Boolean(pin));
+      setCreateWithPin(false);
+      setCreatePinInput('');
       setAccessKeyInput('');
       setSetupNotice('');
       setView('chat');
       await refreshDevices(rid, freshKey, devId, data.deviceToken);
-      notify('New private room created!');
+      notify(pin ? 'PIN-protected room created!' : 'New private room created!');
       return true;
     } catch {
       setSetupNotice('Could not reach server');
@@ -480,8 +533,12 @@ export default function App() {
     targetInviteToken: string,
     devId = deviceId(),
     devName = deviceName(),
+    roomPin?: string,
   ): Promise<boolean> {
     if (!devId) return false;
+    const cleanName = devName.trim() || defaultDeviceName(localOs);
+    setDeviceName(cleanName);
+    await kvSet('deviceName', cleanName);
     setSetupBusy(true);
     setSetupNotice('');
     try {
@@ -491,7 +548,7 @@ export default function App() {
       ]);
       const enc = await encryptJson(
         targetKeyB64,
-        { name: devName, os: localOs } satisfies DeviceMeta,
+        { name: cleanName, os: localOs } satisfies DeviceMeta,
         deviceAad(rid, devId),
       );
       const res = await fetch(`/api/room/${encodeURIComponent(rid)}/join`, {
@@ -501,6 +558,7 @@ export default function App() {
           deviceId: devId,
           roomAuth,
           inviteToken: targetInviteToken,
+          roomPin: roomPin?.trim() || undefined,
           iv: enc.iv,
           ciphertext: enc.ciphertext,
         }),
@@ -509,9 +567,14 @@ export default function App() {
         ok?: boolean;
         deviceToken?: string;
         error?: string;
+        code?: string;
       };
       if (!res.ok || !data.deviceToken) {
-        const msg = data.error || 'Invite link is invalid or expired';
+        if (data.code === 'ROOM_PIN_REQUIRED' || data.code === 'ROOM_PIN_INVALID') {
+          setPendingJoin({ keyB64: targetKeyB64, inviteToken: targetInviteToken });
+          setJoinPinInput('');
+        }
+        const msg = data.error || 'Invite is invalid or expired';
         setSetupNotice(msg);
         notify(msg);
         return false;
@@ -525,8 +588,12 @@ export default function App() {
       setRoomId(rid);
       setDeviceToken(data.deviceToken);
       setImportInput('');
+      setPairCodeInput('');
+      setPendingJoin(null);
+      setJoinPinInput('');
       setSetupNotice('');
       setShowAddDevice(false);
+      setInviteCode('');
       setInviteToken('');
       setInviteExpiresAt(0);
       setView('chat');
@@ -543,29 +610,111 @@ export default function App() {
     }
   }
 
+  async function joinWithSixDigitCode(rawCode: string): Promise<boolean> {
+    const code = rawCode.replace(/\D/g, '');
+    if (!isValidSixDigitCode(code)) {
+      setSetupNotice('Enter all 6 digits of the pairing code');
+      return false;
+    }
+    setSetupBusy(true);
+    setSetupNotice('');
+    try {
+      const codeHash = await hashPairCode(code);
+      const res = await fetch('/api/pair/resolve', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codeHash }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        roomId?: string;
+        inviteToken?: string;
+        salt?: string;
+        bundleIv?: string;
+        bundleCiphertext?: string;
+        pinRequired?: boolean;
+        error?: string;
+      };
+      if (
+        !res.ok ||
+        !data.roomId ||
+        !data.inviteToken ||
+        !data.salt ||
+        !data.bundleIv ||
+        !data.bundleCiphertext
+      ) {
+        const msg = data.error || 'Invalid or expired 6-digit code';
+        setSetupNotice(msg);
+        setPairCodeInput('');
+        return false;
+      }
+
+      const decryptedKey = await decryptPairingBundle(
+        code,
+        data.salt,
+        data.bundleIv,
+        data.bundleCiphertext,
+      );
+      const derivedRid = await deriveRoomId(decryptedKey);
+      if (derivedRid !== data.roomId) {
+        setSetupNotice('Pairing bundle verification failed');
+        setPairCodeInput('');
+        return false;
+      }
+
+      if (data.pinRequired) {
+        setPendingJoin({ keyB64: decryptedKey, inviteToken: data.inviteToken });
+        setJoinPinInput('');
+        setSetupNotice('This room is protected by a 6-digit PIN. Enter it below to pair.');
+        return false;
+      }
+
+      setSetupBusy(false);
+      return await joinRoomWithInvite(decryptedKey, data.inviteToken);
+    } catch {
+      setSetupNotice('Invalid or expired 6-digit code');
+      setPairCodeInput('');
+      return false;
+    } finally {
+      setSetupBusy(false);
+    }
+  }
+
   async function createPairingInvite() {
     const rid = roomId();
     const did = deviceId();
     const tok = deviceToken();
-    if (!rid || !did || !tok) return;
+    const k = keyB64();
+    if (!rid || !did || !tok || !k) return;
     setInviteBusy(true);
     try {
-      const res = await fetch(`/api/room/${encodeURIComponent(rid)}/invites`, {
-        method: 'POST',
-        headers: authHeaders(did, tok),
-      });
-      if (res.status === 401) {
-        await handleRevoked('This device was removed from the room.');
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const code = generateSixDigitCode();
+        const bundle = await encryptPairingBundle(code, k);
+        const res = await fetch(`/api/room/${encodeURIComponent(rid)}/invites`, {
+          method: 'POST',
+          headers: authHeaders(did, tok, { 'content-type': 'application/json' }),
+          body: JSON.stringify(bundle),
+        });
+        if (res.status === 401) {
+          await handleRevoked('This device was removed from the room.');
+          return;
+        }
+        if (res.status === 409) {
+          continue; // rare 6-digit collision; retry with a fresh code
+        }
+        if (!res.ok) {
+          notify('Could not create invite');
+          return;
+        }
+        const data = (await res.json()) as { inviteToken: string; expiresAt: number };
+        setInviteCode(code);
+        setInviteToken(data.inviteToken);
+        setInviteExpiresAt(data.expiresAt);
+        setInviteSecondsLeft(Math.max(0, Math.ceil((data.expiresAt - Date.now()) / 1000)));
         return;
       }
-      if (!res.ok) {
-        notify('Could not create invite');
-        return;
-      }
-      const data = (await res.json()) as { inviteToken: string; expiresAt: number };
-      setInviteToken(data.inviteToken);
-      setInviteExpiresAt(data.expiresAt);
-      setInviteSecondsLeft(Math.max(0, Math.ceil((data.expiresAt - Date.now()) / 1000)));
+      notify('Could not create invite');
     } catch {
       notify('Could not create invite');
     } finally {
@@ -578,6 +727,7 @@ export default function App() {
     const did = deviceId();
     const tok = deviceToken();
     setShowAddDevice(false);
+    setInviteCode('');
     setInviteToken('');
     setInviteExpiresAt(0);
     setInviteSecondsLeft(0);
@@ -587,6 +737,41 @@ export default function App() {
       method: 'DELETE',
       headers: authHeaders(did, tok),
     }).catch(() => {});
+  }
+
+  async function saveRoomPin(nextPin: string | null) {
+    const rid = roomId();
+    const did = deviceId();
+    const tok = deviceToken();
+    if (!rid || !did || !tok) return;
+    if (nextPin !== null && !isValidSixDigitCode(nextPin)) {
+      notify('Enter a 6-digit PIN');
+      return;
+    }
+    setPinBusy(true);
+    try {
+      const res = await fetch(`/api/room/${encodeURIComponent(rid)}/pin`, {
+        method: 'POST',
+        headers: authHeaders(did, tok, { 'content-type': 'application/json' }),
+        body: JSON.stringify({ roomPin: nextPin }),
+      });
+      if (res.status === 401) {
+        await handleRevoked('This device was removed from the room.');
+        return;
+      }
+      if (!res.ok) {
+        notify('Could not update room PIN');
+        return;
+      }
+      setRoomPinEnabled(Boolean(nextPin));
+      setEditingRoomPin(false);
+      setRoomPinDraft('');
+      notify(nextPin ? '6-digit Room PIN enabled' : 'Room PIN removed');
+    } catch {
+      notify('Could not update room PIN');
+    } finally {
+      setPinBusy(false);
+    }
   }
 
   async function leaveCurrentRoom() {
@@ -631,10 +816,23 @@ export default function App() {
         }
       };
 
+      const onBeforeInstall = (e: Event) => {
+        e.preventDefault();
+        setInstallPrompt(e as BeforeInstallPromptEvent);
+      };
+
+      const onAppInstalled = () => {
+        setInstallPrompt(null);
+        setStandalone(true);
+        notify('Push It installed!');
+      };
+
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.addEventListener('message', onSwMessage);
       }
       document.addEventListener('visibilitychange', onVisibility);
+      window.addEventListener('beforeinstallprompt', onBeforeInstall);
+      window.addEventListener('appinstalled', onAppInstalled);
 
       (async () => {
         await registerServiceWorker().catch(() => {});
@@ -763,6 +961,8 @@ export default function App() {
           navigator.serviceWorker.removeEventListener('message', onSwMessage);
         }
         document.removeEventListener('visibilitychange', onVisibility);
+        window.removeEventListener('beforeinstallprompt', onBeforeInstall);
+        window.removeEventListener('appinstalled', onAppInstalled);
       };
     },
   );
@@ -1353,6 +1553,30 @@ export default function App() {
     }
   }
 
+  async function triggerInstall() {
+    const promptEv = installPrompt();
+    if (!promptEv) return;
+    await promptEv.prompt();
+    const choice = await promptEv.userChoice.catch(() => ({ outcome: 'dismissed' as const }));
+    if (choice.outcome === 'accepted') {
+      setInstallPrompt(null);
+    }
+  }
+
+  async function shareInviteLink() {
+    const url = pairUrl();
+    if (!url || !canWebShare) return;
+    try {
+      await navigator.share({
+        title: 'Push It — Single-Use Invite',
+        text: 'Open this single-use link to pair your device with Push It:',
+        url,
+      });
+    } catch {
+      // user cancelled share sheet
+    }
+  }
+
   return (
     <div
       class="app-shell"
@@ -1502,50 +1726,181 @@ export default function App() {
               </Show>
 
               <section class="card">
-                <h2>Join an Existing Room</h2>
-                <p class="muted">
-                  Open Push It on an already-paired device → Settings → <strong>+ Add Device</strong>, then scan the QR code or paste the invite link here.
-                </p>
-                <form
-                  class="import-row"
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    handleImportInvite();
-                  }}
-                >
+                <h2>This Device</h2>
+                <div class="setup-name-row">
+                  <span class="setup-name-badge">
+                    <OsIcon os={localOs} size={18} />
+                  </span>
                   <input
+                    class="setup-input"
                     type="text"
-                    placeholder="Paste single-use invite link..."
-                    value={importInput()}
-                    onInput={(e) => setImportInput(e.currentTarget.value)}
+                    maxlength={24}
+                    placeholder={defaultDeviceName(localOs)}
+                    value={deviceName()}
+                    onInput={(e) => setDeviceName(e.currentTarget.value)}
                   />
-                  <button
-                    class="btn primary"
-                    type="submit"
-                    disabled={setupBusy() || !importInput().trim()}
-                  >
-                    {setupBusy() ? '...' : 'Join'}
-                  </button>
-                </form>
+                </div>
+              </section>
+
+              <section class="card">
+                <h2>Join an Existing Room</h2>
+                <Show
+                  when={pendingJoin()}
+                  fallback={
+                    <>
+                      <p class="muted">
+                        Open Push It on another device → Settings → <strong>+ Add Device</strong>, then enter the 6-digit pairing code (or scan its QR code).
+                      </p>
+                      <DigitCodeInput
+                        value={pairCodeInput()}
+                        onChange={setPairCodeInput}
+                        onComplete={(code) => joinWithSixDigitCode(code)}
+                        disabled={setupBusy()}
+                        ariaLabel="6-digit pairing code"
+                      />
+                      <button
+                        class="btn primary"
+                        disabled={setupBusy() || pairCodeInput().length !== 6}
+                        onClick={() => joinWithSixDigitCode(pairCodeInput())}
+                      >
+                        {setupBusy() ? 'Pairing...' : 'Join with Code'}
+                      </button>
+
+                      <button
+                        class="setup-toggle-link"
+                        type="button"
+                        onClick={() => setShowLinkImport((v) => !v)}
+                      >
+                        {showLinkImport() ? 'Hide invite link input' : 'Or paste an invite link'}
+                      </button>
+
+                      <Show when={showLinkImport()}>
+                        <form
+                          class="import-row"
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            handleImportInvite();
+                          }}
+                        >
+                          <input
+                            type="text"
+                            placeholder="Paste single-use invite link..."
+                            value={importInput()}
+                            onInput={(e) => setImportInput(e.currentTarget.value)}
+                          />
+                          <button
+                            class="btn secondary"
+                            type="submit"
+                            disabled={setupBusy() || !importInput().trim()}
+                          >
+                            {setupBusy() ? '...' : 'Join'}
+                          </button>
+                        </form>
+                      </Show>
+                    </>
+                  }
+                >
+                  {(pending) => (
+                    <div class="pin-box">
+                      <p class="muted">
+                        This room is protected by a <strong>6-digit Room PIN</strong>. Enter the PIN to finish pairing.
+                      </p>
+                      <DigitCodeInput
+                        value={joinPinInput()}
+                        onChange={setJoinPinInput}
+                        onComplete={(pin) =>
+                          joinRoomWithInvite(
+                            pending().keyB64,
+                            pending().inviteToken,
+                            deviceId(),
+                            deviceName(),
+                            pin,
+                          )
+                        }
+                        disabled={setupBusy()}
+                        ariaLabel="6-digit room PIN"
+                      />
+                      <div class="row gap">
+                        <button
+                          class="btn primary"
+                          disabled={setupBusy() || joinPinInput().length !== 6}
+                          onClick={() =>
+                            joinRoomWithInvite(
+                              pending().keyB64,
+                              pending().inviteToken,
+                              deviceId(),
+                              deviceName(),
+                              joinPinInput(),
+                            )
+                          }
+                        >
+                          {setupBusy() ? 'Verifying...' : 'Verify PIN & Join'}
+                        </button>
+                        <button
+                          class="btn secondary"
+                          type="button"
+                          onClick={() => {
+                            setPendingJoin(null);
+                            setJoinPinInput('');
+                            setSetupNotice('');
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </Show>
               </section>
 
               <section class="card">
                 <h2>Start a New Room</h2>
                 <p class="muted">
-                  Setting up your first device? Create a fresh encrypted room and invite your other devices from Settings.
+                  Setting up your first device? Create a fresh encrypted room and invite your other devices with a 6-digit code or QR.
                 </p>
+
+                <label class="toggle">
+                  <div>
+                    <strong>Protect room with a 6-digit PIN</strong>
+                    <span class="muted">Optional extra code required whenever pairing a new device</span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={createWithPin()}
+                    onChange={(e) => {
+                      setCreateWithPin(e.currentTarget.checked);
+                      if (!e.currentTarget.checked) setCreatePinInput('');
+                    }}
+                  />
+                </label>
+
+                <Show when={createWithPin()}>
+                  <DigitCodeInput
+                    value={createPinInput()}
+                    onChange={setCreatePinInput}
+                    disabled={setupBusy()}
+                    ariaLabel="New room 6-digit PIN"
+                  />
+                </Show>
+
                 <Show when={accessKeyRequired()}>
                   <input
                     class="setup-input"
-                    type="password"
-                    placeholder="Server passphrase"
+                    type="text"
+                    inputmode="numeric"
+                    placeholder="Server access code"
                     value={accessKeyInput()}
                     onInput={(e) => setAccessKeyInput(e.currentTarget.value)}
                   />
                 </Show>
+
                 <button
                   class="btn secondary"
-                  disabled={setupBusy() || (accessKeyRequired() && !accessKeyInput().trim())}
+                  disabled={
+                    setupBusy() ||
+                    (accessKeyRequired() && !accessKeyInput().trim()) ||
+                    (createWithPin() && createPinInput().length !== 6)
+                  }
                   onClick={() => createNewRoom()}
                 >
                   {setupBusy() ? 'Creating...' : 'Create New Room'}
@@ -1673,11 +2028,24 @@ export default function App() {
                       }
                     >
                       <div class="row between">
-                        <span class="muted">Scan on your phone or copy the invite link.</span>
+                        <span class="muted">Enter this 6-digit code or scan the QR on your other device.</span>
                         <span class="invite-timer">
                           Single-use · {formatCountdown(inviteSecondsLeft())}
                         </span>
                       </div>
+                      <Show when={inviteCode()}>
+                        <div class="pair-code-display">
+                          <span class="pair-code-digits">
+                            {inviteCode().slice(0, 3)} – {inviteCode().slice(3)}
+                          </span>
+                          <button
+                            class="btn secondary small"
+                            onClick={() => copyToClipboard(inviteCode(), '6-digit code copied')}
+                          >
+                            Copy Code
+                          </button>
+                        </div>
+                      </Show>
                       <Show when={qrDataUrl()}>
                         <div class="qr-wrap">
                           <img src={qrDataUrl()} alt="Pairing QR Code" class="qr-img" />
@@ -1690,6 +2058,11 @@ export default function App() {
                         >
                           Copy Invite Link
                         </button>
+                        <Show when={canWebShare}>
+                          <button class="btn secondary" onClick={shareInviteLink}>
+                            Share
+                          </button>
+                        </Show>
                         <button
                           class="btn secondary"
                           disabled={inviteBusy()}
@@ -1701,6 +2074,71 @@ export default function App() {
                     </Show>
                   </Show>
                 </section>
+
+                <Show when={!standalone() && (installPrompt() || isIos)}>
+                  <section class="card">
+                    <div class="row between">
+                      <div>
+                        <strong>{isIos ? 'Add to Home Screen' : 'Install Push It App'}</strong>
+                        <span class="muted">
+                          {isIos
+                            ? 'Unlocks background notifications and full-screen app mode on iOS/iPadOS.'
+                            : 'Install as an app for instant access and native Share menu integration.'}
+                        </span>
+                      </div>
+                      <Show when={installPrompt()}>
+                        <button class="btn primary small" onClick={triggerInstall}>
+                          Install
+                        </button>
+                      </Show>
+                    </div>
+                    <Show when={isIos}>
+                      <ol class="steps-list">
+                        <li>
+                          Tap Safari’s <strong>Share</strong> icon (square with arrow).
+                        </li>
+                        <li>
+                          Tap <strong>Add to Home Screen</strong>, then open Push It from your Home Screen.
+                        </li>
+                      </ol>
+                    </Show>
+                  </section>
+                </Show>
+
+                <Show when={isIos}>
+                  <section class="card">
+                    <div class="row between">
+                      <div>
+                        <strong>iOS Share Sheet Shortcut</strong>
+                        <span class="muted">
+                          Share links from any iPhone/iPad app directly into Push It with the same device picker &amp; toast.
+                        </span>
+                      </div>
+                      <button
+                        class="btn secondary small"
+                        onClick={() =>
+                          copyToClipboard(
+                            `${window.location.origin}/share?url=`,
+                            'Share URL copied',
+                          )
+                        }
+                      >
+                        Copy URL
+                      </button>
+                    </div>
+                    <ol class="steps-list">
+                      <li>
+                        Open Apple <strong>Shortcuts</strong> → <strong>+</strong> → enable <strong>Show in Share Sheet</strong> (URLs &amp; Text).
+                      </li>
+                      <li>
+                        Add <strong>URL Encode</strong> (Shortcut Input), then <strong>Open URLs</strong> with:
+                      </li>
+                    </ol>
+                    <div class="code-chip">
+                      {`${window.location.origin}/share?url=`}[URL Encoded Text]
+                    </div>
+                  </section>
+                </Show>
 
                 <section class="card">
                   <h2>Preferences</h2>
@@ -1722,7 +2160,9 @@ export default function App() {
                       <span class="muted">
                         {isPushSupported()
                           ? 'Notify me when the app is closed'
-                          : 'Not available in this browser'}
+                          : isIos && !standalone()
+                            ? 'Add to Home Screen first to enable notifications'
+                            : 'Not available in this browser'}
                       </span>
                     </div>
                     <button
@@ -1733,6 +2173,58 @@ export default function App() {
                       {pushBusy() ? '...' : pushEnabled() ? 'On' : 'Turn On'}
                     </button>
                   </div>
+
+                  <div class="divider" />
+
+                  <div class="toggle">
+                    <div>
+                      <strong>Room PIN</strong>
+                      <span class="muted">
+                        {roomPinEnabled()
+                          ? 'Protected · 6-digit PIN required to pair new devices'
+                          : 'Optional extra 6-digit code when pairing new devices'}
+                      </span>
+                    </div>
+                    <button
+                      class={`btn small ${roomPinEnabled() ? 'success' : 'secondary'}`}
+                      disabled={pinBusy()}
+                      onClick={() => {
+                        setEditingRoomPin((v) => !v);
+                        setRoomPinDraft('');
+                      }}
+                    >
+                      {editingRoomPin() ? 'Close' : roomPinEnabled() ? 'Change' : 'Set PIN'}
+                    </button>
+                  </div>
+
+                  <Show when={editingRoomPin()}>
+                    <div class="pin-box">
+                      <DigitCodeInput
+                        value={roomPinDraft()}
+                        onChange={setRoomPinDraft}
+                        disabled={pinBusy()}
+                        ariaLabel="Set 6-digit room PIN"
+                      />
+                      <div class="row gap">
+                        <button
+                          class="btn primary small"
+                          disabled={pinBusy() || roomPinDraft().length !== 6}
+                          onClick={() => saveRoomPin(roomPinDraft())}
+                        >
+                          {pinBusy() ? '...' : 'Save 6-Digit PIN'}
+                        </button>
+                        <Show when={roomPinEnabled()}>
+                          <button
+                            class="chip danger"
+                            disabled={pinBusy()}
+                            onClick={() => saveRoomPin(null)}
+                          >
+                            Remove PIN
+                          </button>
+                        </Show>
+                      </div>
+                    </div>
+                  </Show>
                 </section>
 
                 <section class="card">

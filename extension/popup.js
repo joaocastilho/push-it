@@ -21,12 +21,22 @@ const deviceList = document.getElementById('deviceList');
 const inviteBtn = document.getElementById('inviteBtn');
 const inviteBox = document.getElementById('inviteBox');
 const inviteTimerEl = document.getElementById('inviteTimer');
+const inviteCodeDisplay = document.getElementById('inviteCodeDisplay');
+const copyCodeBtn = document.getElementById('copyCodeBtn');
 const inviteOutput = document.getElementById('inviteOutput');
 const copyInviteBtn = document.getElementById('copyInviteBtn');
 const cancelInviteBtn = document.getElementById('cancelInviteBtn');
 const togglePairBtn = document.getElementById('togglePairBtn');
 const pairBox = document.getElementById('pairBox');
+const tabCodeBtn = document.getElementById('tabCodeBtn');
+const tabLinkBtn = document.getElementById('tabLinkBtn');
+const pairByCode = document.getElementById('pairByCode');
+const pairByLink = document.getElementById('pairByLink');
+const serverUrlInput = document.getElementById('serverUrlInput');
+const pairCodeInput = document.getElementById('pairCodeInput');
 const pairInput = document.getElementById('pairInput');
+const roomPinBox = document.getElementById('roomPinBox');
+const roomPinInput = document.getElementById('roomPinInput');
 const savePairBtn = document.getElementById('savePair');
 const autoOpenEl = document.getElementById('autoOpen');
 const targetBar = document.getElementById('targetBar');
@@ -54,6 +64,9 @@ let currentKeyB64 = '';
 let pairedDevices = [];
 let selectedTargetIds = [];
 let showingSettings = false;
+let pairMode = 'code';
+let activeInviteCode = '';
+let pendingResolved = null;
 let toastTimer;
 let inviteInterval;
 
@@ -276,8 +289,21 @@ function clearInviteUi() {
     clearInterval(inviteInterval);
     inviteInterval = null;
   }
+  activeInviteCode = '';
+  inviteCodeDisplay.textContent = '--- – ---';
   inviteBox.classList.add('hidden');
   inviteOutput.value = '';
+}
+
+function setPairMode(mode) {
+  pairMode = mode;
+  pendingResolved = null;
+  roomPinBox.classList.add('hidden');
+  roomPinInput.value = '';
+  pairByCode.classList.toggle('hidden', mode !== 'code');
+  pairByLink.classList.toggle('hidden', mode !== 'link');
+  tabCodeBtn.classList.toggle('primary', mode === 'code');
+  tabLinkBtn.classList.toggle('primary', mode === 'link');
 }
 
 function startInviteCountdown(expiresAt) {
@@ -303,6 +329,9 @@ async function refresh() {
   currentDeviceOs = state.deviceOs || 'windows';
   currentDeviceName = state.deviceName || defaultDeviceName(currentDeviceOs);
   currentServerUrl = state.serverUrl || '';
+  if (currentServerUrl && !serverUrlInput.value) {
+    serverUrlInput.value = currentServerUrl;
+  }
   currentKeyB64 = state.keyB64 || '';
   pairedDevices = Array.isArray(state.devices) ? state.devices : [];
   renderDevicePill();
@@ -473,6 +502,9 @@ togglePairBtn.addEventListener('click', () => {
   pairBox.classList.toggle('hidden');
 });
 
+tabCodeBtn.addEventListener('click', () => setPairMode('code'));
+tabLinkBtn.addEventListener('click', () => setPairMode('link'));
+
 inviteBtn.addEventListener('click', async () => {
   inviteBtn.disabled = true;
   try {
@@ -481,6 +513,10 @@ inviteBtn.addEventListener('click', async () => {
       showToast(res.error || 'Could not create invite');
       return;
     }
+    activeInviteCode = res.pairCode || '';
+    inviteCodeDisplay.textContent = activeInviteCode
+      ? `${activeInviteCode.slice(0, 3)} – ${activeInviteCode.slice(3)}`
+      : '--- – ---';
     inviteOutput.value = res.inviteUrl;
     inviteBox.classList.remove('hidden');
     startInviteCountdown(res.expiresAt);
@@ -488,6 +524,12 @@ inviteBtn.addEventListener('click', async () => {
   } finally {
     inviteBtn.disabled = false;
   }
+});
+
+copyCodeBtn.addEventListener('click', async () => {
+  if (!activeInviteCode) return;
+  await navigator.clipboard.writeText(activeInviteCode);
+  showToast('6-digit code copied');
 });
 
 copyInviteBtn.addEventListener('click', async () => {
@@ -503,22 +545,62 @@ cancelInviteBtn.addEventListener('click', async () => {
 });
 
 savePairBtn.addEventListener('click', async () => {
-  const raw = pairInput.value.trim();
-  if (!raw) return;
+  const roomPin = roomPinInput.value.replace(/\D/g, '');
   savePairBtn.disabled = true;
   try {
-    const res = await chrome.runtime.sendMessage({ type: 'JOIN_ROOM', rawLink: raw });
+    let res;
+    if (pendingResolved) {
+      res = await chrome.runtime.sendMessage({
+        type: 'JOIN_RESOLVED',
+        origin: pendingResolved.origin,
+        keyB64: pendingResolved.keyB64,
+        inviteToken: pendingResolved.inviteToken,
+        roomPin,
+      });
+    } else if (pairMode === 'code') {
+      const serverUrl = serverUrlInput.value.trim();
+      const code = pairCodeInput.value.replace(/\D/g, '');
+      if (!serverUrl || code.length !== 6) {
+        showToast('Enter your Push It URL and 6-digit code');
+        return;
+      }
+      res = await chrome.runtime.sendMessage({
+        type: 'JOIN_BY_CODE',
+        serverUrl,
+        code,
+        roomPin: roomPin || undefined,
+      });
+    } else {
+      const raw = pairInput.value.trim();
+      if (!raw) return;
+      res = await chrome.runtime.sendMessage({
+        type: 'JOIN_ROOM',
+        rawLink: raw,
+        roomPin: roomPin || undefined,
+      });
+    }
+
     if (!res.ok) {
-      showToast(res.error || 'Invite link is invalid or expired');
+      if (res.pinRequired) {
+        if (res.resolved) pendingResolved = res.resolved;
+        roomPinBox.classList.remove('hidden');
+        roomPinInput.focus();
+      }
+      showToast(res.error || 'Invite is invalid or expired');
       return;
     }
+
+    pendingResolved = null;
     pairInput.value = '';
+    pairCodeInput.value = '';
+    roomPinInput.value = '';
+    roomPinBox.classList.add('hidden');
     pairBox.classList.add('hidden');
     setView(false);
     showToast('Paired!');
     setTimeout(refresh, 450);
   } catch {
-    showToast('Paste the full single-use invite link');
+    showToast('Could not pair right now');
   } finally {
     savePairBtn.disabled = false;
   }

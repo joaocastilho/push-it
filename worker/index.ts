@@ -1,5 +1,5 @@
 import pkg from '../package.json';
-import { RoomDO, VAPID_DO_NAME, type Env } from './room-do';
+import { PAIR_DO_NAME, RoomDO, VAPID_DO_NAME, type Env } from './room-do';
 
 export { RoomDO };
 
@@ -41,12 +41,29 @@ export default {
       );
     }
 
+    if (url.pathname === '/api/pair/resolve' && request.method === 'POST') {
+      const pairStub = env.ROOMS.get(env.ROOMS.idFromName(PAIR_DO_NAME));
+      const clientIp =
+        request.headers.get('cf-connecting-ip') ||
+        request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+        'unknown';
+      const fwdHeaders = new Headers(request.headers);
+      fwdHeaders.set('x-client-ip', clientIp);
+      const fwdReq = new Request(request.url, {
+        method: 'POST',
+        headers: fwdHeaders,
+        body: request.body,
+      });
+      const res = await pairStub.fetch(fwdReq);
+      return withSecurityHeaders(res, true);
+    }
+
     const roomMatch = url.pathname.match(
-      /^\/api\/room\/([^/]+)\/(init|join|invites|ws-ticket|ws|send|ack|pending|devices|subscribe|status|vapid-public-key|blob\/[A-Za-z0-9_-]{8,64})$/,
+      /^\/api\/room\/([^/]+)\/(init|join|invites|pin|ws-ticket|ws|send|ack|pending|devices|subscribe|status|vapid-public-key|blob\/[A-Za-z0-9_-]{8,64})$/,
     );
     if (roomMatch) {
       const roomId = roomMatch[1];
-      if (!ROOM_ID_RE.test(roomId) || roomId === VAPID_DO_NAME) {
+      if (!ROOM_ID_RE.test(roomId) || roomId === VAPID_DO_NAME || roomId === PAIR_DO_NAME) {
         return withSecurityHeaders(
           Response.json({ error: 'Invalid roomId' }, { status: 400 }),
           true,

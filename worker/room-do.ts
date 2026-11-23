@@ -26,14 +26,27 @@ export interface EncryptedEnvelope {
 interface RoomMeta {
   version: 2;
   roomAuthHash: string;
+  roomPinHash?: string;
   createdAt: number;
 }
 
 interface StoredInvite {
   tokenHash: string;
+  codeHash?: string;
   createdBy: string;
   createdAt: number;
   expiresAt: number;
+}
+
+interface StoredPairBundle {
+  roomId: string;
+  inviteToken: string;
+  salt: string;
+  bundleIv: string;
+  bundleCiphertext: string;
+  pinRequired: boolean;
+  expiresAt: number;
+  resolvesLeft: number;
 }
 
 interface StoredWsTicket {
@@ -75,6 +88,7 @@ interface AuthContext {
 
 const ROOM_META_KEY = 'room:meta';
 const INVITE_KEY = 'invite:active';
+const PAIR_PREFIX = 'pair:';
 const WSTICKET_PREFIX = 'wsticket:';
 const SUB_PREFIX = 'sub:';
 const DEV_PREFIX = 'dev:';
@@ -90,11 +104,17 @@ const MAX_BLOB_BYTES = 8 * 1024 * 1024; // 8 MB encrypted blob limit
 const BLOB_CHUNK_SIZE = 512 * 1024; // 512 KB per SQLite row
 const JOIN_FAIL_WINDOW_MS = 60 * 1000;
 const MAX_JOIN_FAILS_PER_WINDOW = 8;
+const PAIR_IP_WINDOW_MS = 10 * 60 * 1000;
+const MAX_PAIR_FAILS_PER_IP = 5;
+const PAIR_GLOBAL_WINDOW_MS = 60 * 1000;
+const MAX_PAIR_FAILS_GLOBAL = 20;
 
 const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const TOKEN_RE = /^[A-Za-z0-9_-]{24,128}$/;
+const SIX_DIGITS_RE = /^\d{6}$/;
 
 export const VAPID_DO_NAME = '__vapid__';
+export const PAIR_DO_NAME = '__pair_codes__';
 
 function toBase64Url(bytes: Uint8Array): string {
   let bin = '';
@@ -148,10 +168,17 @@ function unauthorizedResponse(message = 'Unauthorized'): Response {
   return Response.json({ error: message, code: 'UNAUTHORIZED' }, { status: 401 });
 }
 
+function extractRoomIdFromPath(path: string): string {
+  const m = path.match(/^\/api\/room\/([^/]+)\//);
+  return m ? m[1] : '';
+}
+
 export class RoomDO extends DurableObject<Env> {
   private cachedVapid: StoredVapidKeys | null = null;
   private sqlReady = false;
   private joinFailTimestamps: number[] = [];
+  private pairGlobalFails: number[] = [];
+  private pairIpFails = new Map<string, number[]>();
 
   private ensureBlobTable(): void {
     if (this.sqlReady) return;
@@ -204,9 +231,22 @@ export class RoomDO extends DurableObject<Env> {
     const url = new URL(request.url);
     const path = url.pathname;
 
+    // Internal singleton routes (VAPID & 6-digit pairing code directory)
     if (path === '/internal/vapid-keys' && request.method === 'GET') {
       const keys = await this.getOrCreateOwnVapidKeys();
       return Response.json(keys);
+    }
+
+    if (path === '/internal/pair/register' && request.method === 'POST') {
+      return this.handleRegisterPairCode(request);
+    }
+
+    if (path === '/internal/pair/delete' && request.method === 'POST') {
+      return this.handleDeletePairCode(request);
+    }
+
+    if (path === '/api/pair/resolve' && request.method === 'POST') {
+      return this.handleResolvePairCode(request);
     }
 
     if (path.endsWith('/init') && request.method === 'POST') {
@@ -228,11 +268,15 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     if (path.endsWith('/invites') && request.method === 'POST') {
-      return this.handleCreateInvite(auth);
+      return this.handleCreateInvite(request, path, auth);
     }
 
     if (path.endsWith('/invites') && request.method === 'DELETE') {
       return this.handleDeleteInvite();
+    }
+
+    if (path.endsWith('/pin') && request.method === 'POST') {
+      return this.handleSetPin(request, auth);
     }
 
     if (path.endsWith('/ws-ticket') && request.method === 'POST') {
@@ -268,7 +312,7 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     if (path.endsWith('/devices') && request.method === 'GET') {
-      return this.handleListDevices();
+      return this.handleListDevices(auth);
     }
 
     if (path.endsWith('/devices') && request.method === 'POST') {
@@ -292,6 +336,153 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     return new Response('Not Found', { status: 404 });
+  }
+
+  private async deletePairCodeRemote(codeHash?: string): Promise<void> {
+    if (!codeHash) return;
+    try {
+      const pairStub = this.env.ROOMS.get(this.env.ROOMS.idFromName(PAIR_DO_NAME));
+      await pairStub.fetch('https://internal/internal/pair/delete', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codeHash }),
+      });
+    } catch {
+      // ignore cleanup failures
+    }
+  }
+
+  private async handleRegisterPairCode(request: Request): Promise<Response> {
+    const body = (await request.json()) as {
+      codeHash?: string;
+      roomId?: string;
+      inviteToken?: string;
+      salt?: string;
+      bundleIv?: string;
+      bundleCiphertext?: string;
+      pinRequired?: boolean;
+      expiresAt?: number;
+    };
+
+    if (
+      !body.codeHash ||
+      !TOKEN_RE.test(body.codeHash) ||
+      !body.roomId ||
+      !body.inviteToken ||
+      !body.salt ||
+      !body.bundleIv ||
+      !body.bundleCiphertext ||
+      body.bundleCiphertext.length > 600 ||
+      !body.expiresAt
+    ) {
+      return Response.json({ error: 'Invalid pair code registration' }, { status: 400 });
+    }
+
+    const now = Date.now();
+    // Prune expired pair codes
+    const all = await this.ctx.storage.list<StoredPairBundle>({ prefix: PAIR_PREFIX });
+    const expired: string[] = [];
+    for (const [k, v] of all) {
+      if (v.expiresAt <= now) expired.push(k);
+    }
+    if (expired.length > 0) await this.ctx.storage.delete(expired);
+
+    const key = `${PAIR_PREFIX}${body.codeHash}`;
+    const existing = await this.ctx.storage.get<StoredPairBundle>(key);
+    if (existing && existing.expiresAt > now) {
+      return Response.json({ error: 'Code collision', code: 'CODE_COLLISION' }, { status: 409 });
+    }
+
+    const entry: StoredPairBundle = {
+      roomId: body.roomId,
+      inviteToken: body.inviteToken,
+      salt: body.salt,
+      bundleIv: body.bundleIv,
+      bundleCiphertext: body.bundleCiphertext,
+      pinRequired: Boolean(body.pinRequired),
+      expiresAt: body.expiresAt,
+      resolvesLeft: 4,
+    };
+    await this.ctx.storage.put(key, entry);
+    return Response.json({ ok: true });
+  }
+
+  private async handleDeletePairCode(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { codeHash?: string };
+    if (body.codeHash && TOKEN_RE.test(body.codeHash)) {
+      await this.ctx.storage.delete(`${PAIR_PREFIX}${body.codeHash}`);
+    }
+    return Response.json({ ok: true });
+  }
+
+  private recordPairResolveFailure(ip: string, now: number): void {
+    this.pairGlobalFails = this.pairGlobalFails.filter((t) => now - t < PAIR_GLOBAL_WINDOW_MS);
+    this.pairGlobalFails.push(now);
+
+    const ipList = (this.pairIpFails.get(ip) || []).filter((t) => now - t < PAIR_IP_WINDOW_MS);
+    ipList.push(now);
+    this.pairIpFails.set(ip, ipList);
+  }
+
+  private async handleResolvePairCode(request: Request): Promise<Response> {
+    const now = Date.now();
+    const ip = request.headers.get('x-client-ip') || 'unknown';
+
+    this.pairGlobalFails = this.pairGlobalFails.filter((t) => now - t < PAIR_GLOBAL_WINDOW_MS);
+    const ipList = (this.pairIpFails.get(ip) || []).filter((t) => now - t < PAIR_IP_WINDOW_MS);
+    if (ipList.length > 0) this.pairIpFails.set(ip, ipList);
+    else this.pairIpFails.delete(ip);
+
+    if (
+      ipList.length >= MAX_PAIR_FAILS_PER_IP ||
+      this.pairGlobalFails.length >= MAX_PAIR_FAILS_GLOBAL
+    ) {
+      return Response.json(
+        { error: 'Too many code attempts. Please wait a few minutes.', code: 'RATE_LIMITED' },
+        { status: 429 },
+      );
+    }
+
+    let body: { codeHash?: string };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      this.recordPairResolveFailure(ip, now);
+      return Response.json({ error: 'Invalid code', code: 'PAIR_CODE_INVALID' }, { status: 400 });
+    }
+
+    if (!body.codeHash || !TOKEN_RE.test(body.codeHash)) {
+      this.recordPairResolveFailure(ip, now);
+      return Response.json({ error: 'Invalid code', code: 'PAIR_CODE_INVALID' }, { status: 400 });
+    }
+
+    const key = `${PAIR_PREFIX}${body.codeHash}`;
+    const entry = await this.ctx.storage.get<StoredPairBundle>(key);
+    if (!entry || entry.expiresAt <= now) {
+      if (entry) await this.ctx.storage.delete(key);
+      this.recordPairResolveFailure(ip, now);
+      return Response.json(
+        { error: 'Code is invalid or expired', code: 'PAIR_CODE_INVALID' },
+        { status: 404 },
+      );
+    }
+
+    const nextLeft = entry.resolvesLeft - 1;
+    if (nextLeft <= 0) {
+      await this.ctx.storage.delete(key);
+    } else {
+      await this.ctx.storage.put(key, { ...entry, resolvesLeft: nextLeft });
+    }
+
+    return Response.json({
+      ok: true,
+      roomId: entry.roomId,
+      inviteToken: entry.inviteToken,
+      salt: entry.salt,
+      bundleIv: entry.bundleIv,
+      bundleCiphertext: entry.bundleCiphertext,
+      pinRequired: entry.pinRequired,
+    });
   }
 
   private async getOrCreateOwnVapidKeys(): Promise<StoredVapidKeys> {
@@ -342,7 +533,7 @@ export class RoomDO extends DurableObject<Env> {
       const provided = (request.headers.get('x-access-key') || '').trim();
       if (!provided) {
         return Response.json(
-          { error: 'Server passphrase required', code: 'ACCESS_KEY_REQUIRED' },
+          { error: 'Server access code required', code: 'ACCESS_KEY_REQUIRED' },
           { status: 403 },
         );
       }
@@ -352,7 +543,7 @@ export class RoomDO extends DurableObject<Env> {
       ]);
       if (!timingSafeEqualStr(providedHash, expectedHash)) {
         return Response.json(
-          { error: 'Invalid server passphrase', code: 'ACCESS_KEY_INVALID' },
+          { error: 'Invalid server access code', code: 'ACCESS_KEY_INVALID' },
           { status: 403 },
         );
       }
@@ -366,7 +557,7 @@ export class RoomDO extends DurableObject<Env> {
     if (existingMeta || existingDevices.size > 0) {
       return Response.json(
         {
-          error: 'Room already exists. Use a pairing invite from an existing device.',
+          error: 'Room already exists. Use a pairing code or invite from an existing device.',
           code: 'ROOM_EXISTS',
         },
         { status: 409 },
@@ -376,6 +567,7 @@ export class RoomDO extends DurableObject<Env> {
     let body: {
       deviceId?: string;
       roomAuth?: string;
+      roomPin?: string;
       iv?: string;
       ciphertext?: string;
     };
@@ -397,6 +589,15 @@ export class RoomDO extends DurableObject<Env> {
       return Response.json({ error: 'Invalid room initialization payload' }, { status: 400 });
     }
 
+    let roomPinHash: string | undefined;
+    if (body.roomPin && body.roomPin.trim().length > 0) {
+      const cleanPin = body.roomPin.trim();
+      if (!SIX_DIGITS_RE.test(cleanPin)) {
+        return Response.json({ error: 'Room PIN must be 6 digits' }, { status: 400 });
+      }
+      roomPinHash = await sha256B64(`room-pin:${cleanPin}`);
+    }
+
     const now = Date.now();
     const deviceToken = randomToken(32);
     const [roomAuthHash, tokenHash] = await Promise.all([
@@ -407,6 +608,7 @@ export class RoomDO extends DurableObject<Env> {
     const meta: RoomMeta = {
       version: 2,
       roomAuthHash,
+      roomPinHash,
       createdAt: now,
     };
 
@@ -427,12 +629,86 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ ok: true, deviceToken });
   }
 
-  private async handleCreateInvite(auth: AuthContext): Promise<Response> {
+  private async handleSetPin(request: Request, auth: AuthContext): Promise<Response> {
+    let body: { roomPin?: string | null };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+    }
+
+    const nextMeta: RoomMeta = { ...auth.meta };
+    if (!body.roomPin) {
+      delete nextMeta.roomPinHash;
+    } else {
+      const cleanPin = String(body.roomPin).trim();
+      if (!SIX_DIGITS_RE.test(cleanPin)) {
+        return Response.json({ error: 'Room PIN must be 6 digits' }, { status: 400 });
+      }
+      nextMeta.roomPinHash = await sha256B64(`room-pin:${cleanPin}`);
+    }
+
+    await this.ctx.storage.put(ROOM_META_KEY, nextMeta);
+    this.broadcastJson({ type: 'devices_updated' });
+    return Response.json({ ok: true, pinEnabled: Boolean(nextMeta.roomPinHash) });
+  }
+
+  private async handleCreateInvite(
+    request: Request,
+    path: string,
+    auth: AuthContext,
+  ): Promise<Response> {
+    let body: {
+      codeHash?: string;
+      salt?: string;
+      bundleIv?: string;
+      bundleCiphertext?: string;
+    } = {};
+    try {
+      const text = await request.text();
+      if (text.trim()) body = JSON.parse(text) as typeof body;
+    } catch {
+      return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+    }
+
+    const previous = await this.ctx.storage.get<StoredInvite>(INVITE_KEY);
+    if (previous?.codeHash) {
+      await this.deletePairCodeRemote(previous.codeHash);
+    }
+
     const now = Date.now();
     const inviteToken = randomToken(24);
     const expiresAt = now + INVITE_TTL_MS;
+    const roomId = extractRoomIdFromPath(path);
+
+    let registeredCodeHash: string | undefined;
+    if (body.codeHash && body.salt && body.bundleIv && body.bundleCiphertext && roomId) {
+      const pairStub = this.env.ROOMS.get(this.env.ROOMS.idFromName(PAIR_DO_NAME));
+      const regRes = await pairStub.fetch('https://internal/internal/pair/register', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          codeHash: body.codeHash,
+          roomId,
+          inviteToken,
+          salt: body.salt,
+          bundleIv: body.bundleIv,
+          bundleCiphertext: body.bundleCiphertext,
+          pinRequired: Boolean(auth.meta.roomPinHash),
+          expiresAt,
+        }),
+      });
+      if (regRes.status === 409) {
+        return Response.json({ error: 'Code collision, retry', code: 'CODE_COLLISION' }, { status: 409 });
+      }
+      if (regRes.ok) {
+        registeredCodeHash = body.codeHash;
+      }
+    }
+
     const invite: StoredInvite = {
       tokenHash: await sha256B64(inviteToken),
+      codeHash: registeredCodeHash,
       createdBy: auth.deviceId,
       createdAt: now,
       expiresAt,
@@ -443,6 +719,10 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   private async handleDeleteInvite(): Promise<Response> {
+    const previous = await this.ctx.storage.get<StoredInvite>(INVITE_KEY);
+    if (previous?.codeHash) {
+      await this.deletePairCodeRemote(previous.codeHash);
+    }
     await this.ctx.storage.delete(INVITE_KEY);
     return Response.json({ ok: true });
   }
@@ -470,6 +750,7 @@ export class RoomDO extends DurableObject<Env> {
       deviceId?: string;
       roomAuth?: string;
       inviteToken?: string;
+      roomPin?: string;
       iv?: string;
       ciphertext?: string;
     };
@@ -508,6 +789,7 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     if (invite.expiresAt <= now) {
+      if (invite.codeHash) await this.deletePairCodeRemote(invite.codeHash);
       await this.ctx.storage.delete(INVITE_KEY);
       this.recordJoinFailure(now);
       return Response.json(
@@ -532,8 +814,30 @@ export class RoomDO extends DurableObject<Env> {
       );
     }
 
-    // Consume the single-use invite immediately
+    // If the room has a 6-digit PIN enabled, verify it before burning the invite
+    if (meta.roomPinHash) {
+      const providedPin = String(body.roomPin || '').trim();
+      if (!providedPin) {
+        return Response.json(
+          { error: 'Enter this room’s 6-digit PIN to finish pairing', code: 'ROOM_PIN_REQUIRED' },
+          { status: 403 },
+        );
+      }
+      const pinHash = await sha256B64(`room-pin:${providedPin}`);
+      if (!timingSafeEqualStr(pinHash, meta.roomPinHash)) {
+        this.recordJoinFailure(now);
+        return Response.json(
+          { error: 'Incorrect 6-digit room PIN', code: 'ROOM_PIN_INVALID' },
+          { status: 403 },
+        );
+      }
+    }
+
+    // Consume the single-use invite and its 6-digit code immediately
     await this.ctx.storage.delete(INVITE_KEY);
+    if (invite.codeHash) {
+      await this.deletePairCodeRemote(invite.codeHash);
+    }
 
     const deviceToken = randomToken(32);
     const tokenHash = await sha256B64(deviceToken);
@@ -589,14 +893,12 @@ export class RoomDO extends DurableObject<Env> {
       return unauthorizedResponse('Invalid WebSocket ticket');
     }
 
-    // Single-use ticket
     await this.ctx.storage.delete(ticketKey);
 
     if (stored.expiresAt <= Date.now()) {
       return unauthorizedResponse('Expired WebSocket ticket');
     }
 
-    // Ensure device is still registered and not revoked
     const device = await this.ctx.storage.get<StoredDevice>(`${DEV_PREFIX}${stored.deviceId}`);
     if (!device || !device.tokenHash) {
       return unauthorizedResponse('Device revoked');
@@ -636,10 +938,8 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     const now = Date.now();
-    // Prune expired blobs first
     this.ctx.storage.sql.exec('DELETE FROM blobs WHERE ts < ?', now - MESSAGE_TTL_MS);
 
-    // Prevent overwriting an existing active blob
     const existing = this.ctx.storage.sql
       .exec('SELECT 1 FROM blobs WHERE id = ? LIMIT 1', blobId)
       .toArray();
@@ -747,7 +1047,7 @@ export class RoomDO extends DurableObject<Env> {
     });
   }
 
-  private async handleListDevices(): Promise<Response> {
+  private async handleListDevices(auth: AuthContext): Promise<Response> {
     const onlineIds = new Set<string>();
     for (const ws of this.ctx.getWebSockets()) {
       for (const tag of this.ctx.getTags(ws)) onlineIds.add(tag);
@@ -765,7 +1065,7 @@ export class RoomDO extends DurableObject<Env> {
       }))
       .sort((a, b) => b.updatedAt - a.updatedAt);
 
-    return Response.json({ devices });
+    return Response.json({ devices, pinEnabled: Boolean(auth.meta.roomPinHash) });
   }
 
   private async handleUpdateDevice(request: Request, auth: AuthContext): Promise<Response> {
@@ -785,7 +1085,6 @@ export class RoomDO extends DurableObject<Env> {
       return Response.json({ error: 'Invalid device payload' }, { status: 400 });
     }
 
-    // Only allow updating devices already paired in this room (never create new devices here)
     const existing = await this.ctx.storage.get<StoredDevice>(`${DEV_PREFIX}${targetId}`);
     if (!existing || !existing.tokenHash) {
       return Response.json({ error: 'Device not found in room' }, { status: 404 });
@@ -815,7 +1114,6 @@ export class RoomDO extends DurableObject<Env> {
       this.ctx.storage.delete(`${SUB_PREFIX}${targetId}`),
     ]);
 
-    // Close all sockets for the removed device with custom revocation code 4001
     for (const ws of this.ctx.getWebSockets(targetId)) {
       try {
         ws.close(4001, 'Device removed');
@@ -824,7 +1122,6 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
-    // Remove the deleted device from pending message queues so messages aren't held forever
     const storedMsgs = await this.ctx.storage.list<StoredMessage>({ prefix: MSG_PREFIX });
     const msgDeletes: string[] = [];
     const msgUpdates: Array<[string, StoredMessage]> = [];
@@ -845,7 +1142,6 @@ export class RoomDO extends DurableObject<Env> {
       this.broadcastJson({ type: 'delivered', ids: deliveredIds });
     }
 
-    // Clean up deleted device from blob remaining lists
     this.ensureBlobTable();
     const blobRows = this.ctx.storage.sql
       .exec('SELECT DISTINCT id, remaining FROM blobs')
@@ -960,7 +1256,6 @@ export class RoomDO extends DurableObject<Env> {
       break;
     }
 
-    // Even if it wasn't in the queue (e.g. direct push ack), notify sender sockets
     if (deliveredIds.length === 0) {
       deliveredIds.push(body.messageId);
     }
@@ -1071,7 +1366,6 @@ export class RoomDO extends DurableObject<Env> {
 
     const serialized = JSON.stringify({ type: 'message', envelope });
 
-    // 1. Fan out to connected WebSockets (respecting targetIds and skipping sender)
     let wsDelivered = 0;
     const deliveredIds = new Set<string>();
     for (const ws of this.ctx.getWebSockets()) {
@@ -1088,8 +1382,6 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
-    // 2. Queue only for intended registered devices that were NOT online right now;
-    //    auto-deleted once every remaining device retrieves it (or after 28 days).
     const remaining: string[] = [];
     for (const devId of registeredIds) {
       if (devId === envelope.senderId) continue;
@@ -1105,7 +1397,6 @@ export class RoomDO extends DurableObject<Env> {
       await this.pruneOldMessages(now);
     }
 
-    // 3. Fan out Web Push to registered devices (respecting targetIds and skipping sender)
     let pushSent = 0;
     let pushFailed = 0;
 
