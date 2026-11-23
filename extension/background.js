@@ -1,15 +1,22 @@
 import {
+  blobAad,
   decryptBytes,
   decryptEnvelope,
   decryptJson,
   defaultDeviceName,
+  deriveRoomAuth,
   deriveRoomId,
   detectOs,
   detectPayloadType,
+  deviceAad,
   encryptBytes,
   encryptJson,
   encryptPayload,
   isSafeHttpUrl,
+  isSafeServerOrigin,
+  isValidInviteToken,
+  isValidKeyB64,
+  makeAuthHeader,
   normalizeOs,
 } from './crypto.js';
 
@@ -31,11 +38,13 @@ async function getConfig() {
     'serverUrl',
     'keyB64',
     'deviceId',
+    'deviceToken',
     'deviceName',
     'autoOpen',
     'history',
     'lastSeenTs',
     'unreadCount',
+    'revokedNotice',
   ]);
   let deviceId = data.deviceId;
   if (!deviceId) {
@@ -47,17 +56,45 @@ async function getConfig() {
     deviceName = defaultDeviceName(LOCAL_OS);
     await chrome.storage.local.set({ deviceName });
   }
+  let revokedNotice = data.revokedNotice || '';
+  // Upgrade notice for legacy v1 installations that had keyB64 without deviceToken
+  if (data.keyB64 && !data.deviceToken && !revokedNotice) {
+    revokedNotice =
+      'Security upgraded: please re-pair using a single-use invite link from Push It.';
+    await chrome.storage.local.set({ keyB64: '', revokedNotice });
+  }
   return {
     serverUrl: data.serverUrl || '',
-    keyB64: data.keyB64 || '',
+    keyB64: data.deviceToken ? data.keyB64 || '' : '',
     deviceId,
+    deviceToken: data.deviceToken || '',
     deviceName,
     deviceOs: LOCAL_OS,
     autoOpen: typeof data.autoOpen === 'boolean' ? data.autoOpen : true,
     history: Array.isArray(data.history) ? data.history : [],
     lastSeenTs: typeof data.lastSeenTs === 'number' ? data.lastSeenTs : 0,
     unreadCount: typeof data.unreadCount === 'number' ? data.unreadCount : 0,
+    revokedNotice,
   };
+}
+
+function authHeaders(cfg, extra = {}) {
+  return {
+    authorization: makeAuthHeader(cfg.deviceId, cfg.deviceToken),
+    ...extra,
+  };
+}
+
+async function handleRevoked(reason) {
+  stopSocket();
+  cachedDevices = [];
+  await chrome.storage.local.set({
+    keyB64: '',
+    deviceToken: '',
+    revokedNotice: reason || '',
+  });
+  setStatus('disconnected');
+  setupContextMenus();
 }
 
 async function updateBadge(status = wsStatus) {
@@ -144,36 +181,50 @@ async function setupContextMenus() {
   });
 }
 
-async function registerDeviceRecord(devId, name, os) {
-  const { serverUrl, keyB64 } = await getConfig();
-  if (!serverUrl || !keyB64 || !devId) return;
-  const roomId = await deriveRoomId(keyB64);
-  const base = new URL(serverUrl);
-  const enc = await encryptJson(keyB64, { name, os });
-  await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/devices`, {
+async function updateDeviceRecord(targetDevId, name, os) {
+  const cfg = await getConfig();
+  if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken || !targetDevId) return;
+  const roomId = await deriveRoomId(cfg.keyB64);
+  const base = new URL(cfg.serverUrl);
+  const enc = await encryptJson(cfg.keyB64, { name, os }, deviceAad(roomId, targetDevId));
+  const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/devices`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ deviceId: devId, iv: enc.iv, ciphertext: enc.ciphertext }),
-  }).catch(() => {});
+    headers: authHeaders(cfg, { 'content-type': 'application/json' }),
+    body: JSON.stringify({ deviceId: targetDevId, iv: enc.iv, ciphertext: enc.ciphertext }),
+  }).catch(() => null);
+  if (res?.status === 401) {
+    await handleRevoked('This device was removed from the room.');
+  }
 }
 
 async function refreshDevices() {
-  const { serverUrl, keyB64, deviceId, deviceName } = await getConfig();
-  if (!serverUrl || !keyB64) {
+  const cfg = await getConfig();
+  if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken) {
     cachedDevices = [];
     setupContextMenus();
     return [];
   }
   try {
-    const roomId = await deriveRoomId(keyB64);
-    const base = new URL(serverUrl);
-    const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/devices`);
+    const roomId = await deriveRoomId(cfg.keyB64);
+    const base = new URL(cfg.serverUrl);
+    const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/devices`, {
+      headers: authHeaders(cfg),
+    });
+    if (res.status === 401) {
+      await handleRevoked('This device was removed from the room.');
+      return [];
+    }
     if (!res.ok) return cachedDevices;
     const data = await res.json();
     const list = [];
     for (const d of data.devices || []) {
       try {
-        const meta = await decryptJson(keyB64, d.iv, d.ciphertext);
+        const meta = await decryptJson(
+          cfg.keyB64,
+          d.iv,
+          d.ciphertext,
+          deviceAad(roomId, d.deviceId),
+        );
         const os = normalizeOs(meta.os);
         const name = meta.name ? String(meta.name) : defaultDeviceName(os);
         list.push({
@@ -183,7 +234,7 @@ async function refreshDevices() {
           online: Boolean(d.online),
           updatedAt: d.updatedAt,
         });
-        if (d.deviceId === deviceId && name !== deviceName) {
+        if (d.deviceId === cfg.deviceId && name !== cfg.deviceName) {
           await chrome.storage.local.set({ deviceName: name });
         }
       } catch {
@@ -204,11 +255,21 @@ async function hydrateLongTextIfNeeded(item, cfg) {
     const roomId = await deriveRoomId(cfg.keyB64);
     const base = new URL(cfg.serverUrl);
     const res = await fetch(
-      `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(item.blobId)}?deviceId=${encodeURIComponent(cfg.deviceId)}`,
+      `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(item.blobId)}`,
+      { headers: authHeaders(cfg) },
     );
+    if (res.status === 401) {
+      await handleRevoked('This device was removed from the room.');
+      return item;
+    }
     if (!res.ok) return item;
     const cipher = new Uint8Array(await res.arrayBuffer());
-    const plain = await decryptBytes(cfg.keyB64, item.blobIv, cipher);
+    const plain = await decryptBytes(
+      cfg.keyB64,
+      item.blobIv,
+      cipher,
+      blobAad(roomId, item.blobId),
+    );
     return {
       ...item,
       type: 'text',
@@ -221,13 +282,18 @@ async function hydrateLongTextIfNeeded(item, cfg) {
 
 async function syncPending() {
   const cfg = await getConfig();
-  if (!cfg.serverUrl || !cfg.keyB64) return;
+  if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken) return;
   try {
     const roomId = await deriveRoomId(cfg.keyB64);
     const base = new URL(cfg.serverUrl);
     const res = await fetch(
-      `${base.origin}/api/room/${encodeURIComponent(roomId)}/pending?deviceId=${encodeURIComponent(cfg.deviceId)}&since=${cfg.lastSeenTs}`,
+      `${base.origin}/api/room/${encodeURIComponent(roomId)}/pending?since=${cfg.lastSeenTs}`,
+      { headers: authHeaders(cfg) },
     );
+    if (res.status === 401) {
+      await handleRevoked('This device was removed from the room.');
+      return;
+    }
     if (!res.ok) return;
     const data = await res.json();
     if (!data.messages?.length) return;
@@ -235,7 +301,7 @@ async function syncPending() {
     let maxTs = cfg.lastSeenTs;
     for (const env of data.messages) {
       try {
-        const decrypted = await decryptEnvelope(cfg.keyB64, env);
+        const decrypted = await decryptEnvelope(cfg.keyB64, roomId, env);
         let item = {
           id: env.id,
           senderId: env.senderId,
@@ -306,8 +372,8 @@ function scheduleReconnect() {
 }
 
 async function connect() {
-  const { serverUrl, keyB64, deviceId, deviceName, deviceOs } = await getConfig();
-  if (!serverUrl || !keyB64) {
+  const cfg = await getConfig();
+  if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken) {
     stopSocket();
     setStatus('disconnected');
     return;
@@ -327,17 +393,40 @@ async function connect() {
   setStatus('connecting');
 
   try {
-    const roomId = await deriveRoomId(keyB64);
-    const base = new URL(serverUrl);
+    const roomId = await deriveRoomId(cfg.keyB64);
+    const base = new URL(cfg.serverUrl);
+
+    const ticketRes = await fetch(
+      `${base.origin}/api/room/${encodeURIComponent(roomId)}/ws-ticket`,
+      {
+        method: 'POST',
+        headers: authHeaders(cfg),
+      },
+    );
+    if (ticketRes.status === 401) {
+      await handleRevoked('This device was removed from the room.');
+      return;
+    }
+    if (!ticketRes.ok) {
+      setStatus('disconnected');
+      scheduleReconnect();
+      return;
+    }
+    const { ticket } = await ticketRes.json();
+    if (!ticket) {
+      setStatus('disconnected');
+      scheduleReconnect();
+      return;
+    }
+
     const proto = base.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${base.host}/api/room/${encodeURIComponent(roomId)}/ws?deviceId=${encodeURIComponent(deviceId)}`;
+    const wsUrl = `${proto}//${base.host}/api/room/${encodeURIComponent(roomId)}/ws?ticket=${encodeURIComponent(ticket)}`;
 
     ws = new WebSocket(wsUrl);
 
     ws.onopen = async () => {
       reconnectDelay = 3000;
       setStatus('connected');
-      await registerDeviceRecord(deviceId, deviceName, deviceOs);
       await refreshDevices();
       await syncPending();
       pingTimer = setInterval(() => {
@@ -361,10 +450,12 @@ async function connect() {
         }
         if (parsed.type !== 'message' || !parsed.envelope) return;
 
-        const cfg = await getConfig();
-        if (!cfg.keyB64 || parsed.envelope.senderId === cfg.deviceId) return;
+        const latestCfg = await getConfig();
+        if (!latestCfg.keyB64 || !latestCfg.deviceToken) return;
+        if (parsed.envelope.senderId === latestCfg.deviceId) return;
 
-        const decrypted = await decryptEnvelope(cfg.keyB64, parsed.envelope);
+        const currentRoomId = await deriveRoomId(latestCfg.keyB64);
+        const decrypted = await decryptEnvelope(latestCfg.keyB64, currentRoomId, parsed.envelope);
         let item = {
           id: parsed.envelope.id,
           senderId: parsed.envelope.senderId,
@@ -383,26 +474,30 @@ async function connect() {
           direction: 'in',
         };
 
-        item = await hydrateLongTextIfNeeded(item, cfg);
+        item = await hydrateLongTextIfNeeded(item, latestCfg);
         const added = await appendHistory(item);
-        if (item.ts > cfg.lastSeenTs) {
+        if (item.ts > latestCfg.lastSeenTs) {
           await chrome.storage.local.set({ lastSeenTs: item.ts });
         }
         if (added) {
-          await handleIncoming(item, cfg.autoOpen);
+          await handleIncoming(item, latestCfg.autoOpen);
         }
       } catch {
         // Ignore malformed or wrong-key payloads
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (pingTimer) {
         clearInterval(pingTimer);
         pingTimer = null;
       }
       ws = null;
       setStatus('disconnected');
+      if (ev.code === 4001) {
+        handleRevoked('This device was removed from the room.');
+        return;
+      }
       scheduleReconnect();
     };
 
@@ -442,26 +537,38 @@ async function handleIncoming(item, autoOpen) {
       : item.type === 'file'
         ? `${fromPrefix}${isPhoto ? 'New Photo' : 'New File'}`
         : `${fromPrefix}${item.title || 'New Message'}`,
-    message: item.type === 'file' ? item.fileName || 'Open Push It to download' : item.content.slice(0, 200),
+    message:
+      item.type === 'file'
+        ? item.fileName || 'Open Push It to download'
+        : item.content.slice(0, 200),
     priority: 2,
   });
 }
 
 async function uploadEncryptedBlob(cfg, roomId, plainBytes, targetIds) {
   const blobId = crypto.randomUUID().replace(/-/g, '');
-  const { iv: blobIv, ciphertext } = await encryptBytes(cfg.keyB64, plainBytes);
+  const { iv: blobIv, ciphertext } = await encryptBytes(
+    cfg.keyB64,
+    plainBytes,
+    blobAad(roomId, blobId),
+  );
   const base = new URL(cfg.serverUrl);
-  const params = new URLSearchParams({ senderId: cfg.deviceId });
+  const params = new URLSearchParams();
   if (targetIds && targetIds.length > 0) params.set('targetIds', targetIds.join(','));
+  const qs = params.toString();
 
   const res = await fetch(
-    `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(blobId)}?${params.toString()}`,
+    `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(blobId)}${qs ? `?${qs}` : ''}`,
     {
       method: 'PUT',
-      headers: { 'content-type': 'application/octet-stream' },
+      headers: authHeaders(cfg, { 'content-type': 'application/octet-stream' }),
       body: ciphertext,
     },
   );
+  if (res.status === 401) {
+    await handleRevoked('This device was removed from the room.');
+    throw new Error('This device was removed from the room');
+  }
   if (!res.ok) throw new Error('File too large (max 8 MB)');
   return { blobId, blobIv };
 }
@@ -470,7 +577,9 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
   const content = String(rawContent || '').trim();
   const cfg = await getConfig();
   if (!content) throw new Error('Nothing to send');
-  if (!cfg.serverUrl || !cfg.keyB64) throw new Error('Pair this device first');
+  if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken) {
+    throw new Error('Pair this device first');
+  }
 
   const roomId = await deriveRoomId(cfg.keyB64);
   const isLong = content.length > LONG_TEXT_THRESHOLD;
@@ -481,6 +590,7 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
     const { blobId, blobIv } = await uploadEncryptedBlob(cfg, roomId, plain, targetIds);
     envelope = await encryptPayload(
       cfg.keyB64,
+      roomId,
       cfg.deviceId,
       {
         type: 'longtext',
@@ -499,6 +609,7 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
     const type = detectPayloadType(content);
     envelope = await encryptPayload(
       cfg.keyB64,
+      roomId,
       cfg.deviceId,
       {
         type,
@@ -515,10 +626,14 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
   const base = new URL(cfg.serverUrl);
   const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/send`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(cfg, { 'content-type': 'application/json' }),
     body: JSON.stringify(envelope),
   });
 
+  if (res.status === 401) {
+    await handleRevoked('This device was removed from the room.');
+    throw new Error('This device was removed from the room');
+  }
   if (!res.ok) throw new Error('Could not send right now');
 
   const result = await res.json();
@@ -540,7 +655,9 @@ async function sendContent(rawContent, title, targetIds, targetNames) {
 
 async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNames) {
   const cfg = await getConfig();
-  if (!cfg.serverUrl || !cfg.keyB64) throw new Error('Pair this device first');
+  if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken) {
+    throw new Error('Pair this device first');
+  }
 
   const plainBytes = new Uint8Array(bytesArray);
   const roomId = await deriveRoomId(cfg.keyB64);
@@ -548,6 +665,7 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
 
   const envelope = await encryptPayload(
     cfg.keyB64,
+    roomId,
     cfg.deviceId,
     {
       type: 'file',
@@ -567,10 +685,14 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
   const base = new URL(cfg.serverUrl);
   const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/send`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(cfg, { 'content-type': 'application/json' }),
     body: JSON.stringify(envelope),
   });
 
+  if (res.status === 401) {
+    await handleRevoked('This device was removed from the room.');
+    throw new Error('This device was removed from the room');
+  }
   if (!res.ok) throw new Error('Could not send file');
 
   const result = await res.json();
@@ -592,6 +714,57 @@ async function sendFileBytes(bytesArray, fileName, mimeType, targetIds, targetNa
     status: result.delivered ? 'delivered' : 'queued',
   });
   return result;
+}
+
+async function joinRoomWithInvite(rawLink) {
+  const parsed = new URL(String(rawLink || '').trim());
+  if (!isSafeServerOrigin(parsed.origin)) {
+    throw new Error('Server URL must use HTTPS (or localhost)');
+  }
+  const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ''));
+  const keyB64 = hashParams.get('key')?.trim() || '';
+  const inviteToken = hashParams.get('invite')?.trim() || '';
+  if (!isValidKeyB64(keyB64) || !isValidInviteToken(inviteToken)) {
+    throw new Error('Paste a valid single-use invite link from Push It');
+  }
+
+  const cfg = await getConfig();
+  const [roomId, roomAuth] = await Promise.all([
+    deriveRoomId(keyB64),
+    deriveRoomAuth(keyB64),
+  ]);
+  const enc = await encryptJson(
+    keyB64,
+    { name: cfg.deviceName, os: cfg.deviceOs },
+    deviceAad(roomId, cfg.deviceId),
+  );
+
+  const res = await fetch(`${parsed.origin}/api/room/${encodeURIComponent(roomId)}/join`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      deviceId: cfg.deviceId,
+      roomAuth,
+      inviteToken,
+      iv: enc.iv,
+      ciphertext: enc.ciphertext,
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.deviceToken) {
+    throw new Error(data.error || 'Invite link is invalid or expired');
+  }
+
+  await chrome.storage.local.set({
+    serverUrl: parsed.origin,
+    keyB64,
+    deviceToken: data.deviceToken,
+    revokedNotice: '',
+  });
+  stopSocket();
+  await connect();
+  return { ok: true };
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -655,18 +828,79 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'GET_STATUS') {
       const cfg = await getConfig();
       const devices = await refreshDevices();
+      const refreshedCfg = await getConfig();
       sendResponse({
         status: wsStatus,
-        paired: Boolean(cfg.serverUrl && cfg.keyB64),
-        serverUrl: cfg.serverUrl,
-        keyB64: cfg.keyB64,
-        deviceId: cfg.deviceId,
-        deviceName: cfg.deviceName,
-        deviceOs: cfg.deviceOs,
-        autoOpen: cfg.autoOpen,
-        history: cfg.history,
+        paired: Boolean(refreshedCfg.serverUrl && refreshedCfg.keyB64 && refreshedCfg.deviceToken),
+        serverUrl: refreshedCfg.serverUrl,
+        keyB64: refreshedCfg.keyB64,
+        deviceId: refreshedCfg.deviceId,
+        deviceToken: refreshedCfg.deviceToken,
+        deviceName: refreshedCfg.deviceName,
+        deviceOs: refreshedCfg.deviceOs,
+        autoOpen: refreshedCfg.autoOpen,
+        history: refreshedCfg.history,
+        revokedNotice: refreshedCfg.revokedNotice,
         devices,
       });
+      return;
+    }
+
+    if (msg.type === 'JOIN_ROOM') {
+      const res = await joinRoomWithInvite(msg.rawLink);
+      sendResponse(res);
+      return;
+    }
+
+    if (msg.type === 'CREATE_INVITE') {
+      const cfg = await getConfig();
+      if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken) {
+        throw new Error('Pair this device first');
+      }
+      const roomId = await deriveRoomId(cfg.keyB64);
+      const base = new URL(cfg.serverUrl);
+      const res = await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/invites`, {
+        method: 'POST',
+        headers: authHeaders(cfg),
+      });
+      if (res.status === 401) {
+        await handleRevoked('This device was removed from the room.');
+        throw new Error('This device was removed from the room');
+      }
+      if (!res.ok) throw new Error('Could not create invite');
+      const data = await res.json();
+      const inviteUrl = `${base.origin}/#key=${encodeURIComponent(cfg.keyB64)}&invite=${encodeURIComponent(data.inviteToken)}`;
+      sendResponse({ ok: true, inviteUrl, expiresAt: data.expiresAt });
+      return;
+    }
+
+    if (msg.type === 'CANCEL_INVITE') {
+      const cfg = await getConfig();
+      if (cfg.serverUrl && cfg.keyB64 && cfg.deviceToken) {
+        const roomId = await deriveRoomId(cfg.keyB64);
+        const base = new URL(cfg.serverUrl);
+        await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/invites`, {
+          method: 'DELETE',
+          headers: authHeaders(cfg),
+        }).catch(() => {});
+      }
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (msg.type === 'LEAVE_ROOM') {
+      const cfg = await getConfig();
+      if (cfg.serverUrl && cfg.keyB64 && cfg.deviceToken) {
+        const roomId = await deriveRoomId(cfg.keyB64);
+        const base = new URL(cfg.serverUrl);
+        await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/devices`, {
+          method: 'DELETE',
+          headers: authHeaders(cfg, { 'content-type': 'application/json' }),
+          body: JSON.stringify({ deviceId: cfg.deviceId }),
+        }).catch(() => {});
+      }
+      await handleRevoked('');
+      sendResponse({ ok: true });
       return;
     }
 
@@ -682,7 +916,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg.deviceId === cfg.deviceId) {
         await chrome.storage.local.set({ deviceName: msg.name });
       }
-      await registerDeviceRecord(msg.deviceId, msg.name, msg.os);
+      await updateDeviceRecord(msg.deviceId, msg.name, msg.os);
       const devices = await refreshDevices();
       sendResponse({ ok: true, devices });
       return;
@@ -690,12 +924,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
     if (msg.type === 'REMOVE_DEVICE') {
       const cfg = await getConfig();
-      if (cfg.serverUrl && cfg.keyB64) {
+      if (cfg.serverUrl && cfg.keyB64 && cfg.deviceToken) {
         const roomId = await deriveRoomId(cfg.keyB64);
         const base = new URL(cfg.serverUrl);
         await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/devices`, {
           method: 'DELETE',
-          headers: { 'content-type': 'application/json' },
+          headers: authHeaders(cfg, { 'content-type': 'application/json' }),
           body: JSON.stringify({ deviceId: msg.deviceId }),
         }).catch(() => {});
       }

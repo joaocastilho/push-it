@@ -1,10 +1,11 @@
 import {
+  blobAad,
   decryptBytes,
   defaultDeviceName,
   deriveRoomId,
   formatFileSize,
   isSafeHttpUrl,
-  isValidKeyB64,
+  makeAuthHeader,
 } from './crypto.js';
 
 const statusDot = document.getElementById('statusDot');
@@ -14,8 +15,15 @@ const toggleSettingsBtn = document.getElementById('toggleSettings');
 const toastEl = document.getElementById('toast');
 const settingsView = document.getElementById('settingsView');
 const chatView = document.getElementById('chatView');
+const noticeBanner = document.getElementById('noticeBanner');
 const devicesHeading = document.getElementById('devicesHeading');
 const deviceList = document.getElementById('deviceList');
+const inviteBtn = document.getElementById('inviteBtn');
+const inviteBox = document.getElementById('inviteBox');
+const inviteTimerEl = document.getElementById('inviteTimer');
+const inviteOutput = document.getElementById('inviteOutput');
+const copyInviteBtn = document.getElementById('copyInviteBtn');
+const cancelInviteBtn = document.getElementById('cancelInviteBtn');
 const togglePairBtn = document.getElementById('togglePairBtn');
 const pairBox = document.getElementById('pairBox');
 const pairInput = document.getElementById('pairInput');
@@ -29,6 +37,8 @@ const attachBtn = document.getElementById('attachBtn');
 const draftEl = document.getElementById('draft');
 const sendDraftBtn = document.getElementById('sendDraft');
 const clearBtn = document.getElementById('clearBtn');
+const leaveRow = document.getElementById('leaveRow');
+const leaveBtn = document.getElementById('leaveBtn');
 const versionText = document.getElementById('versionText');
 const updateHint = document.getElementById('updateHint');
 const historyList = document.getElementById('historyList');
@@ -36,6 +46,7 @@ const extVersion = chrome.runtime.getManifest().version;
 versionText.textContent = `Version v${extVersion}`;
 
 let myDeviceId = '';
+let currentDeviceToken = '';
 let currentDeviceOs = 'windows';
 let currentDeviceName = 'Windows';
 let currentServerUrl = '';
@@ -44,6 +55,7 @@ let pairedDevices = [];
 let selectedTargetIds = [];
 let showingSettings = false;
 let toastTimer;
+let inviteInterval;
 
 const OS_PATHS = {
   windows:
@@ -75,7 +87,7 @@ function showToast(msg) {
   toastEl.textContent = msg;
   toastEl.classList.remove('hidden');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.add('hidden'), 2200);
+  toastTimer = setTimeout(() => toastEl.classList.add('hidden'), 2400);
 }
 
 function setView(showSettings) {
@@ -219,19 +231,34 @@ function renderDeviceList() {
 }
 
 async function downloadFileItem(item) {
-  if (!item.blobId || !item.blobIv || !currentServerUrl || !currentKeyB64) return;
+  if (
+    !item.blobId ||
+    !item.blobIv ||
+    !currentServerUrl ||
+    !currentKeyB64 ||
+    !myDeviceId ||
+    !currentDeviceToken
+  ) {
+    return;
+  }
   try {
     const roomId = await deriveRoomId(currentKeyB64);
     const base = new URL(currentServerUrl);
     const res = await fetch(
-      `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(item.blobId)}?deviceId=${encodeURIComponent(myDeviceId)}`,
+      `${base.origin}/api/room/${encodeURIComponent(roomId)}/blob/${encodeURIComponent(item.blobId)}`,
+      { headers: { authorization: makeAuthHeader(myDeviceId, currentDeviceToken) } },
     );
     if (!res.ok) {
       showToast('File already expired or downloaded');
       return;
     }
     const cipher = new Uint8Array(await res.arrayBuffer());
-    const plain = await decryptBytes(currentKeyB64, item.blobIv, cipher);
+    const plain = await decryptBytes(
+      currentKeyB64,
+      item.blobIv,
+      cipher,
+      blobAad(roomId, item.blobId),
+    );
     const blob = new Blob([plain], { type: item.mimeType || 'application/octet-stream' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -244,9 +271,35 @@ async function downloadFileItem(item) {
   }
 }
 
+function clearInviteUi() {
+  if (inviteInterval) {
+    clearInterval(inviteInterval);
+    inviteInterval = null;
+  }
+  inviteBox.classList.add('hidden');
+  inviteOutput.value = '';
+}
+
+function startInviteCountdown(expiresAt) {
+  if (inviteInterval) clearInterval(inviteInterval);
+  const tick = () => {
+    const secs = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    inviteTimerEl.textContent = `${m}:${String(s).padStart(2, '0')}`;
+    if (secs <= 0) {
+      clearInviteUi();
+      showToast('Invite expired');
+    }
+  };
+  tick();
+  inviteInterval = setInterval(tick, 1000);
+}
+
 async function refresh() {
   const state = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
   myDeviceId = state.deviceId || '';
+  currentDeviceToken = state.deviceToken || '';
   currentDeviceOs = state.deviceOs || 'windows';
   currentDeviceName = state.deviceName || defaultDeviceName(currentDeviceOs);
   currentServerUrl = state.serverUrl || '';
@@ -266,7 +319,18 @@ async function refresh() {
         : 'Offline';
   autoOpenEl.checked = Boolean(state.autoOpen);
 
+  inviteBtn.classList.toggle('hidden', !state.paired);
+  leaveRow.classList.toggle('hidden', !state.paired);
+
+  if (state.revokedNotice) {
+    noticeBanner.textContent = state.revokedNotice;
+    noticeBanner.classList.remove('hidden');
+  } else {
+    noticeBanner.classList.add('hidden');
+  }
+
   if (!state.paired) {
+    clearInviteUi();
     setView(true);
     pairBox.classList.remove('hidden');
   } else if (currentServerUrl) {
@@ -409,30 +473,61 @@ togglePairBtn.addEventListener('click', () => {
   pairBox.classList.toggle('hidden');
 });
 
-savePairBtn.addEventListener('click', async () => {
-  const raw = pairInput.value.trim();
+inviteBtn.addEventListener('click', async () => {
+  inviteBtn.disabled = true;
   try {
-    const parsed = new URL(raw);
-    const hashParams = new URLSearchParams(parsed.hash.replace(/^#/, ''));
-    const keyB64 = hashParams.get('key')?.trim() || '';
-    if (!isValidKeyB64(keyB64)) {
-      showToast('That pair link is not valid');
+    const res = await chrome.runtime.sendMessage({ type: 'CREATE_INVITE' });
+    if (!res.ok) {
+      showToast(res.error || 'Could not create invite');
       return;
     }
+    inviteOutput.value = res.inviteUrl;
+    inviteBox.classList.remove('hidden');
+    startInviteCountdown(res.expiresAt);
+    showToast('Single-use invite ready');
+  } finally {
+    inviteBtn.disabled = false;
+  }
+});
 
-    await chrome.storage.local.set({
-      serverUrl: parsed.origin,
-      keyB64,
-    });
+copyInviteBtn.addEventListener('click', async () => {
+  if (!inviteOutput.value) return;
+  await navigator.clipboard.writeText(inviteOutput.value);
+  showToast('Invite link copied');
+});
+
+cancelInviteBtn.addEventListener('click', async () => {
+  clearInviteUi();
+  await chrome.runtime.sendMessage({ type: 'CANCEL_INVITE' }).catch(() => {});
+  showToast('Invite cancelled');
+});
+
+savePairBtn.addEventListener('click', async () => {
+  const raw = pairInput.value.trim();
+  if (!raw) return;
+  savePairBtn.disabled = true;
+  try {
+    const res = await chrome.runtime.sendMessage({ type: 'JOIN_ROOM', rawLink: raw });
+    if (!res.ok) {
+      showToast(res.error || 'Invite link is invalid or expired');
+      return;
+    }
     pairInput.value = '';
     pairBox.classList.add('hidden');
-    await chrome.runtime.sendMessage({ type: 'RECONNECT' });
     setView(false);
     showToast('Paired!');
-    setTimeout(refresh, 600);
+    setTimeout(refresh, 450);
   } catch {
-    showToast('Paste the full pair link');
+    showToast('Paste the full single-use invite link');
+  } finally {
+    savePairBtn.disabled = false;
   }
+});
+
+leaveBtn.addEventListener('click', async () => {
+  await chrome.runtime.sendMessage({ type: 'LEAVE_ROOM' });
+  showToast('Left room');
+  refresh();
 });
 
 autoOpenEl.addEventListener('change', async () => {
@@ -466,7 +561,7 @@ async function pushFileObject(file) {
     ...getSelectedTargetsPayload(),
   });
   if (!res.ok) {
-    showToast('Could not send file');
+    showToast(res.error || 'Could not send file');
     return;
   }
   showToast('Pushed!');
@@ -502,12 +597,17 @@ draftEl.addEventListener('paste', (e) => {
 });
 
 // Show active tab title/host in the quick Push This Tab bar
-chrome.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
-  if (tab?.url && isSafeHttpUrl(tab.url)) {
-    const label = tab.title ? `Push tab: ${tab.title}` : `Push tab: ${new URL(tab.url).host}`;
-    sendTabLabel.textContent = label;
-  }
-}).catch(() => {});
+chrome.tabs
+  .query({ active: true, currentWindow: true })
+  .then(([tab]) => {
+    if (tab?.url && isSafeHttpUrl(tab.url)) {
+      const label = tab.title
+        ? `Push tab: ${tab.title}`
+        : `Push tab: ${new URL(tab.url).host}`;
+      sendTabLabel.textContent = label;
+    }
+  })
+  .catch(() => {});
 
 sendTabBtn.addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -522,7 +622,7 @@ sendTabBtn.addEventListener('click', async () => {
     ...getSelectedTargetsPayload(),
   });
   if (!res.ok) {
-    showToast('Could not send right now');
+    showToast(res.error || 'Could not send right now');
     return;
   }
   showToast('Pushed!');
@@ -538,7 +638,7 @@ async function submitDraft() {
     ...getSelectedTargetsPayload(),
   });
   if (!res.ok) {
-    showToast('Could not send right now');
+    showToast(res.error || 'Could not send right now');
     return;
   }
   draftEl.value = '';

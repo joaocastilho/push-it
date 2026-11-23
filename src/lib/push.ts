@@ -1,4 +1,4 @@
-import { fromBase64Url } from './crypto';
+import { fromBase64Url, makeAuthHeader } from './crypto';
 
 export function isPushSupported(): boolean {
   return (
@@ -14,8 +14,14 @@ export async function registerServiceWorker(): Promise<ServiceWorkerRegistration
   return navigator.serviceWorker.register('/sw.js', { scope: '/' });
 }
 
-export async function getVapidPublicKey(): Promise<string | null> {
-  const res = await fetch('/api/vapid-public-key');
+export async function getVapidPublicKey(
+  roomId: string,
+  deviceId: string,
+  deviceToken: string,
+): Promise<string | null> {
+  const res = await fetch(`/api/room/${encodeURIComponent(roomId)}/vapid-public-key`, {
+    headers: { authorization: makeAuthHeader(deviceId, deviceToken) },
+  });
   if (!res.ok) return null;
   const data = (await res.json()) as { publicKey: string | null };
   return data.publicKey;
@@ -27,7 +33,11 @@ export async function getCurrentPushSubscription(): Promise<PushSubscription | n
   return reg.pushManager.getSubscription();
 }
 
-export async function subscribePush(roomId: string, deviceId: string): Promise<PushSubscription> {
+export async function subscribePush(
+  roomId: string,
+  deviceId: string,
+  deviceToken: string,
+): Promise<PushSubscription> {
   if (!isPushSupported()) {
     throw new Error('Web Push is not supported in this browser');
   }
@@ -37,7 +47,7 @@ export async function subscribePush(roomId: string, deviceId: string): Promise<P
     throw new Error('Notification permission denied');
   }
 
-  const vapidPublicKey = await getVapidPublicKey();
+  const vapidPublicKey = await getVapidPublicKey(roomId, deviceId, deviceToken);
   if (!vapidPublicKey) {
     throw new Error('Server VAPID_PUBLIC_KEY is not configured yet (run bun run gen:vapid)');
   }
@@ -53,10 +63,11 @@ export async function subscribePush(roomId: string, deviceId: string): Promise<P
 
   const res = await fetch(`/api/room/${encodeURIComponent(roomId)}/subscribe`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      authorization: makeAuthHeader(deviceId, deviceToken),
+    },
     body: JSON.stringify({
-      deviceId,
-      deviceName: navigator.userAgent.includes('Android') ? 'Android' : 'Desktop',
       subscription: sub.toJSON(),
     }),
   });
@@ -68,14 +79,20 @@ export async function subscribePush(roomId: string, deviceId: string): Promise<P
   return sub;
 }
 
-export async function unsubscribePush(roomId: string, deviceId: string): Promise<void> {
+export async function unsubscribePush(
+  roomId: string,
+  deviceId: string,
+  deviceToken: string,
+): Promise<void> {
   const sub = await getCurrentPushSubscription();
   if (sub) {
     await sub.unsubscribe();
   }
   await fetch(`/api/room/${encodeURIComponent(roomId)}/subscribe`, {
     method: 'DELETE',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ deviceId }),
+    headers: {
+      'content-type': 'application/json',
+      authorization: makeAuthHeader(deviceId, deviceToken),
+    },
   });
 }

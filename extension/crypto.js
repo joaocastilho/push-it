@@ -1,3 +1,5 @@
+const TOKEN_RE = /^[A-Za-z0-9_-]{24,128}$/;
+
 export function detectOs() {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
   if (/Android/i.test(ua)) return 'android';
@@ -61,10 +63,52 @@ export function isValidKeyB64(keyB64) {
   }
 }
 
+export function isValidInviteToken(token) {
+  return TOKEN_RE.test(String(token || '').trim());
+}
+
+export function isSafeServerOrigin(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (u.protocol === 'https:') return true;
+    if (
+      u.protocol === 'http:' &&
+      (u.hostname === 'localhost' || u.hostname === '127.0.0.1')
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export function makeAuthHeader(deviceId, deviceToken) {
+  return `Bearer ${deviceId}.${deviceToken}`;
+}
+
+export function messageAad(roomId, envelopeId, senderId) {
+  return `push-it-msg-v2:${roomId}:${envelopeId}:${senderId}`;
+}
+
+export function deviceAad(roomId, deviceId) {
+  return `push-it-dev-v2:${roomId}:${deviceId}`;
+}
+
+export function blobAad(roomId, blobId) {
+  return `push-it-blob-v2:${roomId}:${blobId}`;
+}
+
 export async function deriveRoomId(keyB64) {
   const data = new TextEncoder().encode(`push-it-room-v1:${keyB64}`);
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
   return toBase64Url(hash).slice(0, 24);
+}
+
+export async function deriveRoomAuth(keyB64) {
+  const data = new TextEncoder().encode(`push-it-auth-v1:${keyB64}`);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  return toBase64Url(hash);
 }
 
 export async function importAesKey(keyB64) {
@@ -73,39 +117,50 @@ export async function importAesKey(keyB64) {
   return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-export async function encryptBytes(keyB64, plainBytes) {
+export async function encryptBytes(keyB64, plainBytes, aad) {
   const key = await importAesKey(keyB64);
   const iv = new Uint8Array(12);
   crypto.getRandomValues(iv);
-  const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plainBytes);
+  const algo = aad
+    ? { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad) }
+    : { name: 'AES-GCM', iv };
+  const cipherBuf = await crypto.subtle.encrypt(algo, key, plainBytes);
   return {
     iv: toBase64Url(iv),
     ciphertext: new Uint8Array(cipherBuf),
   };
 }
 
-export async function decryptBytes(keyB64, ivB64, cipherBytes) {
+export async function decryptBytes(keyB64, ivB64, cipherBytes, aad) {
   const key = await importAesKey(keyB64);
   const iv = fromBase64Url(ivB64);
-  const plainBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, cipherBytes);
+  const algo = aad
+    ? { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad) }
+    : { name: 'AES-GCM', iv };
+  const plainBuf = await crypto.subtle.decrypt(algo, key, cipherBytes);
   return new Uint8Array(plainBuf);
 }
 
-export async function encryptJson(keyB64, value) {
+export async function encryptJson(keyB64, value, aad) {
   const plain = new TextEncoder().encode(JSON.stringify(value));
-  const { iv, ciphertext } = await encryptBytes(keyB64, plain);
+  const { iv, ciphertext } = await encryptBytes(keyB64, plain, aad);
   return { iv, ciphertext: toBase64Url(ciphertext) };
 }
 
-export async function decryptJson(keyB64, ivB64, ciphertextB64) {
-  const plain = await decryptBytes(keyB64, ivB64, fromBase64Url(ciphertextB64));
+export async function decryptJson(keyB64, ivB64, ciphertextB64, aad) {
+  const plain = await decryptBytes(keyB64, ivB64, fromBase64Url(ciphertextB64), aad);
   return JSON.parse(new TextDecoder().decode(plain));
 }
 
-export async function encryptPayload(keyB64, senderId, payload, targetIds) {
-  const { iv, ciphertext } = await encryptJson(keyB64, payload);
+export async function encryptPayload(keyB64, roomId, senderId, payload, targetIds) {
+  const id = crypto.randomUUID();
+  const { iv, ciphertext } = await encryptJson(
+    keyB64,
+    payload,
+    messageAad(roomId, id, senderId),
+  );
   return {
-    id: crypto.randomUUID(),
+    id,
     senderId,
     targetIds: targetIds && targetIds.length > 0 ? targetIds : undefined,
     iv,
@@ -114,8 +169,13 @@ export async function encryptPayload(keyB64, senderId, payload, targetIds) {
   };
 }
 
-export async function decryptEnvelope(keyB64, envelope) {
-  const parsed = await decryptJson(keyB64, envelope.iv, envelope.ciphertext);
+export async function decryptEnvelope(keyB64, roomId, envelope) {
+  const parsed = await decryptJson(
+    keyB64,
+    envelope.iv,
+    envelope.ciphertext,
+    messageAad(roomId, envelope.id, envelope.senderId),
+  );
   const type =
     parsed.type === 'link' || parsed.type === 'file' || parsed.type === 'longtext'
       ? parsed.type

@@ -600,3 +600,23 @@ input[type='text']:focus {
   font-size: 0.86rem;
   padding: 24px 12px;
 }
+
+.notice-banner {
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  color: #fde68a;
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.invite-timer {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  padding: 2px 8px;
+  border-radius: 999px;
+}

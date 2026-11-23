@@ -27,16 +27,34 @@
       <div id="toast" class="toast hidden"></div>
 
       <section id="settingsView" class="settings-view hidden">
+        <div id="noticeBanner" class="notice-banner hidden"></div>
+
         <div class="card">
           <div class="toggle">
             <strong id="devicesHeading">Devices</strong>
-            <button id="togglePairBtn" class="btn primary small">+ Pair</button>
+            <div class="item-actions">
+              <button id="inviteBtn" class="btn primary small hidden">+ Invite</button>
+              <button id="togglePairBtn" class="btn secondary small">Join Room</button>
+            </div>
           </div>
           <div id="deviceList" class="device-list"></div>
+
+          <div id="inviteBox" class="pair-box hidden">
+            <div class="toggle">
+              <span class="label">Single-use invite link</span>
+              <span id="inviteTimer" class="invite-timer">5:00</span>
+            </div>
+            <input id="inviteOutput" type="text" readonly />
+            <div class="item-actions">
+              <button id="copyInviteBtn" class="btn primary small">Copy Invite</button>
+              <button id="cancelInviteBtn" class="btn secondary small">Cancel</button>
+            </div>
+          </div>
+
           <div id="pairBox" class="pair-box hidden">
-            <label class="label" for="pairInput">Paste pair link from Push It</label>
-            <input id="pairInput" type="text" placeholder="Paste pair link here..." />
-            <button id="savePair" class="btn primary">Save &amp; Connect</button>
+            <label class="label" for="pairInput">Paste single-use invite link from Push It</label>
+            <input id="pairInput" type="text" placeholder="Paste invite link here..." />
+            <button id="savePair" class="btn primary">Join &amp; Connect</button>
           </div>
         </div>
 
@@ -51,6 +69,10 @@
           <div class="toggle">
             <span>Chat history</span>
             <button id="clearBtn" class="btn secondary small">Clear</button>
+          </div>
+          <div id="leaveRow" class="toggle hidden">
+            <span>Room membership</span>
+            <button id="leaveBtn" class="chip danger">Leave Room</button>
           </div>
         </div>
 

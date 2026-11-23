@@ -11,6 +11,7 @@ export interface Env {
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;
   VAPID_SUBJECT?: string;
+  ACCESS_KEY?: string;
 }
 
 export interface EncryptedEnvelope {
@@ -22,6 +23,24 @@ export interface EncryptedEnvelope {
   ts: number;
 }
 
+interface RoomMeta {
+  version: 2;
+  roomAuthHash: string;
+  createdAt: number;
+}
+
+interface StoredInvite {
+  tokenHash: string;
+  createdBy: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+interface StoredWsTicket {
+  deviceId: string;
+  expiresAt: number;
+}
+
 interface StoredSubscription {
   deviceId: string;
   subscription: PushSubscription;
@@ -30,8 +49,10 @@ interface StoredSubscription {
 
 interface StoredDevice {
   deviceId: string;
+  tokenHash?: string;
   iv: string;
   ciphertext: string;
+  createdAt?: number;
   updatedAt: number;
 }
 
@@ -46,21 +67,62 @@ interface StoredVapidKeys {
   subject: string;
 }
 
+interface AuthContext {
+  deviceId: string;
+  device: StoredDevice;
+  meta: RoomMeta;
+}
+
+const ROOM_META_KEY = 'room:meta';
+const INVITE_KEY = 'invite:active';
+const WSTICKET_PREFIX = 'wsticket:';
 const SUB_PREFIX = 'sub:';
 const DEV_PREFIX = 'dev:';
 const MSG_PREFIX = 'msg:';
 const VAPID_STORAGE_KEY = 'vapid:keys';
+
 const MAX_TTL_SECONDS = 2419200; // 28 days (Web Push / FCM max)
 const MESSAGE_TTL_MS = MAX_TTL_SECONDS * 1000;
+const INVITE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const WS_TICKET_TTL_MS = 30 * 1000; // 30 seconds
 const MAX_PENDING_MESSAGES = 200;
 const MAX_BLOB_BYTES = 8 * 1024 * 1024; // 8 MB encrypted blob limit
 const BLOB_CHUNK_SIZE = 512 * 1024; // 512 KB per SQLite row
+const JOIN_FAIL_WINDOW_MS = 60 * 1000;
+const MAX_JOIN_FAILS_PER_WINDOW = 8;
+
+const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const TOKEN_RE = /^[A-Za-z0-9_-]{24,128}$/;
+
 export const VAPID_DO_NAME = '__vapid__';
 
 function toBase64Url(bytes: Uint8Array): string {
   let bin = '';
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function randomToken(numBytes = 32): string {
+  const bytes = new Uint8Array(numBytes);
+  crypto.getRandomValues(bytes);
+  return toBase64Url(bytes);
+}
+
+async function sha256B64(value: string): Promise<string> {
+  const data = new TextEncoder().encode(value);
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+  return toBase64Url(hash);
+}
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = new TextEncoder().encode(a);
+  const bb = new TextEncoder().encode(b);
+  if (ab.byteLength !== bb.byteLength) return false;
+  let diff = 0;
+  for (let i = 0; i < ab.byteLength; i++) {
+    diff |= ab[i] ^ bb[i];
+  }
+  return diff === 0;
 }
 
 async function generateVapidKeys(subject: string): Promise<StoredVapidKeys> {
@@ -82,9 +144,14 @@ async function generateVapidKeys(subject: string): Promise<StoredVapidKeys> {
   };
 }
 
+function unauthorizedResponse(message = 'Unauthorized'): Response {
+  return Response.json({ error: message, code: 'UNAUTHORIZED' }, { status: 401 });
+}
+
 export class RoomDO extends DurableObject<Env> {
   private cachedVapid: StoredVapidKeys | null = null;
   private sqlReady = false;
+  private joinFailTimestamps: number[] = [];
 
   private ensureBlobTable(): void {
     if (this.sqlReady) return;
@@ -94,11 +161,43 @@ export class RoomDO extends DurableObject<Env> {
         chunk_index INTEGER NOT NULL,
         data BLOB NOT NULL,
         ts INTEGER NOT NULL,
+        sender_id TEXT NOT NULL DEFAULT '',
         remaining TEXT NOT NULL,
         PRIMARY KEY (id, chunk_index)
       )
     `);
+    try {
+      this.ctx.storage.sql.exec(
+        "ALTER TABLE blobs ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''",
+      );
+    } catch {
+      // Column already exists
+    }
     this.sqlReady = true;
+  }
+
+  private async authenticateRequest(request: Request): Promise<AuthContext | null> {
+    const authHeader = request.headers.get('authorization') || '';
+    if (!authHeader.startsWith('Bearer ')) return null;
+    const raw = authHeader.slice('Bearer '.length).trim();
+    const dot = raw.indexOf('.');
+    if (dot <= 0) return null;
+
+    const deviceId = raw.slice(0, dot);
+    const deviceToken = raw.slice(dot + 1);
+    if (!DEVICE_ID_RE.test(deviceId) || !TOKEN_RE.test(deviceToken)) return null;
+
+    const [meta, device] = await Promise.all([
+      this.ctx.storage.get<RoomMeta>(ROOM_META_KEY),
+      this.ctx.storage.get<StoredDevice>(`${DEV_PREFIX}${deviceId}`),
+    ]);
+
+    if (!meta || !device || !device.tokenHash) return null;
+
+    const candidateHash = await sha256B64(deviceToken);
+    if (!timingSafeEqualStr(candidateHash, device.tokenHash)) return null;
+
+    return { deviceId, device, meta };
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -110,30 +209,61 @@ export class RoomDO extends DurableObject<Env> {
       return Response.json(keys);
     }
 
+    if (path.endsWith('/init') && request.method === 'POST') {
+      return this.handleInit(request);
+    }
+
+    if (path.endsWith('/join') && request.method === 'POST') {
+      return this.handleJoin(request);
+    }
+
     if (path.endsWith('/ws')) {
       return this.handleWebSocket(request, url);
     }
 
+    // All remaining endpoints require an authenticated paired device
+    const auth = await this.authenticateRequest(request);
+    if (!auth) {
+      return unauthorizedResponse();
+    }
+
+    if (path.endsWith('/invites') && request.method === 'POST') {
+      return this.handleCreateInvite(auth);
+    }
+
+    if (path.endsWith('/invites') && request.method === 'DELETE') {
+      return this.handleDeleteInvite();
+    }
+
+    if (path.endsWith('/ws-ticket') && request.method === 'POST') {
+      return this.handleWsTicket(auth);
+    }
+
+    if (path.endsWith('/vapid-public-key') && request.method === 'GET') {
+      const vapid = await this.resolveVapidKeys();
+      return Response.json({ publicKey: vapid.publicKey });
+    }
+
     if (path.endsWith('/send') && request.method === 'POST') {
-      return this.handleSend(request);
+      return this.handleSend(request, auth);
     }
 
     if (path.endsWith('/ack') && request.method === 'POST') {
-      return this.handleAck(request);
+      return this.handleAck(request, auth);
     }
 
     if (path.endsWith('/pending') && request.method === 'GET') {
-      return this.handlePending(url);
+      return this.handlePending(url, auth);
     }
 
     const blobMatch = path.match(/\/blob\/([A-Za-z0-9_-]{8,64})$/);
     if (blobMatch) {
       const blobId = blobMatch[1];
       if (request.method === 'PUT') {
-        return this.handleUploadBlob(request, url, blobId);
+        return this.handleUploadBlob(request, url, blobId, auth);
       }
       if (request.method === 'GET') {
-        return this.handleDownloadBlob(url, blobId);
+        return this.handleDownloadBlob(blobId, auth);
       }
     }
 
@@ -142,19 +272,19 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     if (path.endsWith('/devices') && request.method === 'POST') {
-      return this.handleUpsertDevice(request);
+      return this.handleUpdateDevice(request, auth);
     }
 
     if (path.endsWith('/devices') && request.method === 'DELETE') {
-      return this.handleDeleteDevice(request);
+      return this.handleDeleteDevice(request, auth);
     }
 
     if (path.endsWith('/subscribe') && request.method === 'POST') {
-      return this.handleSubscribe(request);
+      return this.handleSubscribe(request, auth);
     }
 
     if (path.endsWith('/subscribe') && request.method === 'DELETE') {
-      return this.handleUnsubscribe(request);
+      return this.handleUnsubscribe(auth);
     }
 
     if (path.endsWith('/status') && request.method === 'GET') {
@@ -206,16 +336,276 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
-  private handleWebSocket(request: Request, url: URL): Response {
+  private async handleInit(request: Request): Promise<Response> {
+    const requiredAccessKey = this.env.ACCESS_KEY?.trim();
+    if (requiredAccessKey) {
+      const provided = (request.headers.get('x-access-key') || '').trim();
+      if (!provided) {
+        return Response.json(
+          { error: 'Server passphrase required', code: 'ACCESS_KEY_REQUIRED' },
+          { status: 403 },
+        );
+      }
+      const [providedHash, expectedHash] = await Promise.all([
+        sha256B64(provided),
+        sha256B64(requiredAccessKey),
+      ]);
+      if (!timingSafeEqualStr(providedHash, expectedHash)) {
+        return Response.json(
+          { error: 'Invalid server passphrase', code: 'ACCESS_KEY_INVALID' },
+          { status: 403 },
+        );
+      }
+    }
+
+    const [existingMeta, existingDevices] = await Promise.all([
+      this.ctx.storage.get<RoomMeta>(ROOM_META_KEY),
+      this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX, limit: 1 }),
+    ]);
+
+    if (existingMeta || existingDevices.size > 0) {
+      return Response.json(
+        {
+          error: 'Room already exists. Use a pairing invite from an existing device.',
+          code: 'ROOM_EXISTS',
+        },
+        { status: 409 },
+      );
+    }
+
+    let body: {
+      deviceId?: string;
+      roomAuth?: string;
+      iv?: string;
+      ciphertext?: string;
+    };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+    }
+
+    if (
+      !body.deviceId ||
+      !DEVICE_ID_RE.test(body.deviceId) ||
+      !body.roomAuth ||
+      !TOKEN_RE.test(body.roomAuth) ||
+      !body.iv ||
+      !body.ciphertext ||
+      body.ciphertext.length > 1000
+    ) {
+      return Response.json({ error: 'Invalid room initialization payload' }, { status: 400 });
+    }
+
+    const now = Date.now();
+    const deviceToken = randomToken(32);
+    const [roomAuthHash, tokenHash] = await Promise.all([
+      sha256B64(body.roomAuth),
+      sha256B64(deviceToken),
+    ]);
+
+    const meta: RoomMeta = {
+      version: 2,
+      roomAuthHash,
+      createdAt: now,
+    };
+
+    const record: StoredDevice = {
+      deviceId: body.deviceId,
+      tokenHash,
+      iv: body.iv,
+      ciphertext: body.ciphertext,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await Promise.all([
+      this.ctx.storage.put(ROOM_META_KEY, meta),
+      this.ctx.storage.put(`${DEV_PREFIX}${body.deviceId}`, record),
+    ]);
+
+    return Response.json({ ok: true, deviceToken });
+  }
+
+  private async handleCreateInvite(auth: AuthContext): Promise<Response> {
+    const now = Date.now();
+    const inviteToken = randomToken(24);
+    const expiresAt = now + INVITE_TTL_MS;
+    const invite: StoredInvite = {
+      tokenHash: await sha256B64(inviteToken),
+      createdBy: auth.deviceId,
+      createdAt: now,
+      expiresAt,
+    };
+
+    await this.ctx.storage.put(INVITE_KEY, invite);
+    return Response.json({ ok: true, inviteToken, expiresAt });
+  }
+
+  private async handleDeleteInvite(): Promise<Response> {
+    await this.ctx.storage.delete(INVITE_KEY);
+    return Response.json({ ok: true });
+  }
+
+  private recordJoinFailure(now: number): void {
+    this.joinFailTimestamps = this.joinFailTimestamps.filter(
+      (ts) => now - ts < JOIN_FAIL_WINDOW_MS,
+    );
+    this.joinFailTimestamps.push(now);
+  }
+
+  private async handleJoin(request: Request): Promise<Response> {
+    const now = Date.now();
+    this.joinFailTimestamps = this.joinFailTimestamps.filter(
+      (ts) => now - ts < JOIN_FAIL_WINDOW_MS,
+    );
+    if (this.joinFailTimestamps.length >= MAX_JOIN_FAILS_PER_WINDOW) {
+      return Response.json(
+        { error: 'Too many pairing attempts. Try again shortly.', code: 'RATE_LIMITED' },
+        { status: 429 },
+      );
+    }
+
+    let body: {
+      deviceId?: string;
+      roomAuth?: string;
+      inviteToken?: string;
+      iv?: string;
+      ciphertext?: string;
+    };
+    try {
+      body = (await request.json()) as typeof body;
+    } catch {
+      return Response.json({ error: 'Invalid JSON' }, { status: 400 });
+    }
+
+    if (
+      !body.deviceId ||
+      !DEVICE_ID_RE.test(body.deviceId) ||
+      !body.roomAuth ||
+      !TOKEN_RE.test(body.roomAuth) ||
+      !body.inviteToken ||
+      !TOKEN_RE.test(body.inviteToken) ||
+      !body.iv ||
+      !body.ciphertext ||
+      body.ciphertext.length > 1000
+    ) {
+      this.recordJoinFailure(now);
+      return Response.json({ error: 'Invalid pairing request', code: 'INVITE_INVALID' }, { status: 400 });
+    }
+
+    const [meta, invite] = await Promise.all([
+      this.ctx.storage.get<RoomMeta>(ROOM_META_KEY),
+      this.ctx.storage.get<StoredInvite>(INVITE_KEY),
+    ]);
+
+    if (!meta || !invite) {
+      this.recordJoinFailure(now);
+      return Response.json(
+        { error: 'Pairing invite is invalid or already used', code: 'INVITE_INVALID' },
+        { status: 403 },
+      );
+    }
+
+    if (invite.expiresAt <= now) {
+      await this.ctx.storage.delete(INVITE_KEY);
+      this.recordJoinFailure(now);
+      return Response.json(
+        { error: 'Pairing invite has expired. Generate a new one.', code: 'INVITE_EXPIRED' },
+        { status: 403 },
+      );
+    }
+
+    const [roomAuthHash, inviteHash] = await Promise.all([
+      sha256B64(body.roomAuth),
+      sha256B64(body.inviteToken),
+    ]);
+
+    if (
+      !timingSafeEqualStr(roomAuthHash, meta.roomAuthHash) ||
+      !timingSafeEqualStr(inviteHash, invite.tokenHash)
+    ) {
+      this.recordJoinFailure(now);
+      return Response.json(
+        { error: 'Pairing invite is invalid', code: 'INVITE_INVALID' },
+        { status: 403 },
+      );
+    }
+
+    // Consume the single-use invite immediately
+    await this.ctx.storage.delete(INVITE_KEY);
+
+    const deviceToken = randomToken(32);
+    const tokenHash = await sha256B64(deviceToken);
+    const record: StoredDevice = {
+      deviceId: body.deviceId,
+      tokenHash,
+      iv: body.iv,
+      ciphertext: body.ciphertext,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await this.ctx.storage.put(`${DEV_PREFIX}${body.deviceId}`, record);
+    this.broadcastJson({ type: 'devices_updated', joinedDeviceId: body.deviceId });
+
+    return Response.json({ ok: true, deviceToken });
+  }
+
+  private async handleWsTicket(auth: AuthContext): Promise<Response> {
+    const now = Date.now();
+    const existing = await this.ctx.storage.list<StoredWsTicket>({ prefix: WSTICKET_PREFIX });
+    const expiredKeys: string[] = [];
+    for (const [k, v] of existing) {
+      if (v.expiresAt <= now) expiredKeys.push(k);
+    }
+    if (expiredKeys.length > 0) {
+      await this.ctx.storage.delete(expiredKeys);
+    }
+
+    const ticket = randomToken(24);
+    const ticketHash = await sha256B64(ticket);
+    await this.ctx.storage.put<StoredWsTicket>(`${WSTICKET_PREFIX}${ticketHash}`, {
+      deviceId: auth.deviceId,
+      expiresAt: now + WS_TICKET_TTL_MS,
+    });
+
+    return Response.json({ ok: true, ticket });
+  }
+
+  private async handleWebSocket(request: Request, url: URL): Promise<Response> {
     if (request.headers.get('Upgrade') !== 'websocket') {
       return new Response('Expected Upgrade: websocket', { status: 426 });
     }
 
-    const deviceId = url.searchParams.get('deviceId') || crypto.randomUUID();
+    const ticket = url.searchParams.get('ticket') || '';
+    if (!TOKEN_RE.test(ticket)) {
+      return unauthorizedResponse('Missing WebSocket ticket');
+    }
+
+    const ticketKey = `${WSTICKET_PREFIX}${await sha256B64(ticket)}`;
+    const stored = await this.ctx.storage.get<StoredWsTicket>(ticketKey);
+    if (!stored) {
+      return unauthorizedResponse('Invalid WebSocket ticket');
+    }
+
+    // Single-use ticket
+    await this.ctx.storage.delete(ticketKey);
+
+    if (stored.expiresAt <= Date.now()) {
+      return unauthorizedResponse('Expired WebSocket ticket');
+    }
+
+    // Ensure device is still registered and not revoked
+    const device = await this.ctx.storage.get<StoredDevice>(`${DEV_PREFIX}${stored.deviceId}`);
+    if (!device || !device.tokenHash) {
+      return unauthorizedResponse('Device revoked');
+    }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
 
-    this.ctx.acceptWebSocket(server, [deviceId]);
+    this.ctx.acceptWebSocket(server, [stored.deviceId]);
     this.broadcastJson({ type: 'devices_updated' });
 
     return new Response(null, { status: 101, webSocket: client });
@@ -237,6 +627,7 @@ export class RoomDO extends DurableObject<Env> {
     request: Request,
     url: URL,
     blobId: string,
+    auth: AuthContext,
   ): Promise<Response> {
     this.ensureBlobTable();
     const buf = await request.arrayBuffer();
@@ -244,7 +635,19 @@ export class RoomDO extends DurableObject<Env> {
       return Response.json({ error: 'File must be between 1 byte and 8 MB' }, { status: 413 });
     }
 
-    const senderId = url.searchParams.get('senderId') || '';
+    const now = Date.now();
+    // Prune expired blobs first
+    this.ctx.storage.sql.exec('DELETE FROM blobs WHERE ts < ?', now - MESSAGE_TTL_MS);
+
+    // Prevent overwriting an existing active blob
+    const existing = this.ctx.storage.sql
+      .exec('SELECT 1 FROM blobs WHERE id = ? LIMIT 1', blobId)
+      .toArray();
+    if (existing.length > 0) {
+      return Response.json({ error: 'Blob already exists' }, { status: 409 });
+    }
+
+    const senderId = auth.deviceId;
     const targetParam = url.searchParams.get('targetIds') || '';
     const targetIds = targetParam ? targetParam.split(',').filter(Boolean) : [];
     const targetSet = targetIds.length > 0 ? new Set(targetIds) : null;
@@ -252,28 +655,25 @@ export class RoomDO extends DurableObject<Env> {
     const allDevices = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
     const remaining: string[] = [];
     for (const dev of allDevices.values()) {
+      if (!dev.tokenHash) continue;
       if (dev.deviceId === senderId) continue;
       if (targetSet && !targetSet.has(dev.deviceId)) continue;
       remaining.push(dev.deviceId);
     }
 
-    const now = Date.now();
     const bytes = new Uint8Array(buf);
     const remainingJson = JSON.stringify(remaining);
-
-    // Prune expired blobs first
-    this.ctx.storage.sql.exec('DELETE FROM blobs WHERE ts < ?', now - MESSAGE_TTL_MS);
-    this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', blobId);
 
     let chunkIndex = 0;
     for (let offset = 0; offset < bytes.byteLength; offset += BLOB_CHUNK_SIZE) {
       const slice = bytes.slice(offset, offset + BLOB_CHUNK_SIZE);
       this.ctx.storage.sql.exec(
-        'INSERT INTO blobs (id, chunk_index, data, ts, remaining) VALUES (?, ?, ?, ?, ?)',
+        'INSERT INTO blobs (id, chunk_index, data, ts, sender_id, remaining) VALUES (?, ?, ?, ?, ?, ?)',
         blobId,
         chunkIndex,
         slice,
         now,
+        senderId,
         remainingJson,
       );
       chunkIndex++;
@@ -282,16 +682,32 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ ok: true, blobId, bytes: bytes.byteLength });
   }
 
-  private handleDownloadBlob(url: URL, blobId: string): Response {
+  private handleDownloadBlob(blobId: string, auth: AuthContext): Response {
     this.ensureBlobTable();
-    const deviceId = url.searchParams.get('deviceId') || '';
+    const deviceId = auth.deviceId;
 
     const rows = this.ctx.storage.sql
-      .exec('SELECT chunk_index, data, remaining FROM blobs WHERE id = ? ORDER BY chunk_index ASC', blobId)
+      .exec(
+        'SELECT chunk_index, data, sender_id, remaining FROM blobs WHERE id = ? ORDER BY chunk_index ASC',
+        blobId,
+      )
       .toArray();
 
     if (rows.length === 0) {
       return new Response('Not Found', { status: 404 });
+    }
+
+    const senderId = String(rows[0].sender_id || '');
+    let remaining: string[] = [];
+    try {
+      remaining = JSON.parse(String(rows[0].remaining || '[]')) as string[];
+    } catch {
+      remaining = [];
+    }
+
+    const isAllowed = remaining.includes(deviceId) || senderId === deviceId;
+    if (!isAllowed) {
+      return Response.json({ error: 'Forbidden' }, { status: 403 });
     }
 
     let totalLen = 0;
@@ -310,23 +726,16 @@ export class RoomDO extends DurableObject<Env> {
       offset += c.byteLength;
     }
 
-    if (deviceId) {
-      try {
-        const remaining = JSON.parse(String(rows[0].remaining || '[]')) as string[];
-        if (remaining.includes(deviceId)) {
-          const next = remaining.filter((id) => id !== deviceId);
-          if (next.length === 0) {
-            this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', blobId);
-          } else {
-            this.ctx.storage.sql.exec(
-              'UPDATE blobs SET remaining = ? WHERE id = ?',
-              JSON.stringify(next),
-              blobId,
-            );
-          }
-        }
-      } catch {
-        // ignore malformed remaining list
+    if (remaining.includes(deviceId)) {
+      const next = remaining.filter((id) => id !== deviceId);
+      if (next.length === 0) {
+        this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', blobId);
+      } else {
+        this.ctx.storage.sql.exec(
+          'UPDATE blobs SET remaining = ? WHERE id = ?',
+          JSON.stringify(next),
+          blobId,
+        );
       }
     }
 
@@ -346,6 +755,7 @@ export class RoomDO extends DurableObject<Env> {
 
     const stored = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
     const devices = Array.from(stored.values())
+      .filter((d) => Boolean(d.tokenHash))
       .map((d) => ({
         deviceId: d.deviceId,
         iv: d.iv,
@@ -358,43 +768,103 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ devices });
   }
 
-  private async handleUpsertDevice(request: Request): Promise<Response> {
+  private async handleUpdateDevice(request: Request, auth: AuthContext): Promise<Response> {
     const body = (await request.json()) as {
       deviceId?: string;
       iv?: string;
       ciphertext?: string;
     };
 
-    if (!body.deviceId || !body.iv || !body.ciphertext || body.ciphertext.length > 1000) {
+    const targetId = body.deviceId || auth.deviceId;
+    if (
+      !DEVICE_ID_RE.test(targetId) ||
+      !body.iv ||
+      !body.ciphertext ||
+      body.ciphertext.length > 1000
+    ) {
       return Response.json({ error: 'Invalid device payload' }, { status: 400 });
     }
 
+    // Only allow updating devices already paired in this room (never create new devices here)
+    const existing = await this.ctx.storage.get<StoredDevice>(`${DEV_PREFIX}${targetId}`);
+    if (!existing || !existing.tokenHash) {
+      return Response.json({ error: 'Device not found in room' }, { status: 404 });
+    }
+
     const record: StoredDevice = {
-      deviceId: body.deviceId,
+      ...existing,
       iv: body.iv,
       ciphertext: body.ciphertext,
       updatedAt: Date.now(),
     };
 
-    await this.ctx.storage.put(`${DEV_PREFIX}${body.deviceId}`, record);
+    await this.ctx.storage.put(`${DEV_PREFIX}${targetId}`, record);
     this.broadcastJson({ type: 'devices_updated' });
     return Response.json({ ok: true });
   }
 
-  private async handleDeleteDevice(request: Request): Promise<Response> {
-    const body = (await request.json()) as { deviceId?: string };
-    if (!body.deviceId) {
-      return Response.json({ error: 'Missing deviceId' }, { status: 400 });
+  private async handleDeleteDevice(request: Request, auth: AuthContext): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { deviceId?: string };
+    const targetId = body.deviceId || auth.deviceId;
+    if (!DEVICE_ID_RE.test(targetId)) {
+      return Response.json({ error: 'Invalid deviceId' }, { status: 400 });
     }
 
     await Promise.all([
-      this.ctx.storage.delete(`${DEV_PREFIX}${body.deviceId}`),
-      this.ctx.storage.delete(`${SUB_PREFIX}${body.deviceId}`),
+      this.ctx.storage.delete(`${DEV_PREFIX}${targetId}`),
+      this.ctx.storage.delete(`${SUB_PREFIX}${targetId}`),
     ]);
 
-    for (const ws of this.ctx.getWebSockets(body.deviceId)) {
+    // Close all sockets for the removed device with custom revocation code 4001
+    for (const ws of this.ctx.getWebSockets(targetId)) {
       try {
-        ws.close(1000, 'Device removed');
+        ws.close(4001, 'Device removed');
+      } catch {
+        // ignore
+      }
+    }
+
+    // Remove the deleted device from pending message queues so messages aren't held forever
+    const storedMsgs = await this.ctx.storage.list<StoredMessage>({ prefix: MSG_PREFIX });
+    const msgDeletes: string[] = [];
+    const msgUpdates: Array<[string, StoredMessage]> = [];
+    const deliveredIds: string[] = [];
+    for (const [key, entry] of storedMsgs) {
+      if (!('envelope' in entry) || !entry.remaining.includes(targetId)) continue;
+      const next = entry.remaining.filter((id) => id !== targetId);
+      if (next.length === 0) {
+        msgDeletes.push(key);
+        deliveredIds.push(entry.envelope.id);
+      } else {
+        msgUpdates.push([key, { envelope: entry.envelope, remaining: next }]);
+      }
+    }
+    if (msgDeletes.length > 0) await this.ctx.storage.delete(msgDeletes);
+    for (const [k, v] of msgUpdates) await this.ctx.storage.put(k, v);
+    if (deliveredIds.length > 0) {
+      this.broadcastJson({ type: 'delivered', ids: deliveredIds });
+    }
+
+    // Clean up deleted device from blob remaining lists
+    this.ensureBlobTable();
+    const blobRows = this.ctx.storage.sql
+      .exec('SELECT DISTINCT id, remaining FROM blobs')
+      .toArray();
+    for (const row of blobRows) {
+      const id = String(row.id);
+      try {
+        const rem = JSON.parse(String(row.remaining || '[]')) as string[];
+        if (!rem.includes(targetId)) continue;
+        const next = rem.filter((x) => x !== targetId);
+        if (next.length === 0) {
+          this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', id);
+        } else {
+          this.ctx.storage.sql.exec(
+            'UPDATE blobs SET remaining = ? WHERE id = ?',
+            JSON.stringify(next),
+            id,
+          );
+        }
       } catch {
         // ignore
       }
@@ -404,32 +874,27 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
-  private async handleSubscribe(request: Request): Promise<Response> {
+  private async handleSubscribe(request: Request, auth: AuthContext): Promise<Response> {
     const body = (await request.json()) as {
-      deviceId: string;
-      subscription: PushSubscription;
+      subscription?: PushSubscription;
     };
 
-    if (!body.deviceId || !body.subscription?.endpoint || !body.subscription?.keys?.p256dh) {
+    if (!body.subscription?.endpoint || !body.subscription?.keys?.p256dh) {
       return Response.json({ error: 'Invalid subscription payload' }, { status: 400 });
     }
 
     const record: StoredSubscription = {
-      deviceId: body.deviceId,
+      deviceId: auth.deviceId,
       subscription: body.subscription,
       updatedAt: Date.now(),
     };
 
-    await this.ctx.storage.put(`${SUB_PREFIX}${body.deviceId}`, record);
+    await this.ctx.storage.put(`${SUB_PREFIX}${auth.deviceId}`, record);
     return Response.json({ ok: true });
   }
 
-  private async handleUnsubscribe(request: Request): Promise<Response> {
-    const body = (await request.json()) as { deviceId?: string };
-    if (!body.deviceId) {
-      return Response.json({ error: 'Missing deviceId' }, { status: 400 });
-    }
-    await this.ctx.storage.delete(`${SUB_PREFIX}${body.deviceId}`);
+  private async handleUnsubscribe(auth: AuthContext): Promise<Response> {
+    await this.ctx.storage.delete(`${SUB_PREFIX}${auth.deviceId}`);
     return Response.json({ ok: true });
   }
 
@@ -471,19 +936,20 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
-  private async handleAck(request: Request): Promise<Response> {
-    const body = (await request.json()) as { deviceId?: string; messageId?: string };
-    if (!body.deviceId || !body.messageId) {
+  private async handleAck(request: Request, auth: AuthContext): Promise<Response> {
+    const body = (await request.json()) as { messageId?: string };
+    if (!body.messageId) {
       return Response.json({ ok: false }, { status: 400 });
     }
 
+    const deviceId = auth.deviceId;
     const stored = await this.ctx.storage.list<StoredMessage>({ prefix: MSG_PREFIX });
     const deliveredIds: string[] = [];
 
     for (const [key, entry] of stored) {
       if (!('envelope' in entry) || entry.envelope.id !== body.messageId) continue;
-      if (entry.remaining.includes(body.deviceId)) {
-        const next = entry.remaining.filter((id) => id !== body.deviceId);
+      if (entry.remaining.includes(deviceId)) {
+        const next = entry.remaining.filter((id) => id !== deviceId);
         if (next.length === 0) {
           await this.ctx.storage.delete(key);
           deliveredIds.push(body.messageId);
@@ -502,8 +968,8 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
-  private async handlePending(url: URL): Promise<Response> {
-    const deviceId = url.searchParams.get('deviceId') || '';
+  private async handlePending(url: URL, auth: AuthContext): Promise<Response> {
+    const deviceId = auth.deviceId;
     const since = Number(url.searchParams.get('since') || '0');
     const now = Date.now();
 
@@ -525,16 +991,16 @@ export class RoomDO extends DurableObject<Env> {
         continue;
       }
 
-      if (deviceId && env.senderId === deviceId) continue;
+      if (env.senderId === deviceId) continue;
 
       const targetedToDevice =
         !Array.isArray(env.targetIds) ||
         env.targetIds.length === 0 ||
-        (deviceId !== '' && env.targetIds.includes(deviceId));
+        env.targetIds.includes(deviceId);
 
       if (!targetedToDevice) continue;
 
-      if (isWrapped && deviceId) {
+      if (isWrapped) {
         if (remaining.includes(deviceId)) {
           messages.push(env);
           const nextRemaining = remaining.filter((id) => id !== deviceId);
@@ -565,12 +1031,17 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ messages });
   }
 
-  private async handleSend(request: Request): Promise<Response> {
+  private async handleSend(request: Request, auth: AuthContext): Promise<Response> {
     const envelope = (await request.json()) as EncryptedEnvelope;
 
-    if (!envelope.id || !envelope.senderId || !envelope.iv || !envelope.ciphertext) {
+    if (!envelope.id || !envelope.iv || !envelope.ciphertext) {
       return Response.json({ error: 'Invalid encrypted envelope' }, { status: 400 });
     }
+
+    if (envelope.senderId && envelope.senderId !== auth.deviceId) {
+      return Response.json({ error: 'Sender mismatch' }, { status: 403 });
+    }
+    envelope.senderId = auth.deviceId;
 
     if (envelope.ciphertext.length > 3500) {
       return Response.json({ error: 'Message too large' }, { status: 413 });
@@ -579,10 +1050,24 @@ export class RoomDO extends DurableObject<Env> {
     const now = Date.now();
     envelope.ts = envelope.ts || now;
 
+    const allDevices = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
+    const registeredIds = new Set<string>();
+    for (const dev of allDevices.values()) {
+      if (dev.tokenHash) registeredIds.add(dev.deviceId);
+    }
+
+    const filteredTargets = Array.isArray(envelope.targetIds)
+      ? envelope.targetIds.filter((id) => registeredIds.has(id) && id !== auth.deviceId)
+      : [];
     const targetSet =
       Array.isArray(envelope.targetIds) && envelope.targetIds.length > 0
-        ? new Set(envelope.targetIds)
+        ? new Set(filteredTargets)
         : null;
+    if (targetSet) {
+      envelope.targetIds = filteredTargets;
+    } else {
+      delete envelope.targetIds;
+    }
 
     const serialized = JSON.stringify({ type: 'message', envelope });
 
@@ -592,6 +1077,7 @@ export class RoomDO extends DurableObject<Env> {
     for (const ws of this.ctx.getWebSockets()) {
       const tags = this.ctx.getTags(ws);
       if (tags.includes(envelope.senderId)) continue;
+      if (!tags.some((t) => registeredIds.has(t))) continue;
       if (targetSet && !tags.some((t) => targetSet.has(t))) continue;
       try {
         ws.send(serialized);
@@ -602,15 +1088,14 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
-    // 2. Queue only for intended devices that were NOT online right now;
+    // 2. Queue only for intended registered devices that were NOT online right now;
     //    auto-deleted once every remaining device retrieves it (or after 28 days).
-    const allDevices = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
     const remaining: string[] = [];
-    for (const dev of allDevices.values()) {
-      if (dev.deviceId === envelope.senderId) continue;
-      if (targetSet && !targetSet.has(dev.deviceId)) continue;
-      if (deliveredIds.has(dev.deviceId)) continue;
-      remaining.push(dev.deviceId);
+    for (const devId of registeredIds) {
+      if (devId === envelope.senderId) continue;
+      if (targetSet && !targetSet.has(devId)) continue;
+      if (deliveredIds.has(devId)) continue;
+      remaining.push(devId);
     }
 
     if (remaining.length > 0) {
@@ -631,6 +1116,7 @@ export class RoomDO extends DurableObject<Env> {
       const pushTasks: Promise<void>[] = [];
 
       for (const [storageKey, entry] of subs) {
+        if (!registeredIds.has(entry.deviceId)) continue;
         if (entry.deviceId === envelope.senderId) continue;
         if (targetSet && !targetSet.has(entry.deviceId)) continue;
 
