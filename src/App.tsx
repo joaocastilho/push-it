@@ -210,6 +210,9 @@ export default function App() {
   const [editDeviceDraft, setEditDeviceDraft] = createSignal<string>('');
 
   const [pendingShare, setPendingShare] = createSignal<PendingSharePayload | null>(null);
+  const [shareSelectedIds, setShareSelectedIds] = createSignal<string[]>([]);
+  const [pullDist, setPullDist] = createSignal<number>(0);
+  const [pullRefreshing, setPullRefreshing] = createSignal<boolean>(false);
   const [pendingDelete, setPendingDelete] = createSignal<StoredMessage | null>(null);
   const [searchOpen, setSearchOpen] = createSignal<boolean>(false);
   const [searchQuery, setSearchQuery] = createSignal<string>('');
@@ -253,6 +256,9 @@ export default function App() {
   const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0';
 
   let chatStreamEl: HTMLElement | undefined;
+  let settingsPageEl: HTMLElement | undefined;
+  let pullStartY: number | null = null;
+  let pullStartX: number | null = null;
   let chatEndEl: HTMLDivElement | undefined;
   let fileInputEl: HTMLInputElement | undefined;
   let searchInputEl: HTMLInputElement | undefined;
@@ -362,6 +368,63 @@ export default function App() {
     requestAnimationFrame(() => {
       chatEndEl?.scrollIntoView({ behavior: 'smooth', block: 'end' });
     });
+  }
+
+  function handlePullTouchStart(scrollEl: HTMLElement | undefined, e: TouchEvent) {
+    if (pullRefreshing() || e.touches.length !== 1) return;
+    if (!scrollEl || scrollEl.scrollTop > 1) return;
+    pullStartY = e.touches[0].clientY;
+    pullStartX = e.touches[0].clientX;
+  }
+
+  function handlePullTouchMove(scrollEl: HTMLElement | undefined, e: TouchEvent) {
+    if (pullStartY === null || pullStartX === null || pullRefreshing() || e.touches.length !== 1) {
+      return;
+    }
+    if (!scrollEl || scrollEl.scrollTop > 1) {
+      pullStartY = null;
+      pullStartX = null;
+      if (pullDist() > 0) setPullDist(0);
+      return;
+    }
+    const dy = e.touches[0].clientY - pullStartY;
+    const dx = Math.abs(e.touches[0].clientX - pullStartX);
+    if (dy <= 0 || dx > dy) {
+      if (pullDist() > 0) setPullDist(0);
+      return;
+    }
+    // Rubber-band damping capped at 76px
+    const damped = Math.min(76, Math.round(dy * 0.45));
+    setPullDist(damped);
+  }
+
+  async function handlePullTouchEnd() {
+    if (pullStartY === null) return;
+    pullStartY = null;
+    pullStartX = null;
+    const dist = pullDist();
+    if (dist < 52 || pullRefreshing()) {
+      setPullDist(0);
+      return;
+    }
+    setPullRefreshing(true);
+    setPullDist(48);
+    const minSpin = new Promise((r) => window.setTimeout(r, 400));
+    try {
+      await Promise.all([
+        minSpin,
+        checkForAppUpdate(false),
+        refreshDevices(),
+        syncPending(roomId(), keyB64(), deviceId(), deviceToken(), true),
+      ]);
+      if (wsStatus() !== 'connected' && !(import.meta.env.DEV && localDemo())) {
+        setReconnectNonce((n) => n + 1);
+      }
+      notify('Refreshed');
+    } finally {
+      setPullRefreshing(false);
+      setPullDist(0);
+    }
   }
 
   function handleChatScroll() {
@@ -2191,16 +2254,37 @@ export default function App() {
     }
   }
 
-  async function handlePendingShareSend(target?: PairedDevice) {
+  function toggleShareTarget(id: string) {
+    setShareSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  }
+
+  async function handlePendingShareSend(sendToAll = false) {
     const share = pendingShare();
     if (!share) return;
+    const chosenIds = sendToAll ? [] : shareSelectedIds();
+    const chosenDevs =
+      chosenIds.length > 0
+        ? otherDevices().filter((d) => chosenIds.includes(d.deviceId))
+        : [];
+    const targetIds = chosenDevs.length > 0 ? chosenDevs.map((d) => d.deviceId) : undefined;
+    const targetNames = chosenDevs.length > 0 ? chosenDevs.map((d) => d.name) : undefined;
+    const label =
+      !targetNames || targetNames.length === 0
+        ? 'All Devices'
+        : targetNames.length === 1
+          ? targetNames[0]
+          : `${targetNames.length} devices`;
+
     const ok = await sendText(share.content, share.title, {
-      targetIds: target ? [target.deviceId] : undefined,
-      targetNames: target ? [target.name] : undefined,
-      toastOverride: target ? `✓ Sent to ${target.name}` : '✓ Sent to All Devices',
+      targetIds,
+      targetNames,
+      toastOverride: `✓ Sent to ${label}`,
     });
     if (ok) {
       setPendingShare(null);
+      setShareSelectedIds([]);
       window.setTimeout(() => window.close(), 1400);
     }
   }
@@ -2853,61 +2937,98 @@ export default function App() {
       </Show>
 
       <Show when={pendingShare()}>
-        {(share) => (
-          <div class="modal-backdrop">
-            <div class="share-modal">
-              <h2>Send with Push It</h2>
-              <p class="muted">Choose a device or send to everyone in the room.</p>
-              <div class="share-preview">
-                <Show when={share().title}>
-                  <div class="share-preview-title">{share().title}</div>
-                </Show>
-                <div class="share-preview-body">{share().content.slice(0, 220)}</div>
+        {(share) => {
+          const allSelected = () => shareSelectedIds().length === 0;
+          const sendLabel = () => {
+            const count = shareSelectedIds().length;
+            if (count === 0) return `Push to All Devices (${otherDevices().length})`;
+            if (count === 1) {
+              const dev = otherDevices().find((d) => d.deviceId === shareSelectedIds()[0]);
+              return `Push to ${dev?.name || '1 device'}`;
+            }
+            return `Push to ${count} devices`;
+          };
+          return (
+            <div class="modal-backdrop">
+              <div class="share-modal">
+                <h2>Send with Push It</h2>
+                <p class="muted">Select all devices or pick specific devices to share with.</p>
+                <div class="share-preview">
+                  <Show when={share().title}>
+                    <div class="share-preview-title">{share().title}</div>
+                  </Show>
+                  <div class="share-preview-body">{share().content.slice(0, 220)}</div>
+                </div>
+                <div class="share-dest-list">
+                  <button
+                    type="button"
+                    class={`share-dest-btn all ${allSelected() ? 'selected' : ''}`}
+                    disabled={sending()}
+                    onClick={() => setShareSelectedIds([])}
+                  >
+                    <span class="share-dest-main">
+                      <strong>All Devices (Room)</strong>
+                      <span class="muted">{otherDevices().length} devices</span>
+                    </span>
+                    <span class={`share-check ${allSelected() ? 'checked' : ''}`}>
+                      <Show when={allSelected()}>
+                        <LucideIcon icon={Check} size={13} />
+                      </Show>
+                    </span>
+                  </button>
+                  <For each={otherDevices()}>
+                    {(dev) => {
+                      const isSelected = () => shareSelectedIds().includes(dev.deviceId);
+                      return (
+                        <button
+                          type="button"
+                          class={`share-dest-btn ${isSelected() ? 'selected' : ''}`}
+                          disabled={sending()}
+                          onClick={() => toggleShareTarget(dev.deviceId)}
+                        >
+                          <span class="share-dest-main">
+                            <span class="device-info">
+                              <span class={`dot ${dev.online ? 'connected' : 'disconnected'}`} />
+                              <OsIcon os={dev.os} size={15} />
+                              <strong>{dev.name}</strong>
+                            </span>
+                            <span class="muted">{dev.online ? 'Online' : 'Offline'}</span>
+                          </span>
+                          <span class={`share-check ${isSelected() ? 'checked' : ''}`}>
+                            <Show when={isSelected()}>
+                              <LucideIcon icon={Check} size={13} />
+                            </Show>
+                          </span>
+                        </button>
+                      );
+                    }}
+                  </For>
+                </div>
+                <div class="row gap">
+                  <button
+                    class="btn primary"
+                    style={{ flex: 1 }}
+                    disabled={sending()}
+                    onClick={() => handlePendingShareSend(false)}
+                  >
+                    <LucideIcon icon={Send} size={14} />
+                    <span>{sending() ? 'Sending…' : sendLabel()}</span>
+                  </button>
+                  <button
+                    class="btn secondary"
+                    onClick={() => {
+                      setPendingShare(null);
+                      setShareSelectedIds([]);
+                      window.close();
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
               </div>
-              <div class="share-dest-list">
-                <button
-                  class="share-dest-btn all"
-                  disabled={sending()}
-                  onClick={() => handlePendingShareSend(undefined)}
-                >
-                  <span class="share-dest-main">
-                    <strong>All Devices (Room)</strong>
-                    <span class="muted">{otherDevices().length} devices</span>
-                  </span>
-                  <span>→</span>
-                </button>
-                <For each={otherDevices()}>
-                  {(dev) => (
-                    <button
-                      class="share-dest-btn"
-                      disabled={sending()}
-                      onClick={() => handlePendingShareSend(dev)}
-                    >
-                      <span class="share-dest-main">
-                        <span class="device-info">
-                          <span class={`dot ${dev.online ? 'connected' : 'disconnected'}`} />
-                          <OsIcon os={dev.os} size={15} />
-                          <strong>{dev.name}</strong>
-                        </span>
-                        <span class="muted">{dev.online ? 'Online' : 'Offline'}</span>
-                      </span>
-                      <span>→</span>
-                    </button>
-                  )}
-                </For>
-              </div>
-              <button
-                class="btn secondary"
-                onClick={() => {
-                  setPendingShare(null);
-                  window.close();
-                }}
-              >
-                Cancel
-              </button>
             </div>
-          </div>
-        )}
+          );
+        }}
       </Show>
 
       <Show
@@ -3137,7 +3258,40 @@ export default function App() {
           <Show
             when={view() === 'chat'}
             fallback={
-              <main class="settings-page">
+              <main
+                ref={settingsPageEl}
+                class="settings-page"
+                onTouchStart={(e) => handlePullTouchStart(settingsPageEl, e)}
+                onTouchMove={(e) => handlePullTouchMove(settingsPageEl, e)}
+                onTouchEnd={handlePullTouchEnd}
+                onTouchCancel={handlePullTouchEnd}
+              >
+                <Show when={pullDist() > 0 || pullRefreshing()}>
+                  <div
+                    class={`ptr-indicator ${pullRefreshing() ? 'refreshing' : ''} ${pullDist() >= 52 ? 'armed' : ''}`}
+                    style={{ height: `${pullDist()}px` }}
+                  >
+                    <div class="ptr-pill">
+                      <span
+                        class={`ptr-icon ${pullRefreshing() ? 'spinning' : ''}`}
+                        style={{
+                          transform: pullRefreshing()
+                            ? undefined
+                            : `rotate(${Math.min(180, pullDist() * 3.2)}deg)`,
+                        }}
+                      >
+                        <LucideIcon icon={RefreshCw} size={14} />
+                      </span>
+                      <span>
+                        {pullRefreshing()
+                          ? 'Refreshing…'
+                          : pullDist() >= 52
+                            ? 'Release to refresh'
+                            : 'Pull to refresh'}
+                      </span>
+                    </div>
+                  </div>
+                </Show>
                 <section class="card">
                   <div class="row between">
                     <h2>Devices ({devices().length})</h2>
@@ -3647,7 +3801,37 @@ export default function App() {
               ref={chatStreamEl}
               class="chat-stream"
               onScroll={handleChatScroll}
+              onTouchStart={(e) => handlePullTouchStart(chatStreamEl, e)}
+              onTouchMove={(e) => handlePullTouchMove(chatStreamEl, e)}
+              onTouchEnd={handlePullTouchEnd}
+              onTouchCancel={handlePullTouchEnd}
             >
+              <Show when={pullDist() > 0 || pullRefreshing()}>
+                <div
+                  class={`ptr-indicator ${pullRefreshing() ? 'refreshing' : ''} ${pullDist() >= 52 ? 'armed' : ''}`}
+                  style={{ height: `${pullDist()}px` }}
+                >
+                  <div class="ptr-pill">
+                    <span
+                      class={`ptr-icon ${pullRefreshing() ? 'spinning' : ''}`}
+                      style={{
+                        transform: pullRefreshing()
+                          ? undefined
+                          : `rotate(${Math.min(180, pullDist() * 3.2)}deg)`,
+                      }}
+                    >
+                      <LucideIcon icon={RefreshCw} size={14} />
+                    </span>
+                    <span>
+                      {pullRefreshing()
+                        ? 'Refreshing…'
+                        : pullDist() >= 52
+                          ? 'Release to refresh'
+                          : 'Pull to refresh'}
+                    </span>
+                  </div>
+                </div>
+              </Show>
               <For
                 each={filteredMessages()}
                 fallback={

@@ -2058,3 +2058,75 @@ h2 {
   font-weight: 600;
   flex-shrink: 0;
 }
+
+/* Pull-to-refresh indicator */
+.ptr-indicator {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  transition: height 0.16s ease-out;
+}
+
+.ptr-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 13px;
+  border-radius: 999px;
+  background: rgba(17, 24, 39, 0.92);
+  border: 1px solid var(--border-strong);
+  color: var(--text-soft);
+  font-size: 0.76rem;
+  font-weight: 600;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+
+.ptr-indicator.armed .ptr-pill,
+.ptr-indicator.refreshing .ptr-pill {
+  border-color: rgba(129, 140, 248, 0.55);
+  color: #e0e7ff;
+}
+
+.ptr-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+@keyframes ptrSpin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ptr-icon.spinning {
+  animation: ptrSpin 0.75s linear infinite;
+}
+
+/* Multi-select share modal checkmark */
+.share-dest-btn.selected {
+  background: rgba(99, 102, 241, 0.18);
+  border-color: rgba(129, 140, 248, 0.65);
+}
+
+.share-check {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 1.5px solid rgba(148, 163, 184, 0.35);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  color: #fff;
+  transition: background 0.14s, border-color 0.14s;
+}
+
+.share-check.checked {
+  background: var(--accent);
+  border-color: var(--accent-bright);
+}
