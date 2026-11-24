@@ -258,7 +258,6 @@ async function refreshDevices() {
     }
     cachedDevices = list;
     setupContextMenus();
-    await chrome.storage.local.set({ devicesUpdatedAt: Date.now() }).catch(() => {});
     return list;
   } catch {
     return cachedDevices;
@@ -460,6 +459,7 @@ async function connect() {
         const parsed = JSON.parse(event.data);
         if (parsed.type === 'devices_updated') {
           await refreshDevices();
+          await chrome.storage.local.set({ devicesUpdatedAt: Date.now() }).catch(() => {});
           return;
         }
         if (parsed.type === 'delivered' && Array.isArray(parsed.ids)) {

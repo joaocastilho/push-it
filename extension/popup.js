@@ -1148,10 +1148,15 @@ setInterval(() => {
 }, 5000);
 
 // Live-sync open popup whenever background receives messages or device updates
+let storageRefreshTimer = null;
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if (changes.history || changes.devicesUpdatedAt || changes.deviceName || changes.revokedNotice) {
-    refresh();
+    if (storageRefreshTimer) clearTimeout(storageRefreshTimer);
+    storageRefreshTimer = setTimeout(() => {
+      storageRefreshTimer = null;
+      refresh();
+    }, 150);
   }
 });
 
