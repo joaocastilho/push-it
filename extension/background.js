@@ -35,6 +35,7 @@ const LOCAL_OS = detectOs();
 
 let ws = null;
 let pingTimer = null;
+let pongTimer = null;
 let reconnectTimer = null;
 let reconnectDelay = 3000;
 let wsStatus = 'disconnected';
@@ -377,6 +378,10 @@ function stopSocket() {
     clearInterval(pingTimer);
     pingTimer = null;
   }
+  if (pongTimer) {
+    clearTimeout(pongTimer);
+    pongTimer = null;
+  }
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -466,12 +471,27 @@ async function connect() {
       pingTimer = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send('ping');
+          if (pongTimer) clearTimeout(pongTimer);
+          pongTimer = setTimeout(() => {
+            try {
+              ws?.close();
+            } catch {
+              // ignore
+            }
+          }, 6000);
         }
       }, 20000);
     };
 
     ws.onmessage = async (event) => {
-      if (typeof event.data !== 'string' || event.data === 'pong') return;
+      if (typeof event.data !== 'string') return;
+      if (event.data === 'pong') {
+        if (pongTimer) {
+          clearTimeout(pongTimer);
+          pongTimer = null;
+        }
+        return;
+      }
       try {
         const parsed = JSON.parse(event.data);
         if (parsed.type === 'devices_updated') {
@@ -544,6 +564,10 @@ async function connect() {
       if (pingTimer) {
         clearInterval(pingTimer);
         pingTimer = null;
+      }
+      if (pongTimer) {
+        clearTimeout(pongTimer);
+        pongTimer = null;
       }
       ws = null;
       setStatus('disconnected');
@@ -918,12 +942,47 @@ async function completeRoomJoin(origin, keyB64, inviteToken, roomPin) {
     throw new Error(data.error || 'Invite is invalid or expired');
   }
 
+  await clearExtBlobs().catch(() => {});
   await chrome.storage.local.set({
     serverUrl: origin,
     keyB64,
     deviceToken: data.deviceToken,
+    history: [],
+    lastSeenTs: 0,
+    unreadCount: 0,
     revokedNotice: '',
   });
+  const roomDevices = await refreshDevices();
+  const usedColors = new Set(
+    roomDevices
+      .filter((d) => d.deviceId !== cfg.deviceId)
+      .map((d) => (typeof d.color === 'number' ? d.color : 0)),
+  );
+  let uniqueColor = 0;
+  for (let c = 0; c < 8; c++) {
+    if (!usedColors.has(c)) {
+      uniqueColor = c;
+      break;
+    }
+  }
+  const takenNames = new Set(
+    roomDevices
+      .filter((d) => d.deviceId !== cfg.deviceId)
+      .map((d) => d.name.trim().toLowerCase()),
+  );
+  let finalName = cfg.deviceName;
+  if (takenNames.has(finalName.trim().toLowerCase())) {
+    for (let n = 2; n <= 99; n++) {
+      const candidate = `${cfg.deviceName} ${n}`;
+      if (!takenNames.has(candidate.toLowerCase())) {
+        finalName = candidate;
+        break;
+      }
+    }
+    await chrome.storage.local.set({ deviceName: finalName });
+  }
+  await updateDeviceRecord(cfg.deviceId, finalName, cfg.deviceOs, uniqueColor);
+  await refreshDevices();
   stopSocket();
   await connect();
   return { ok: true };

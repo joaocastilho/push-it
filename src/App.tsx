@@ -378,7 +378,14 @@ export default function App() {
   }
 
   function handlePullTouchMove(scrollEl: HTMLElement | undefined, e: TouchEvent) {
-    if (pullStartY === null || pullStartX === null || pullRefreshing() || e.touches.length !== 1) {
+    if (
+      pullStartY === null ||
+      pullStartX === null ||
+      pullRefreshing() ||
+      activeTouch?.swiping ||
+      e.touches.length !== 1
+    ) {
+      if (activeTouch?.swiping && pullDist() > 0) setPullDist(0);
       return;
     }
     if (!scrollEl || scrollEl.scrollTop > 1) {
@@ -463,11 +470,24 @@ export default function App() {
     };
   }
 
+  function revokeAllBlobUrls() {
+    for (const url of Object.values(blobUrls())) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // ignore
+      }
+    }
+    setBlobUrls({});
+  }
+
   async function handleRevoked(reason: string) {
     setDeviceToken('');
     setKeyB64('');
     setRoomId('');
     setDevices([]);
+    setMessages([]);
+    revokeAllBlobUrls();
     setSelectedTargets([]);
     setShowAddDevice(false);
     setInviteToken('');
@@ -478,6 +498,9 @@ export default function App() {
       kvDelete('deviceToken'),
       kvDelete('keyB64'),
       kvDelete('cachedDevices'),
+      kvDelete('lastSeenTs'),
+      kvDelete('historyBackfilledRoom'),
+      clearMessages().catch(() => {}),
     ]);
   }
 
@@ -2169,6 +2192,36 @@ export default function App() {
 
     const { targetIds, targetNames } = getTargetInfo();
     const expiresAt = burnMs() > 0 ? Date.now() + burnMs() : undefined;
+
+    if (import.meta.env.DEV && localDemo()) {
+      const fileBuf = await file.arrayBuffer();
+      const mimeType = file.type || 'application/octet-stream';
+      const fileName = file.name || (mimeType.startsWith('image/') ? 'photo.png' : 'file');
+      const blobId = `demo-blob-${crypto.randomUUID()}`;
+      const localUrl = URL.createObjectURL(new Blob([fileBuf], { type: mimeType }));
+      setBlobUrls((prev) => ({ ...prev, [blobId]: localUrl }));
+      const item: StoredMessage = {
+        id: crypto.randomUUID(),
+        senderId: did,
+        senderName: dName,
+        senderOs: localOs,
+        targetNames,
+        ts: Date.now(),
+        type: 'file',
+        content: fileName,
+        blobId,
+        fileName,
+        mimeType,
+        fileSize: file.size,
+        expiresAt,
+        direction: 'out',
+        status: 'delivered',
+      };
+      addOrUpdateMessage(item);
+      notify('Pushed!');
+      return;
+    }
+
     setSending(true);
     try {
       const fileBuf = await file.arrayBuffer();
@@ -2246,6 +2299,7 @@ export default function App() {
 
       await saveMessage(item);
       addOrUpdateMessage(item);
+      postTabSync({ type: 'msg_added', item });
       notify('Pushed!');
     } catch (e) {
       notify(e instanceof Error ? e.message : 'Could not send file');
@@ -3652,7 +3706,7 @@ export default function App() {
                   <div class="row between">
                     <div>
                       <strong>Chat History</strong>
-                      <span class="muted">Stored only on this device</span>
+                      <span class="muted">Synced across all devices in this room</span>
                     </div>
                     <div class="row gap">
                       <button
@@ -3667,8 +3721,9 @@ export default function App() {
                         onClick={async () => {
                           await clearMessages();
                           setMessages([]);
-                          setBlobUrls({});
-                          notify('History cleared');
+                          revokeAllBlobUrls();
+                          postTabSync({ type: 'msg_cleared' });
+                          notify('Local cache cleared');
                         }}
                       >
                         Clear

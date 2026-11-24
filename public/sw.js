@@ -606,25 +606,25 @@ function renderToastHtml({ ok, title, subtitle, preview, revoked }) {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-<meta name="theme-color" content="#0b0f19" />
+<meta name="theme-color" content="#070a12" />
 <title>Push It</title>
 <style>
   *{box-sizing:border-box}
   body{
     margin:0;min-height:100dvh;
-    background:rgba(11,15,25,0.92);
-    color:#eef2ff;
+    background:rgba(7,10,18,0.94);
+    color:#f1f5f9;
     font:500 15px/1.4 system-ui,-apple-system,sans-serif;
     display:flex;flex-direction:column;justify-content:flex-end;align-items:center;
     padding:20px 16px calc(28px + env(safe-area-inset-bottom));
   }
   .toast{
     width:min(100%, 420px);
-    background:#131a2a;
+    background:#111827;
     border:1px solid ${accent};
-    border-radius:16px;
+    border-radius:18px;
     padding:14px 16px;
-    box-shadow:0 14px 40px rgba(0,0,0,0.55);
+    box-shadow:0 18px 48px rgba(0,0,0,0.6);
     display:flex;align-items:flex-start;gap:12px;
     animation:pop .2s ease-out;
   }

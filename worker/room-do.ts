@@ -1089,21 +1089,7 @@ export class RoomDO extends DurableObject<Env> {
       return new Response('Not Found', { status: 404 });
     }
 
-    const senderId = String(rows[0].sender_id || '');
-    let remaining: string[] = [];
-    try {
-      remaining = JSON.parse(String(rows[0].remaining || '[]')) as string[];
-    } catch {
-      remaining = [];
-    }
-
-    // Retain encrypted blobs for shared room history until expired, explicitly deleted, or room cleared
-    const isAllowed =
-      remaining.length === 0 || remaining.includes(deviceId) || senderId === deviceId || true;
-    if (!isAllowed) {
-      return Response.json({ error: 'Forbidden' }, { status: 403 });
-    }
-
+    // Any authenticated room member can download room blobs until expired, deleted, or room cleared
     let totalLen = 0;
     const chunks: Uint8Array[] = [];
     for (const row of rows) {
@@ -1120,6 +1106,12 @@ export class RoomDO extends DurableObject<Env> {
       offset += c.byteLength;
     }
 
+    let remaining: string[] = [];
+    try {
+      remaining = JSON.parse(String(rows[0].remaining || '[]')) as string[];
+    } catch {
+      remaining = [];
+    }
     if (remaining.includes(deviceId)) {
       const next = remaining.filter((id) => id !== deviceId);
       this.ctx.storage.sql.exec(

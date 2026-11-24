@@ -319,6 +319,13 @@ function renderDeviceList() {
       saveBtn.textContent = 'Save';
       const commit = async () => {
         const nextName = input.value.trim() || defaultDeviceName(dev.os);
+        const dup = pairedDevices.some(
+          (d) => d.deviceId !== dev.deviceId && d.name.trim().toLowerCase() === nextName.toLowerCase(),
+        );
+        if (dup) {
+          showToast(`"${nextName}" is already used by another device`);
+          return;
+        }
         await chrome.runtime.sendMessage({
           type: 'RENAME_DEVICE',
           deviceId: dev.deviceId,
