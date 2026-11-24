@@ -311,12 +311,27 @@ async function syncPending() {
     }
     if (!res.ok) return;
     const data = await res.json();
+
+    if (Array.isArray(data.deletedIds) && data.deletedIds.length > 0) {
+      const delSet = new Set(data.deletedIds);
+      const removed = cfg.history.filter((m) => delSet.has(m.id));
+      if (removed.length > 0) {
+        for (const r of removed) {
+          if (r.blobId) await deleteExtBlob(r.blobId).catch(() => {});
+        }
+        await chrome.storage.local.set({
+          history: cfg.history.filter((m) => !delSet.has(m.id)),
+        });
+      }
+    }
+
     if (!data.messages?.length) return;
 
     let maxTs = cfg.lastSeenTs;
     for (const env of data.messages) {
       try {
         const decrypted = await decryptEnvelope(cfg.keyB64, roomId, env);
+        const isSelf = env.senderId === cfg.deviceId;
         let item = {
           id: env.id,
           senderId: env.senderId,
@@ -333,13 +348,14 @@ async function syncPending() {
           mimeType: decrypted.mimeType,
           fileSize: decrypted.fileSize,
           expiresAt: decrypted.expiresAt,
-          direction: 'in',
+          direction: isSelf ? 'out' : 'in',
+          status: isSelf ? 'delivered' : undefined,
         };
         if (item.expiresAt && item.expiresAt <= Date.now()) continue;
         if (item.ts > maxTs) maxTs = item.ts;
         item = await hydrateLongTextIfNeeded(item, cfg);
         const added = await appendHistory(item);
-        if (added) {
+        if (added && !isSelf && cfg.lastSeenTs > 0) {
           await handleIncoming(item, cfg.autoOpen);
         }
       } catch {
@@ -460,6 +476,18 @@ async function connect() {
         if (parsed.type === 'devices_updated') {
           await refreshDevices();
           await chrome.storage.local.set({ devicesUpdatedAt: Date.now() }).catch(() => {});
+          return;
+        }
+        if (parsed.type === 'message_deleted' && parsed.id) {
+          const { history } = await getConfig();
+          const target = history.find((m) => m.id === parsed.id);
+          const bId = parsed.blobId || target?.blobId;
+          if (bId) await deleteExtBlob(bId).catch(() => {});
+          if (target) {
+            await chrome.storage.local.set({
+              history: history.filter((m) => m.id !== parsed.id),
+            });
+          }
           return;
         }
         if (parsed.type === 'delivered' && Array.isArray(parsed.ids)) {
@@ -1139,13 +1167,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
 
     if (msg.type === 'DELETE_MESSAGE') {
-      const { history } = await getConfig();
-      const target = history.find((m) => m.id === msg.id);
+      const cfg = await getConfig();
+      const target = cfg.history.find((m) => m.id === msg.id);
       if (target?.blobId) {
         await deleteExtBlob(target.blobId).catch(() => {});
       }
-      const next = history.filter((m) => m.id !== msg.id);
+      const next = cfg.history.filter((m) => m.id !== msg.id);
       await chrome.storage.local.set({ history: next });
+      if (cfg.serverUrl && cfg.keyB64 && cfg.deviceToken && msg.id) {
+        const roomId = await deriveRoomId(cfg.keyB64);
+        const base = new URL(cfg.serverUrl);
+        await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/delete-message`, {
+          method: 'POST',
+          headers: authHeaders(cfg, { 'content-type': 'application/json' }),
+          body: JSON.stringify({ messageId: msg.id, blobId: target?.blobId }),
+        }).catch(() => {});
+      }
       sendResponse({ ok: true });
       return;
     }

@@ -248,6 +248,8 @@ export default function App() {
   const [undoDelete, setUndoDelete] = createSignal<{ msg: StoredMessage; index: number } | null>(
     null,
   );
+  const [nameConflictDraft, setNameConflictDraft] = createSignal<string>('');
+  const [showNameConflict, setShowNameConflict] = createSignal<boolean>(false);
   const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0';
 
   let chatStreamEl: HTMLElement | undefined;
@@ -645,6 +647,44 @@ export default function App() {
     }
   }
 
+  function pickUniqueDeviceColor(roomDevices: PairedDevice[], myId: string): number {
+    const used = new Set<number>();
+    for (const d of roomDevices) {
+      if (d.deviceId === myId) continue;
+      used.add(d.color ?? deviceColorIndex(d.deviceId));
+    }
+    for (const opt of DEVICE_COLOR_OPTIONS) {
+      if (!used.has(opt.index)) return opt.index;
+    }
+    return roomDevices.length % DEVICE_COLOR_OPTIONS.length;
+  }
+
+  function hasDuplicateDeviceName(
+    candidate: string,
+    roomDevices: PairedDevice[],
+    excludeId: string,
+  ): boolean {
+    const norm = candidate.trim().toLowerCase();
+    if (!norm) return false;
+    return roomDevices.some(
+      (d) => d.deviceId !== excludeId && d.name.trim().toLowerCase() === norm,
+    );
+  }
+
+  function suggestUniqueDeviceName(
+    baseName: string,
+    roomDevices: PairedDevice[],
+    excludeId: string,
+  ): string {
+    const clean = baseName.trim() || defaultDeviceName(localOs);
+    if (!hasDuplicateDeviceName(clean, roomDevices, excludeId)) return clean;
+    for (let n = 2; n <= 99; n++) {
+      const candidate = `${clean} ${n}`;
+      if (!hasDuplicateDeviceName(candidate, roomDevices, excludeId)) return candidate;
+    }
+    return `${clean} ${Math.floor(Math.random() * 900 + 100)}`;
+  }
+
   async function syncPending(
     rid = roomId(),
     k = keyB64(),
@@ -652,6 +692,7 @@ export default function App() {
     tok = deviceToken(),
   ) {
     if (!rid || !k || !myId || !tok) return;
+    if (import.meta.env.DEV && localDemo()) return;
     try {
       const since = (await kvGet<number>('lastSeenTs')) || 0;
       const res = await fetch(
@@ -663,13 +704,30 @@ export default function App() {
         return;
       }
       if (!res.ok) return;
-      const data = (await res.json()) as { messages: EncryptedEnvelope[] };
+      const data = (await res.json()) as {
+        messages?: EncryptedEnvelope[];
+        deletedIds?: string[];
+      };
+
+      // Apply global deletions that happened while offline
+      if (Array.isArray(data.deletedIds) && data.deletedIds.length > 0) {
+        const delSet = new Set(data.deletedIds);
+        const toRemove = messages().filter((m) => delSet.has(m.id));
+        for (const m of toRemove) {
+          await deleteMessage(m.id, m.blobId).catch(() => {});
+        }
+        if (toRemove.length > 0) {
+          setMessages((prev) => prev.filter((m) => !delSet.has(m.id)));
+        }
+      }
+
       if (!data.messages?.length) return;
 
       let maxTs = since;
       for (const env of data.messages) {
         try {
           const decrypted = await decryptEnvelope(k, rid, env);
+          const isSelf = env.senderId === myId;
           let item: StoredMessage = {
             id: env.id,
             senderId: env.senderId,
@@ -686,7 +744,8 @@ export default function App() {
             mimeType: decrypted.mimeType,
             fileSize: decrypted.fileSize,
             expiresAt: decrypted.expiresAt,
-            direction: 'in',
+            direction: isSelf ? 'out' : 'in',
+            status: isSelf ? 'delivered' : undefined,
           };
           if (item.expiresAt && item.expiresAt <= Date.now()) continue;
           if (item.ts > maxTs) maxTs = item.ts;
@@ -694,7 +753,7 @@ export default function App() {
           await saveMessage(item);
           addOrUpdateMessage(item);
           item = await ensureBlobHydrated(item, rid, k, myId, tok);
-          if (!existed) {
+          if (!existed && !isSelf && since > 0) {
             handleIncomingAction(item);
           }
         } catch {
@@ -732,7 +791,7 @@ export default function App() {
       ]);
       const enc = await encryptJson(
         freshKey,
-        { name: cleanName, os: localOs } satisfies DeviceMeta,
+        { name: cleanName, os: localOs, color: 0 } satisfies DeviceMeta,
         deviceAad(rid, devId),
       );
       const headers: Record<string, string> = { 'content-type': 'application/json' };
@@ -846,7 +905,11 @@ export default function App() {
       await Promise.all([
         kvSet('keyB64', targetKeyB64),
         kvSet('deviceToken', data.deviceToken),
+        kvSet('lastSeenTs', 0),
+        clearMessages(),
       ]);
+      setMessages([]);
+      setBlobUrls({});
       setKeyB64(targetKeyB64);
       setRoomId(rid);
       setDeviceToken(data.deviceToken);
@@ -860,7 +923,26 @@ export default function App() {
       setInviteToken('');
       setInviteExpiresAt(0);
       setView('chat');
+
+      const roomDevices = await refreshDevices(rid, targetKeyB64, devId, data.deviceToken);
+      const uniqueColor = pickUniqueDeviceColor(roomDevices, devId);
+      await updateDeviceRecord(
+        rid,
+        targetKeyB64,
+        devId,
+        cleanName,
+        localOs,
+        uniqueColor,
+        devId,
+        data.deviceToken,
+      );
       await refreshDevices(rid, targetKeyB64, devId, data.deviceToken);
+
+      if (hasDuplicateDeviceName(cleanName, roomDevices, devId)) {
+        setNameConflictDraft(suggestUniqueDeviceName(cleanName, roomDevices, devId));
+        setShowNameConflict(true);
+      }
+
       await syncPending(rid, targetKeyB64, devId, data.deviceToken);
       notify('Devices paired!');
       return true;
@@ -1215,12 +1297,13 @@ export default function App() {
       const expiryTimer = window.setInterval(async () => {
         const now = Date.now();
         setNowTick(now);
+        const expiredInMem = messages().filter((m) => m.expiresAt && m.expiresAt <= now);
         const removed = await pruneExpiredMessages().catch(() => [] as string[]);
-        if (removed.length > 0) {
-          const removedSet = new Set(removed);
+        if (removed.length > 0 || expiredInMem.length > 0) {
+          const removedSet = new Set([...removed, ...expiredInMem.map((m) => m.id)]);
           setMessages((prev) => prev.filter((m) => !removedSet.has(m.id)));
         }
-      }, 5000);
+      }, 2000);
 
       (async () => {
         await registerServiceWorker().catch(() => {});
@@ -1551,6 +1634,24 @@ export default function App() {
               } else {
                 await refreshDevices(rid, k, did, tok);
               }
+              return;
+            }
+            if (parsed.type === 'message_deleted' && typeof (parsed as { id?: string }).id === 'string') {
+              const delId = (parsed as { id: string; blobId?: string }).id;
+              const delBlobId = (parsed as { id: string; blobId?: string }).blobId;
+              const existing = messages().find((m) => m.id === delId);
+              await deleteMessage(delId, delBlobId || existing?.blobId).catch(() => {});
+              const bId = delBlobId || existing?.blobId;
+              if (bId && blobUrls()[bId]) {
+                URL.revokeObjectURL(blobUrls()[bId]);
+                setBlobUrls((prev) => {
+                  const next = { ...prev };
+                  delete next[bId];
+                  return next;
+                });
+              }
+              setMessages((prev) => prev.filter((m) => m.id !== delId));
+              postTabSync({ type: 'msg_deleted', id: delId });
               return;
             }
             if (parsed.type === 'delivered' && Array.isArray(parsed.ids)) {
@@ -2028,6 +2129,10 @@ export default function App() {
 
   async function saveEditedDevice(dev: PairedDevice) {
     const nextName = editDeviceDraft().trim() || defaultDeviceName(dev.os);
+    if (hasDuplicateDeviceName(nextName, devices(), dev.deviceId)) {
+      notify(`"${nextName}" is already used by another device`);
+      return;
+    }
     setEditingDeviceId(null);
     if (dev.deviceId === deviceId()) {
       setDeviceName(nextName);
@@ -2043,6 +2148,31 @@ export default function App() {
     await updateDeviceRecord(roomId(), keyB64(), dev.deviceId, nextName, dev.os, dev.color);
     await refreshDevices();
     notify(`Renamed to "${nextName}"`);
+  }
+
+  async function saveUniqueConflictName() {
+    const nextName = nameConflictDraft().trim();
+    const myId = deviceId();
+    if (!nextName) {
+      notify('Enter a device name');
+      return;
+    }
+    if (hasDuplicateDeviceName(nextName, devices(), myId)) {
+      notify(`"${nextName}" is already used by another device in this room`);
+      return;
+    }
+    const me = devices().find((d) => d.deviceId === myId);
+    const color = me?.color ?? pickUniqueDeviceColor(devices(), myId);
+    setDeviceName(nextName);
+    setShowNameConflict(false);
+    if (!(import.meta.env.DEV && localDemo())) {
+      await kvSet('deviceName', nextName);
+      await updateDeviceRecord(roomId(), keyB64(), myId, nextName, localOs, color);
+      await refreshDevices();
+    } else {
+      setDevices((prev) => prev.map((d) => (d.deviceId === myId ? { ...d, name: nextName } : d)));
+    }
+    notify(`Device named "${nextName}"`);
   }
 
   async function setDeviceColor(dev: PairedDevice, colorIdx: number) {
@@ -2154,6 +2284,16 @@ export default function App() {
   async function commitDeleteMessage(target: StoredMessage) {
     if (!(import.meta.env.DEV && localDemo())) {
       await deleteMessage(target.id, target.blobId).catch(() => {});
+      const rid = roomId();
+      const did = deviceId();
+      const tok = deviceToken();
+      if (rid && did && tok && !target.id.startsWith('opt-')) {
+        await fetch(`/api/room/${encodeURIComponent(rid)}/delete-message`, {
+          method: 'POST',
+          headers: authHeaders(did, tok, { 'content-type': 'application/json' }),
+          body: JSON.stringify({ messageId: target.id, blobId: target.blobId }),
+        }).catch(() => {});
+      }
     }
     if (target.blobId) {
       const existingUrl = blobUrls()[target.blobId];
@@ -2563,6 +2703,41 @@ export default function App() {
 
       <Show when={popupWarning() && view() === 'chat' && isPaired()}>
         <div class="banner warning">{popupWarning()}</div>
+      </Show>
+
+      <Show when={showNameConflict()}>
+        <div class="modal-backdrop">
+          <form
+            class="confirm-modal"
+            onSubmit={(e) => {
+              e.preventDefault();
+              saveUniqueConflictName();
+            }}
+          >
+            <h2>Choose a unique device name</h2>
+            <p class="muted">
+              Another device in this room is already named <strong>{deviceName()}</strong>. Give this device a distinct name so you can tell them apart.
+            </p>
+            <input
+              class="setup-input"
+              type="text"
+              maxlength={24}
+              value={nameConflictDraft()}
+              onInput={(e) => setNameConflictDraft(e.currentTarget.value)}
+              autofocus
+            />
+            <button
+              class="btn primary"
+              type="submit"
+              disabled={
+                !nameConflictDraft().trim() ||
+                hasDuplicateDeviceName(nameConflictDraft(), devices(), deviceId())
+              }
+            >
+              Save Device Name
+            </button>
+          </form>
+        </div>
       </Show>
 
       <Show when={pendingDelete()}>
@@ -3442,9 +3617,9 @@ export default function App() {
                       >
                         <div
                           class={`swipe-delete-bg ${swipe() && swipe()!.offset < -10 ? 'visible' : ''} ${swipe()?.armed ? 'armed' : ''}`}
+                          aria-hidden="true"
                         >
-                          <LucideIcon icon={Trash2} size={15} />
-                          <span>{swipe()?.armed ? 'Release to delete' : 'Swipe to delete'}</span>
+                          <LucideIcon icon={Trash2} size={19} />
                         </div>
                         <div
                           class={`swipe-content ${msg.direction} ${swipe()?.snapping ? 'snapping' : ''}`}

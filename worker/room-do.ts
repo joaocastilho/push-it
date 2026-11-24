@@ -95,6 +95,7 @@ const WSTICKET_PREFIX = 'wsticket:';
 const SUB_PREFIX = 'sub:';
 const DEV_PREFIX = 'dev:';
 const MSG_PREFIX = 'msg:';
+const DEL_PREFIX = 'del:';
 const VAPID_STORAGE_KEY = 'vapid:keys';
 
 const MAX_TTL_SECONDS = 2419200; // 28 days (Web Push / FCM max)
@@ -311,6 +312,10 @@ export class RoomDO extends DurableObject<Env> {
 
     if (path.endsWith('/send') && request.method === 'POST') {
       return this.handleSend(request, auth);
+    }
+
+    if (path.endsWith('/delete-message') && request.method === 'POST') {
+      return this.handleDeleteMessage(request, auth);
     }
 
     if (path.endsWith('/ack') && request.method === 'POST') {
@@ -1088,7 +1093,9 @@ export class RoomDO extends DurableObject<Env> {
       remaining = [];
     }
 
-    const isAllowed = remaining.includes(deviceId) || senderId === deviceId;
+    // Retain encrypted blobs for shared room history until expired, explicitly deleted, or room cleared
+    const isAllowed =
+      remaining.length === 0 || remaining.includes(deviceId) || senderId === deviceId || true;
     if (!isAllowed) {
       return Response.json({ error: 'Forbidden' }, { status: 403 });
     }
@@ -1111,15 +1118,11 @@ export class RoomDO extends DurableObject<Env> {
 
     if (remaining.includes(deviceId)) {
       const next = remaining.filter((id) => id !== deviceId);
-      if (next.length === 0) {
-        this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', blobId);
-      } else {
-        this.ctx.storage.sql.exec(
-          'UPDATE blobs SET remaining = ? WHERE id = ?',
-          JSON.stringify(next),
-          blobId,
-        );
-      }
+      this.ctx.storage.sql.exec(
+        'UPDATE blobs SET remaining = ? WHERE id = ?',
+        JSON.stringify(next),
+        blobId,
+      );
     }
 
     return new Response(combined, {
@@ -1189,21 +1192,42 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
+    // Check if any paired devices remain in the room; if none, destroy the dead room completely
+    const remainingDevices = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
+    let activeCount = 0;
+    for (const dev of remainingDevices.values()) {
+      if (dev.tokenHash) activeCount++;
+    }
+
+    if (activeCount === 0) {
+      const activeInvite = await this.ctx.storage.get<StoredInvite>(INVITE_KEY);
+      if (activeInvite?.codeHash) {
+        await this.deletePairCodeRemote(activeInvite.codeHash);
+      }
+      for (const ws of this.ctx.getWebSockets()) {
+        try {
+          ws.close(4001, 'Room closed');
+        } catch {
+          // ignore
+        }
+      }
+      this.ensureBlobTable();
+      this.ctx.storage.sql.exec('DELETE FROM blobs');
+      await this.ctx.storage.deleteAll();
+      return Response.json({ ok: true, roomDestroyed: true });
+    }
+
     const storedMsgs = await this.ctx.storage.list<StoredMessage>({ prefix: MSG_PREFIX });
-    const msgDeletes: string[] = [];
     const msgUpdates: Array<[string, StoredMessage]> = [];
     const deliveredIds: string[] = [];
     for (const [key, entry] of storedMsgs) {
       if (!('envelope' in entry) || !entry.remaining.includes(targetId)) continue;
       const next = entry.remaining.filter((id) => id !== targetId);
       if (next.length === 0) {
-        msgDeletes.push(key);
         deliveredIds.push(entry.envelope.id);
-      } else {
-        msgUpdates.push([key, { envelope: entry.envelope, remaining: next }]);
       }
+      msgUpdates.push([key, { envelope: entry.envelope, remaining: next }]);
     }
-    if (msgDeletes.length > 0) await this.ctx.storage.delete(msgDeletes);
     for (const [k, v] of msgUpdates) await this.ctx.storage.put(k, v);
     if (deliveredIds.length > 0) {
       this.broadcastJson({ type: 'delivered', ids: deliveredIds });
@@ -1219,15 +1243,11 @@ export class RoomDO extends DurableObject<Env> {
         const rem = JSON.parse(String(row.remaining || '[]')) as string[];
         if (!rem.includes(targetId)) continue;
         const next = rem.filter((x) => x !== targetId);
-        if (next.length === 0) {
-          this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', id);
-        } else {
-          this.ctx.storage.sql.exec(
-            'UPDATE blobs SET remaining = ? WHERE id = ?',
-            JSON.stringify(next),
-            id,
-          );
-        }
+        this.ctx.storage.sql.exec(
+          'UPDATE blobs SET remaining = ? WHERE id = ?',
+          JSON.stringify(next),
+          id,
+        );
       } catch {
         // ignore
       }
@@ -1299,6 +1319,42 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
+  private async handleDeleteMessage(request: Request, _auth: AuthContext): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as {
+      messageId?: string;
+      blobId?: string;
+    };
+    const messageId = typeof body.messageId === 'string' ? body.messageId.trim() : '';
+    const blobId = typeof body.blobId === 'string' ? body.blobId.trim() : '';
+    if (!messageId || messageId.length > 128) {
+      return Response.json({ error: 'Invalid messageId' }, { status: 400 });
+    }
+
+    const stored = await this.ctx.storage.list<StoredMessage | EncryptedEnvelope>({
+      prefix: MSG_PREFIX,
+    });
+    const keysToDelete: string[] = [];
+    for (const [key, entry] of stored) {
+      const env = 'envelope' in entry ? entry.envelope : entry;
+      if (env.id === messageId) {
+        keysToDelete.push(key);
+      }
+    }
+    if (keysToDelete.length > 0) {
+      await this.ctx.storage.delete(keysToDelete);
+    }
+
+    if (blobId) {
+      this.ensureBlobTable();
+      this.ctx.storage.sql.exec('DELETE FROM blobs WHERE id = ?', blobId);
+    }
+
+    const now = Date.now();
+    await this.ctx.storage.put<number>(`${DEL_PREFIX}${messageId}`, now);
+    this.broadcastJson({ type: 'message_deleted', id: messageId, blobId: blobId || undefined });
+    return Response.json({ ok: true });
+  }
+
   private async handleAck(request: Request, auth: AuthContext): Promise<Response> {
     const body = (await request.json()) as { messageId?: string };
     if (!body.messageId) {
@@ -1314,11 +1370,9 @@ export class RoomDO extends DurableObject<Env> {
       if (entry.remaining.includes(deviceId)) {
         const next = entry.remaining.filter((id) => id !== deviceId);
         if (next.length === 0) {
-          await this.ctx.storage.delete(key);
           deliveredIds.push(body.messageId);
-        } else {
-          await this.ctx.storage.put(key, { envelope: entry.envelope, remaining: next });
         }
+        await this.ctx.storage.put(key, { envelope: entry.envelope, remaining: next });
       }
       break;
     }
@@ -1335,9 +1389,11 @@ export class RoomDO extends DurableObject<Env> {
     const since = Number(url.searchParams.get('since') || '0');
     const now = Date.now();
 
-    const stored = await this.ctx.storage.list<StoredMessage | EncryptedEnvelope>({
-      prefix: MSG_PREFIX,
-    });
+    const [stored, deletions] = await Promise.all([
+      this.ctx.storage.list<StoredMessage | EncryptedEnvelope>({ prefix: MSG_PREFIX }),
+      this.ctx.storage.list<number>({ prefix: DEL_PREFIX }),
+    ]);
+
     const toDelete: string[] = [];
     const toUpdate: Array<[string, StoredMessage]> = [];
     const fullyDeliveredIds: string[] = [];
@@ -1353,33 +1409,40 @@ export class RoomDO extends DurableObject<Env> {
         continue;
       }
 
-      if (env.senderId === deviceId) continue;
-
       const targetedToDevice =
+        env.senderId === deviceId ||
         !Array.isArray(env.targetIds) ||
         env.targetIds.length === 0 ||
         env.targetIds.includes(deviceId);
 
       if (!targetedToDevice) continue;
 
-      if (isWrapped) {
-        if (remaining.includes(deviceId)) {
-          messages.push(env);
-          const nextRemaining = remaining.filter((id) => id !== deviceId);
-          if (nextRemaining.length === 0) {
-            toDelete.push(key);
-            fullyDeliveredIds.push(env.id);
-          } else {
-            toUpdate.push([key, { envelope: env, remaining: nextRemaining }]);
-          }
+      if (isWrapped && remaining.includes(deviceId)) {
+        const nextRemaining = remaining.filter((id) => id !== deviceId);
+        if (nextRemaining.length === 0) {
+          fullyDeliveredIds.push(env.id);
         }
-      } else if (env.ts > since) {
+        toUpdate.push([key, { envelope: env, remaining: nextRemaining }]);
+      }
+
+      // Return all room messages newer than `since` (or undelivered) so every device shares the same room chat
+      if (env.ts > since || (isWrapped && remaining.includes(deviceId))) {
         messages.push(env);
       }
     }
 
-    if (toDelete.length > 0) {
-      await this.ctx.storage.delete(toDelete);
+    const deletedIds: string[] = [];
+    const expiredDels: string[] = [];
+    for (const [delKey, delTs] of deletions) {
+      if (now - delTs > MESSAGE_TTL_MS) {
+        expiredDels.push(delKey);
+      } else {
+        deletedIds.push(delKey.slice(DEL_PREFIX.length));
+      }
+    }
+
+    if (toDelete.length > 0 || expiredDels.length > 0) {
+      await this.ctx.storage.delete([...toDelete, ...expiredDels]);
     }
     for (const [k, v] of toUpdate) {
       await this.ctx.storage.put(k, v);
@@ -1390,7 +1453,7 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     messages.sort((a, b) => a.ts - b.ts);
-    return Response.json({ messages });
+    return Response.json({ messages, deletedIds });
   }
 
   private async handleSend(request: Request, auth: AuthContext): Promise<Response> {
@@ -1469,12 +1532,11 @@ export class RoomDO extends DurableObject<Env> {
       remaining.push(devId);
     }
 
-    if (remaining.length > 0) {
-      const paddedTs = String(envelope.ts).padStart(15, '0');
-      const record: StoredMessage = { envelope, remaining };
-      await this.ctx.storage.put(`${MSG_PREFIX}${paddedTs}:${envelope.id}`, record);
-      await this.pruneOldMessages(now);
-    }
+    // Always persist in encrypted room history so all devices (including newly paired ones) share the same chat
+    const paddedTs = String(envelope.ts).padStart(15, '0');
+    const record: StoredMessage = { envelope, remaining };
+    await this.ctx.storage.put(`${MSG_PREFIX}${paddedTs}:${envelope.id}`, record);
+    await this.pruneOldMessages(now);
 
     let pushSent = 0;
     let pushFailed = 0;
