@@ -1147,5 +1147,13 @@ setInterval(() => {
   renderHistory(allHistory);
 }, 5000);
 
+// Live-sync open popup whenever background receives messages or device updates
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.history || changes.devicesUpdatedAt || changes.deviceName || changes.revokedNotice) {
+    refresh();
+  }
+});
+
 chrome.runtime.sendMessage({ type: 'MARK_READ' }).catch(() => {});
 refresh();

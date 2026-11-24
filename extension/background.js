@@ -258,6 +258,7 @@ async function refreshDevices() {
     }
     cachedDevices = list;
     setupContextMenus();
+    await chrome.storage.local.set({ devicesUpdatedAt: Date.now() }).catch(() => {});
     return list;
   } catch {
     return cachedDevices;

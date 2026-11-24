@@ -12,7 +12,7 @@ export interface StoredMessage {
   content: string;
   title?: string;
   direction: 'in' | 'out';
-  status?: 'queued' | 'delivered';
+  status?: 'sending' | 'queued' | 'delivered' | 'failed';
   blobId?: string;
   blobIv?: string;
   fileName?: string;

@@ -1,5 +1,27 @@
 import { createEffect, createMemo, createSignal, For, Show } from 'solid-js';
-import { Check, Copy, Download, ExternalLink, Trash2 } from 'lucide';
+import {
+  ArrowDown,
+  ArrowLeft,
+  Check,
+  Copy,
+  Download,
+  ExternalLink,
+  FileText,
+  Flame,
+  Globe,
+  Paperclip,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Send,
+  Settings,
+  ShieldCheck,
+  Sparkles,
+  Trash2,
+  Upload,
+  WifiOff,
+  X,
+} from 'lucide';
 import QRCode from 'qrcode';
 import { DigitCodeInput } from './components/DigitCodeInput';
 import { LucideIcon } from './components/LucideIcon';
@@ -63,6 +85,7 @@ import {
   subscribePush,
   unsubscribePush,
 } from './lib/push';
+import { createLocalDemoData } from './lib/devDemo';
 
 interface PairedDevice {
   deviceId: string;
@@ -98,6 +121,29 @@ function formatCountdown(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function getDayKey(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+function formatDayLabel(ts: number): string {
+  const d = new Date(ts);
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  if (getDayKey(ts) === getDayKey(today.getTime())) return 'Today';
+  if (getDayKey(ts) === getDayKey(yesterday.getTime())) return 'Yesterday';
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: d.getFullYear() !== today.getFullYear() ? 'numeric' : undefined });
+}
+
+function extractHostname(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    return 'Link';
+  }
 }
 
 function isNewerVersion(candidate: string | null | undefined, current: string): boolean {
@@ -191,11 +237,32 @@ export default function App() {
   const [popupWarning, setPopupWarning] = createSignal<string>('');
   const [unreadCount, setUnreadCount] = createSignal<number>(0);
   const [serverVersion, setServerVersion] = createSignal<string | null>(null);
+  const [localDemo, setLocalDemo] = createSignal<boolean>(false);
+  const [newlyJoinedId, setNewlyJoinedId] = createSignal<string | null>(null);
+  const [isNearBottom, setIsNearBottom] = createSignal<boolean>(true);
+  const [unseenIncoming, setUnseenIncoming] = createSignal<number>(0);
+  const [dragActive, setDragActive] = createSignal<boolean>(false);
+  const [reconnectNonce, setReconnectNonce] = createSignal<number>(0);
+  const [undoDelete, setUndoDelete] = createSignal<{ msg: StoredMessage; index: number } | null>(
+    null,
+  );
   const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0';
 
+  let chatStreamEl: HTMLElement | undefined;
   let chatEndEl: HTMLDivElement | undefined;
   let fileInputEl: HTMLInputElement | undefined;
   let searchInputEl: HTMLInputElement | undefined;
+  let composerEl: HTMLTextAreaElement | undefined;
+  let dragDepth = 0;
+  let undoTimer: number | undefined;
+  let newlyJoinedTimer: number | undefined;
+  let syncChannel: BroadcastChannel | null = null;
+
+  function syncComposerHeight() {
+    if (!composerEl) return;
+    composerEl.style.height = 'auto';
+    composerEl.style.height = `${Math.min(composerEl.scrollHeight, 140)}px`;
+  }
   let toastTimer: number | undefined;
   let copiedTimer: number | undefined;
   let activeTouch: {
@@ -219,10 +286,40 @@ export default function App() {
     toastTimer = window.setTimeout(() => setToast(''), durationMs);
   }
 
-  function scrollToBottom() {
+  function postTabSync(payload: Record<string, unknown>) {
+    try {
+      syncChannel?.postMessage(payload);
+    } catch {
+      // ignore BroadcastChannel failures
+    }
+  }
+
+  function highlightNewDevice(id: string) {
+    setNewlyJoinedId(id);
+    if (newlyJoinedTimer) window.clearTimeout(newlyJoinedTimer);
+    newlyJoinedTimer = window.setTimeout(() => {
+      if (newlyJoinedId() === id) setNewlyJoinedId(null);
+    }, 4500);
+  }
+
+  function scrollToBottom(force = true) {
+    if (!force && !isNearBottom()) return;
+    setUnseenIncoming(0);
+    setIsNearBottom(true);
     requestAnimationFrame(() => {
       chatEndEl?.scrollIntoView({ behavior: 'smooth', block: 'end' });
     });
+  }
+
+  function handleChatScroll() {
+    if (!chatStreamEl) return;
+    const distance =
+      chatStreamEl.scrollHeight - chatStreamEl.scrollTop - chatStreamEl.clientHeight;
+    const near = distance < 120;
+    setIsNearBottom(near);
+    if (near && unseenIncoming() > 0) {
+      setUnseenIncoming(0);
+    }
   }
 
   const otherDevices = createMemo(() =>
@@ -378,6 +475,85 @@ export default function App() {
     }
   }
 
+  async function applyEncryptedDevicesSnapshot(
+    rawDevices: Array<{
+      deviceId: string;
+      iv: string;
+      ciphertext: string;
+      updatedAt: number;
+      lastSeenAt?: number;
+      online: boolean;
+    }>,
+    pinEnabled: boolean | undefined,
+    rid = roomId(),
+    k = keyB64(),
+    myId = deviceId(),
+    joinedDeviceId?: string,
+  ): Promise<PairedDevice[]> {
+    if (typeof pinEnabled === 'boolean') {
+      setRoomPinEnabled(pinEnabled);
+    }
+
+    const prevIds = new Set(devices().map((d) => d.deviceId));
+    const decrypted: PairedDevice[] = [];
+    for (const d of rawDevices) {
+      try {
+        const meta = await decryptJson<Partial<DeviceMeta>>(
+          k,
+          d.iv,
+          d.ciphertext,
+          deviceAad(rid, d.deviceId),
+        );
+        const os = normalizeOs(meta.os);
+        const name = meta.name ? String(meta.name) : defaultDeviceName(os);
+        const color = normalizeDeviceColor(meta.color);
+        decrypted.push({
+          deviceId: d.deviceId,
+          name,
+          os,
+          color,
+          online: d.online,
+          updatedAt: d.updatedAt,
+          lastSeenAt: d.lastSeenAt || d.updatedAt,
+        });
+        if (d.deviceId === myId && name !== deviceName()) {
+          setDeviceName(name);
+          await kvSet('deviceName', name);
+        }
+      } catch {
+        // Ignore devices with another key
+      }
+    }
+
+    setDevices(decrypted);
+    await kvSet('cachedDevices', decrypted).catch(() => {});
+    const validIds = new Set(decrypted.map((d) => d.deviceId));
+    setSelectedTargets((prev) => prev.filter((id) => validIds.has(id) && id !== myId));
+
+    // Detect newly added device for instant UI feedback without refresh
+    const addedDev =
+      (joinedDeviceId && joinedDeviceId !== myId
+        ? decrypted.find((d) => d.deviceId === joinedDeviceId)
+        : undefined) ||
+      (prevIds.size > 0
+        ? decrypted.find((d) => d.deviceId !== myId && !prevIds.has(d.deviceId))
+        : undefined);
+
+    if (addedDev) {
+      highlightNewDevice(addedDev.deviceId);
+      if (showAddDevice()) {
+        setShowAddDevice(false);
+        setInviteCode('');
+        setInviteToken('');
+        setInviteExpiresAt(0);
+        setQrDataUrl('');
+      }
+      notify(`${addedDev.name} joined the room!`);
+    }
+
+    return decrypted;
+  }
+
   async function refreshDevices(
     rid = roomId(),
     k = keyB64(),
@@ -385,6 +561,7 @@ export default function App() {
     tok = deviceToken(),
   ): Promise<PairedDevice[]> {
     if (!rid || !k || !myId || !tok) return [];
+    if (import.meta.env.DEV && localDemo()) return devices();
     try {
       const res = await fetch(`/api/room/${encodeURIComponent(rid)}/devices`, {
         headers: authHeaders(myId, tok),
@@ -405,45 +582,13 @@ export default function App() {
           online: boolean;
         }>;
       };
-      if (typeof data.pinEnabled === 'boolean') {
-        setRoomPinEnabled(data.pinEnabled);
-      }
-
-      const decrypted: PairedDevice[] = [];
-      for (const d of data.devices) {
-        try {
-          const meta = await decryptJson<Partial<DeviceMeta>>(
-            k,
-            d.iv,
-            d.ciphertext,
-            deviceAad(rid, d.deviceId),
-          );
-          const os = normalizeOs(meta.os);
-          const name = meta.name ? String(meta.name) : defaultDeviceName(os);
-          const color = normalizeDeviceColor(meta.color);
-          decrypted.push({
-            deviceId: d.deviceId,
-            name,
-            os,
-            color,
-            online: d.online,
-            updatedAt: d.updatedAt,
-            lastSeenAt: d.lastSeenAt || d.updatedAt,
-          });
-          if (d.deviceId === myId && name !== deviceName()) {
-            setDeviceName(name);
-            await kvSet('deviceName', name);
-          }
-        } catch {
-          // Ignore devices with another key
-        }
-      }
-
-      setDevices(decrypted);
-      await kvSet('cachedDevices', decrypted).catch(() => {});
-      const validIds = new Set(decrypted.map((d) => d.deviceId));
-      setSelectedTargets((prev) => prev.filter((id) => validIds.has(id) && id !== myId));
-      return decrypted;
+      return await applyEncryptedDevicesSnapshot(
+        data.devices,
+        data.pinEnabled,
+        rid,
+        k,
+        myId,
+      );
     } catch {
       return devices();
     }
@@ -747,7 +892,36 @@ export default function App() {
     }
   }
 
+  function enterLocalDemo(devId = deviceId(), devName = deviceName()) {
+    if (!import.meta.env.DEV) return;
+    const id = devId || 'demo-local-device';
+    const name = devName.trim() || defaultDeviceName(localOs);
+    const demo = createLocalDemoData(id, name, localOs);
+    setDeviceId(id);
+    setDeviceName(name);
+    setKeyB64('local-demo-key');
+    setRoomId('local-demo-room');
+    setDeviceToken('local-demo-token');
+    setDevices(demo.devices);
+    setMessages(demo.messages);
+    setLocalDemo(true);
+    setWsStatus('connected');
+    setSetupNotice('');
+    setView('chat');
+    setBooting(false);
+    scrollToBottom();
+  }
+
   async function createPairingInvite() {
+    if (import.meta.env.DEV && localDemo()) {
+      const code = generateSixDigitCode();
+      const expiresAt = Date.now() + 5 * 60 * 1000;
+      setInviteCode(code);
+      setInviteToken('demo-invite-' + code);
+      setInviteExpiresAt(expiresAt);
+      setInviteSecondsLeft(300);
+      return;
+    }
     const rid = roomId();
     const did = deviceId();
     const tok = deviceToken();
@@ -807,6 +981,17 @@ export default function App() {
   }
 
   async function saveRoomPin(nextPin: string | null) {
+    if (import.meta.env.DEV && localDemo()) {
+      if (nextPin !== null && !isValidSixDigitCode(nextPin)) {
+        notify('Enter a 6-digit PIN');
+        return;
+      }
+      setRoomPinEnabled(Boolean(nextPin));
+      setEditingRoomPin(false);
+      setRoomPinDraft('');
+      notify(nextPin ? '6-digit Room PIN enabled' : 'Room PIN removed');
+      return;
+    }
     const rid = roomId();
     const did = deviceId();
     const tok = deviceToken();
@@ -842,6 +1027,21 @@ export default function App() {
   }
 
   async function leaveCurrentRoom() {
+    if (import.meta.env.DEV && localDemo()) {
+      setConfirmLeave(false);
+      setLocalDemo(false);
+      setDeviceToken('');
+      setKeyB64('');
+      setRoomId('');
+      setDevices([]);
+      setMessages([]);
+      setSelectedTargets([]);
+      setShowAddDevice(false);
+      setWsStatus('disconnected');
+      setView('chat');
+      notify('Exited demo room');
+      return;
+    }
     const rid = roomId();
     const did = deviceId();
     const tok = deviceToken();
@@ -880,8 +1080,62 @@ export default function App() {
         if (document.visibilityState === 'visible' && isPaired()) {
           updateBadge(0);
           syncPending();
+          refreshDevices();
+          if (wsStatus() !== 'connected') {
+            setReconnectNonce((n) => n + 1);
+          }
         }
       };
+
+      const onOnlineOrFocus = () => {
+        if (!isPaired()) return;
+        syncPending();
+        refreshDevices();
+        if (wsStatus() !== 'connected') {
+          setReconnectNonce((n) => n + 1);
+        }
+      };
+
+      const onGlobalKeyDown = (e: KeyboardEvent) => {
+        if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+          if (isPaired() && view() === 'chat') {
+            e.preventDefault();
+            const next = !searchOpen();
+            setSearchOpen(next);
+            if (!next) setSearchQuery('');
+            else requestAnimationFrame(() => searchInputEl?.focus());
+          }
+        } else if (e.key === 'Escape') {
+          if (pendingDelete()) setPendingDelete(null);
+          else if (searchOpen()) {
+            setSearchQuery('');
+            setSearchOpen(false);
+          }
+        }
+      };
+
+      if (typeof BroadcastChannel !== 'undefined') {
+        syncChannel = new BroadcastChannel('push-it-sync');
+        syncChannel.onmessage = (ev: MessageEvent) => {
+          const msg = ev.data as {
+            type?: string;
+            item?: StoredMessage;
+            id?: string;
+            ids?: string[];
+          };
+          if (!msg?.type) return;
+          if (msg.type === 'msg_added' && msg.item) {
+            addOrUpdateMessage(msg.item);
+          } else if (msg.type === 'msg_deleted' && msg.id) {
+            setMessages((prev) => prev.filter((m) => m.id !== msg.id));
+          } else if (msg.type === 'msg_cleared') {
+            setMessages([]);
+            setBlobUrls({});
+          } else if (msg.type === 'devices_changed') {
+            refreshDevices();
+          }
+        };
+      }
 
       const onBeforeInstall = (e: Event) => {
         e.preventDefault();
@@ -898,6 +1152,9 @@ export default function App() {
         navigator.serviceWorker.addEventListener('message', onSwMessage);
       }
       document.addEventListener('visibilitychange', onVisibility);
+      window.addEventListener('online', onOnlineOrFocus);
+      window.addEventListener('focus', onOnlineOrFocus);
+      window.addEventListener('keydown', onGlobalKeyDown);
       window.addEventListener('beforeinstallprompt', onBeforeInstall);
       window.addEventListener('appinstalled', onAppInstalled);
 
@@ -952,6 +1209,11 @@ export default function App() {
         setMessages(existingMsgs);
         setPushEnabled(Boolean(currentSub));
         await updateBadge(0);
+
+        if (import.meta.env.DEV && new URLSearchParams(window.location.search).get('demo') === '1') {
+          enterLocalDemo(devId, devName);
+          return;
+        }
 
         const rawHash = window.location.hash;
         if (rawHash && rawHash.includes('key=')) {
@@ -1038,18 +1300,31 @@ export default function App() {
           navigator.serviceWorker.removeEventListener('message', onSwMessage);
         }
         document.removeEventListener('visibilitychange', onVisibility);
+        window.removeEventListener('online', onOnlineOrFocus);
+        window.removeEventListener('focus', onOnlineOrFocus);
+        window.removeEventListener('keydown', onGlobalKeyDown);
         window.removeEventListener('beforeinstallprompt', onBeforeInstall);
         window.removeEventListener('appinstalled', onAppInstalled);
         window.clearInterval(expiryTimer);
+        syncChannel?.close();
+        syncChannel = null;
       };
     },
   );
 
-  // 2. Invite countdown timer + QR code generation
+  // 2. Invite countdown timer, QR code generation, and active Settings/Pairing sync
   createEffect(
-    () => [view(), showAddDevice(), pairUrl(), inviteExpiresAt()] as const,
-    ([activeView, adding, url, expiresAt]) => {
-      if (activeView === 'settings') {
+    () => [view(), showAddDevice(), pairUrl(), inviteExpiresAt(), isPaired()] as const,
+    ([activeView, adding, url, expiresAt, paired]) => {
+      let pairingPoll: number | undefined;
+
+      if (activeView === 'settings' && paired) {
+        refreshDevices();
+        if (adding && !(import.meta.env.DEV && localDemo())) {
+          pairingPoll = window.setInterval(() => {
+            refreshDevices();
+          }, 2500);
+        }
         fetch('/api/version', { cache: 'no-store' })
           .then((r) => (r.ok ? r.json() : null))
           .then((d: { version?: string; accessKeyRequired?: boolean } | null) => {
@@ -1063,7 +1338,9 @@ export default function App() {
 
       if (activeView !== 'settings' || !adding || !url) {
         setQrDataUrl('');
-        return;
+        return () => {
+          if (pairingPoll) window.clearInterval(pairingPoll);
+        };
       }
 
       QRCode.toDataURL(url, {
@@ -1084,14 +1361,21 @@ export default function App() {
       };
       tick();
       const timer = window.setInterval(tick, 1000);
-      return () => window.clearInterval(timer);
+      return () => {
+        window.clearInterval(timer);
+        if (pairingPoll) window.clearInterval(pairingPoll);
+      };
     },
   );
 
-  // 3. Authenticated live WebSocket connection using single-use WS ticket
+  // 3. Authenticated live WebSocket connection with heartbeat pong watchdog & instant device snapshots
   createEffect(
-    () => [roomId(), deviceId(), keyB64(), deviceToken()] as const,
-    ([rid, did, k, tok]) => {
+    () => [roomId(), deviceId(), keyB64(), deviceToken(), localDemo(), reconnectNonce()] as const,
+    ([rid, did, k, tok, isDemo]) => {
+      if (import.meta.env.DEV && isDemo) {
+        setWsStatus('connected');
+        return;
+      }
       if (!rid || !did || !k || !tok) {
         setWsStatus('disconnected');
         return;
@@ -1100,10 +1384,27 @@ export default function App() {
       let ws: WebSocket | null = null;
       let reconnectTimer: number | undefined;
       let pingTimer: number | undefined;
+      let pongTimer: number | undefined;
+      let retryDelay = 1200;
       let closed = false;
+
+      const clearTimers = () => {
+        if (pingTimer) window.clearInterval(pingTimer);
+        if (pongTimer) window.clearTimeout(pongTimer);
+        pingTimer = undefined;
+        pongTimer = undefined;
+      };
+
+      const scheduleReconnect = () => {
+        if (closed) return;
+        const delay = retryDelay;
+        retryDelay = Math.min(retryDelay * 1.7, 10000);
+        reconnectTimer = window.setTimeout(connect, delay);
+      };
 
       const connect = async () => {
         if (closed) return;
+        clearTimers();
         setWsStatus('connecting');
 
         let ticket = '';
@@ -1124,9 +1425,7 @@ export default function App() {
           if (!ticket) throw new Error('Missing ticket');
         } catch {
           setWsStatus('disconnected');
-          if (!closed) {
-            reconnectTimer = window.setTimeout(connect, 3000);
-          }
+          scheduleReconnect();
           return;
         }
 
@@ -1137,31 +1436,62 @@ export default function App() {
         ws = new WebSocket(wsUrl);
 
         ws.onopen = () => {
+          retryDelay = 1200;
           setWsStatus('connected');
           refreshDevices(rid, k, did, tok);
           syncPending(rid, k, did, tok);
           pingTimer = window.setInterval(() => {
-            if (ws && ws.readyState === WebSocket.OPEN) ws.send('ping');
-          }, 25000);
+            if (!ws || ws.readyState !== WebSocket.OPEN) return;
+            ws.send('ping');
+            if (pongTimer) window.clearTimeout(pongTimer);
+            pongTimer = window.setTimeout(() => {
+              // Half-open dead socket detected; force reconnect immediately
+              try {
+                ws?.close();
+              } catch {
+                // ignore
+              }
+            }, 6000);
+          }, 20000);
         };
 
         ws.onmessage = async (event) => {
-          if (typeof event.data !== 'string' || event.data === 'pong') return;
+          if (typeof event.data !== 'string') return;
+          if (event.data === 'pong') {
+            if (pongTimer) {
+              window.clearTimeout(pongTimer);
+              pongTimer = undefined;
+            }
+            return;
+          }
           try {
             const parsed = JSON.parse(event.data) as {
               type?: string;
               ids?: string[];
               joinedDeviceId?: string;
+              pinEnabled?: boolean;
+              devices?: Array<{
+                deviceId: string;
+                iv: string;
+                ciphertext: string;
+                updatedAt: number;
+                lastSeenAt?: number;
+                online: boolean;
+              }>;
               envelope?: EncryptedEnvelope;
             };
             if (parsed.type === 'devices_updated') {
-              await refreshDevices(rid, k, did, tok);
-              if (parsed.joinedDeviceId && parsed.joinedDeviceId !== did && showAddDevice()) {
-                setShowAddDevice(false);
-                setInviteToken('');
-                setInviteExpiresAt(0);
-                setQrDataUrl('');
-                notify('New device paired!');
+              if (Array.isArray(parsed.devices)) {
+                await applyEncryptedDevicesSnapshot(
+                  parsed.devices,
+                  parsed.pinEnabled,
+                  rid,
+                  k,
+                  did,
+                  parsed.joinedDeviceId,
+                );
+              } else {
+                await refreshDevices(rid, k, did, tok);
               }
               return;
             }
@@ -1200,6 +1530,7 @@ export default function App() {
             await saveMessage(item);
             await kvSet('lastSeenTs', item.ts);
             addOrUpdateMessage(item);
+            postTabSync({ type: 'msg_added', item });
             item = await ensureBlobHydrated(item, rid, k, did, tok);
 
             if (document.visibilityState !== 'visible') {
@@ -1213,15 +1544,13 @@ export default function App() {
         };
 
         ws.onclose = (ev) => {
-          if (pingTimer) window.clearInterval(pingTimer);
+          clearTimers();
           setWsStatus('disconnected');
           if (ev.code === 4001) {
             handleRevoked('This device was removed from the room.');
             return;
           }
-          if (!closed) {
-            reconnectTimer = window.setTimeout(connect, 2500);
-          }
+          scheduleReconnect();
         };
 
         ws.onerror = () => {
@@ -1234,18 +1563,31 @@ export default function App() {
       return () => {
         closed = true;
         if (reconnectTimer) window.clearTimeout(reconnectTimer);
-        if (pingTimer) window.clearInterval(pingTimer);
+        clearTimers();
         ws?.close();
       };
     },
   );
 
   function addOrUpdateMessage(item: StoredMessage) {
+    let added = false;
     setMessages((prev) => {
-      if (prev.some((m) => m.id === item.id)) return prev;
+      const idx = prev.findIndex((m) => m.id === item.id);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = item;
+        return next;
+      }
+      added = true;
       return [...prev, item].slice(-500);
     });
-    scrollToBottom();
+    if (added) {
+      if (item.direction === 'out' || isNearBottom()) {
+        scrollToBottom(true);
+      } else {
+        setUnseenIncoming((c) => c + 1);
+      }
+    }
   }
 
   function handleIncomingAction(item: StoredMessage) {
@@ -1356,6 +1698,51 @@ export default function App() {
     const targetNames = opts && 'targetNames' in opts ? opts.targetNames : defaults.targetNames;
     const expiresAt = burnMs() > 0 ? Date.now() + burnMs() : undefined;
 
+    if (import.meta.env.DEV && localDemo()) {
+      const item: StoredMessage = {
+        id: crypto.randomUUID(),
+        senderId: did,
+        senderName: dName,
+        senderOs: localOs,
+        targetNames,
+        ts: Date.now(),
+        type: detectPayloadType(content),
+        content,
+        title,
+        expiresAt,
+        direction: 'out',
+        status: 'delivered',
+      };
+      addOrUpdateMessage(item);
+      setDraft('');
+      requestAnimationFrame(syncComposerHeight);
+      notify(opts?.toastOverride || 'Pushed!');
+      return true;
+    }
+
+    // Optimistic UI: show the bubble immediately and clear composer
+    const optimisticId = `opt-${crypto.randomUUID()}`;
+    const optimisticTs = Date.now();
+    const optimisticItem: StoredMessage = {
+      id: optimisticId,
+      senderId: did,
+      senderName: dName,
+      senderOs: localOs,
+      targetNames,
+      ts: optimisticTs,
+      type: content.length > LONG_TEXT_THRESHOLD ? 'text' : detectPayloadType(content),
+      content,
+      title,
+      expiresAt,
+      direction: 'out',
+      status: 'sending',
+    };
+    addOrUpdateMessage(optimisticItem);
+    if (!opts?.toastOverride) {
+      setDraft('');
+      requestAnimationFrame(syncComposerHeight);
+    }
+
     setSending(true);
     try {
       const isLong = content.length > LONG_TEXT_THRESHOLD;
@@ -1418,6 +1805,7 @@ export default function App() {
       });
 
       if (res.status === 401) {
+        setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
         await handleRevoked('This device was removed from the room.');
         throw new Error('This device was removed from the room');
       }
@@ -1443,11 +1831,14 @@ export default function App() {
       };
 
       await saveMessage(item);
-      addOrUpdateMessage(item);
-      setDraft('');
-      notify(opts?.toastOverride || 'Pushed!');
+      setMessages((prev) => prev.map((m) => (m.id === optimisticId ? item : m)));
+      postTabSync({ type: 'msg_added', item });
+      if (opts?.toastOverride) notify(opts.toastOverride);
       return true;
     } catch (e) {
+      setMessages((prev) =>
+        prev.map((m) => (m.id === optimisticId ? { ...m, status: 'failed' } : m)),
+      );
       notify(e instanceof Error ? e.message : 'Could not send');
       return false;
     } finally {
@@ -1582,7 +1973,14 @@ export default function App() {
     setEditingDeviceId(null);
     if (dev.deviceId === deviceId()) {
       setDeviceName(nextName);
-      await kvSet('deviceName', nextName);
+      if (!localDemo()) await kvSet('deviceName', nextName);
+    }
+    if (import.meta.env.DEV && localDemo()) {
+      setDevices((prev) =>
+        prev.map((d) => (d.deviceId === dev.deviceId ? { ...d, name: nextName } : d)),
+      );
+      notify(`Renamed to "${nextName}"`);
+      return;
     }
     await updateDeviceRecord(roomId(), keyB64(), dev.deviceId, nextName, dev.os, dev.color);
     await refreshDevices();
@@ -1593,6 +1991,11 @@ export default function App() {
     setDevices((prev) =>
       prev.map((d) => (d.deviceId === dev.deviceId ? { ...d, color: colorIdx } : d)),
     );
+    if (import.meta.env.DEV && localDemo()) {
+      const label = DEVICE_COLOR_OPTIONS.find((c) => c.index === colorIdx)?.name || 'Color';
+      notify(`${dev.name} color set to ${label}`);
+      return;
+    }
     await updateDeviceRecord(roomId(), keyB64(), dev.deviceId, dev.name, dev.os, colorIdx);
     await refreshDevices();
     const label = DEVICE_COLOR_OPTIONS.find((c) => c.index === colorIdx)?.name || 'Color';
@@ -1600,6 +2003,11 @@ export default function App() {
   }
 
   async function removeDevice(dev: PairedDevice) {
+    if (import.meta.env.DEV && localDemo()) {
+      setDevices((prev) => prev.filter((d) => d.deviceId !== dev.deviceId));
+      notify(`Removed "${dev.name}"`);
+      return;
+    }
     const res = await fetch(`/api/room/${encodeURIComponent(roomId())}/devices`, {
       method: 'DELETE',
       headers: authHeaders(deviceId(), deviceToken(), { 'content-type': 'application/json' }),
@@ -1685,11 +2093,10 @@ export default function App() {
     });
   });
 
-  async function confirmDeleteMessage() {
-    const target = pendingDelete();
-    if (!target) return;
-    setPendingDelete(null);
-    await deleteMessage(target.id, target.blobId).catch(() => {});
+  async function commitDeleteMessage(target: StoredMessage) {
+    if (!(import.meta.env.DEV && localDemo())) {
+      await deleteMessage(target.id, target.blobId).catch(() => {});
+    }
     if (target.blobId) {
       const existingUrl = blobUrls()[target.blobId];
       if (existingUrl) {
@@ -1701,6 +2108,129 @@ export default function App() {
         });
       }
     }
+    postTabSync({ type: 'msg_deleted', id: target.id });
+  }
+
+  function deleteMessageWithUndo(target: StoredMessage) {
+    // Commit any previous pending undo deletion first
+    const prevUndo = undoDelete();
+    if (prevUndo) {
+      if (undoTimer) window.clearTimeout(undoTimer);
+      commitDeleteMessage(prevUndo.msg);
+    }
+
+    const currentList = messages();
+    const index = currentList.findIndex((m) => m.id === target.id);
+    if (index < 0) return;
+
+    setMessages((prev) => prev.filter((m) => m.id !== target.id));
+    setUndoDelete({ msg: target, index });
+    undoTimer = window.setTimeout(() => {
+      const pending = undoDelete();
+      if (pending && pending.msg.id === target.id) {
+        setUndoDelete(null);
+        commitDeleteMessage(pending.msg);
+      }
+    }, 5000);
+  }
+
+  function handleUndoDelete() {
+    const pending = undoDelete();
+    if (!pending) return;
+    if (undoTimer) window.clearTimeout(undoTimer);
+    setUndoDelete(null);
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === pending.msg.id)) return prev;
+      const next = [...prev];
+      next.splice(Math.min(pending.index, next.length), 0, pending.msg);
+      return next;
+    });
+    notify('Message restored');
+  }
+
+  async function retryFailedMessage(failedMsg: StoredMessage) {
+    setMessages((prev) => prev.filter((m) => m.id !== failedMsg.id));
+    await sendText(failedMsg.content, failedMsg.title);
+  }
+
+  function simulateDemoDeviceJoin() {
+    if (!(import.meta.env.DEV && localDemo())) return;
+    const pool: Array<{ name: string; os: DeviceOs; color: number }> = [
+      { name: 'iPad Air', os: 'ios', color: 3 },
+      { name: 'Linux Workstation', os: 'linux', color: 6 },
+      { name: 'Galaxy Tab S9', os: 'android', color: 4 },
+      { name: 'Mac Studio', os: 'macos', color: 0 },
+    ];
+    const existingNames = new Set(devices().map((d) => d.name));
+    const pick = pool.find((p) => !existingNames.has(p.name)) || {
+      name: `Device ${devices().length + 1}`,
+      os: 'other' as DeviceOs,
+      color: devices().length % 8,
+    };
+    const now = Date.now();
+    const newDev: PairedDevice = {
+      deviceId: `demo-joined-${now}`,
+      name: pick.name,
+      os: pick.os,
+      color: pick.color,
+      online: true,
+      updatedAt: now,
+      lastSeenAt: now,
+    };
+    setDevices((prev) => [newDev, ...prev]);
+    highlightNewDevice(newDev.deviceId);
+    setShowAddDevice(false);
+    setInviteCode('');
+    setInviteToken('');
+    setInviteExpiresAt(0);
+    setQrDataUrl('');
+    notify(`${newDev.name} joined the room!`);
+  }
+
+  function simulateDemoIncomingPush() {
+    if (!(import.meta.env.DEV && localDemo())) return;
+    const others = otherDevices();
+    const sender = others[Math.floor(Math.random() * others.length)] || {
+      deviceId: 'demo-iphone',
+      name: 'iPhone 16 Pro',
+      os: 'ios' as DeviceOs,
+    };
+    const samples = [
+      {
+        type: 'text' as const,
+        content: 'Just pushed this live from another device — zero refresh needed!',
+      },
+      {
+        type: 'link' as const,
+        title: 'Web Push Protocol RFC 8030',
+        content: 'https://datatracker.ietf.org/doc/html/rfc8030',
+      },
+      {
+        type: 'text' as const,
+        content: 'Quick note: check the new real-time reactivity and smart scroll pill.',
+      },
+    ];
+    const sample = samples[messages().length % samples.length];
+    const item: StoredMessage = {
+      id: `demo-in-${Date.now()}`,
+      senderId: sender.deviceId,
+      senderName: sender.name,
+      senderOs: sender.os,
+      ts: Date.now(),
+      type: sample.type,
+      title: sample.title,
+      content: sample.content,
+      direction: 'in',
+    };
+    addOrUpdateMessage(item);
+    notify(`Message from ${sender.name}`);
+  }
+
+  async function confirmDeleteMessage() {
+    const target = pendingDelete();
+    if (!target) return;
+    setPendingDelete(null);
+    await commitDeleteMessage(target);
     setMessages((prev) => prev.filter((m) => m.id !== target.id));
     notify('Message deleted');
   }
@@ -1758,7 +2288,7 @@ export default function App() {
         if (swipeState()?.id === msg.id) setSwipeState(null);
       }, 200);
       if (shouldAskDelete) {
-        setPendingDelete(msg);
+        deleteMessageWithUndo(msg);
       }
     }
   }
@@ -1806,22 +2336,69 @@ export default function App() {
   return (
     <div
       class="app-shell"
+      onDragEnter={(e) => {
+        if (!isPaired()) return;
+        e.preventDefault();
+        dragDepth++;
+        if (e.dataTransfer?.types?.includes('Files')) {
+          setDragActive(true);
+        }
+      }}
       onDragOver={(e) => e.preventDefault()}
+      onDragLeave={() => {
+        dragDepth = Math.max(0, dragDepth - 1);
+        if (dragDepth === 0) setDragActive(false);
+      }}
       onDrop={(e) => {
         e.preventDefault();
+        dragDepth = 0;
+        setDragActive(false);
         if (!isPaired()) return;
         const file = e.dataTransfer?.files?.[0];
         if (file) sendFile(file);
       }}
     >
+      <Show when={dragActive()}>
+        <div class="drop-overlay">
+          <div class="drop-overlay-card">
+            <LucideIcon icon={Upload} size={28} />
+            <strong>Drop file to push</strong>
+            <span class="muted">
+              {selectedTargets().length > 0
+                ? `Sending to ${getTargetInfo().targetNames?.join(', ')}`
+                : 'Sending to all devices in room'}
+            </span>
+          </div>
+        </div>
+      </Show>
       <header class="topbar">
         <div class="brand">
-          <img src="/icon.svg" alt="" class="logo" />
-          <div>
-            <h1>Push It</h1>
+          <div class="logo-wrap">
+            <img src="/icon.svg" alt="" class="logo" />
+          </div>
+          <div class="brand-text">
+            <div class="brand-title-row">
+              <h1>Push It</h1>
+              <Show when={import.meta.env.DEV && localDemo()}>
+                <button
+                  type="button"
+                  class="demo-pill demo-pill-btn"
+                  title="Simulate incoming push (Dev)"
+                  onClick={simulateDemoIncomingPush}
+                >
+                  Demo · +Push
+                </button>
+              </Show>
+            </div>
             <div class="status-row">
               <span class={`dot ${isPaired() ? wsStatus() : 'disconnected'}`} />
               <span>{statusLabel()}</span>
+              <Show when={isPaired() && devices().length > 0}>
+                <span class="status-sep">·</span>
+                <span>
+                  {devices().filter((d) => d.online || d.deviceId === deviceId()).length}/{devices().length} online
+                </span>
+              </Show>
             </div>
           </div>
         </div>
@@ -1838,7 +2415,8 @@ export default function App() {
                     scrollToBottom();
                   }}
                 >
-                  ← Back
+                  <LucideIcon icon={ArrowLeft} size={14} />
+                  <span>Back</span>
                 </button>
               }
             >
@@ -1856,10 +2434,7 @@ export default function App() {
                   }
                 }}
               >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="11" cy="11" r="8" />
-                  <path d="m21 21-4.35-4.35" />
-                </svg>
+                <LucideIcon icon={Search} size={16} />
               </button>
               <button
                 class="device-pill"
@@ -1870,19 +2445,48 @@ export default function App() {
                 <span>{deviceName()}</span>
               </button>
               <button
-                class="btn secondary small"
+                class="icon-toggle-btn"
+                title="Settings"
                 aria-label="Settings"
                 onClick={() => setView('settings')}
               >
-                Settings
+                <LucideIcon icon={Settings} size={16} />
               </button>
             </Show>
           </div>
         </Show>
       </header>
 
-      <Show when={toast()}>
-        <div class="toast">{toast()}</div>
+      <Show when={undoDelete()}>
+        <div class="toast undo-toast" role="status" aria-live="polite">
+          <span>Message deleted</span>
+          <button class="toast-undo-btn" onClick={handleUndoDelete}>
+            <LucideIcon icon={RotateCcw} size={13} />
+            <span>Undo</span>
+          </button>
+        </div>
+      </Show>
+
+      <Show when={!undoDelete() && toast()}>
+        <div class="toast" role="status" aria-live="polite">
+          {toast()}
+        </div>
+      </Show>
+
+      <Show when={isPaired() && wsStatus() === 'disconnected' && !(import.meta.env.DEV && localDemo())}>
+        <div class="offline-banner">
+          <span class="row gap">
+            <LucideIcon icon={WifiOff} size={14} />
+            <span>Connection paused — reconnecting automatically…</span>
+          </span>
+          <button
+            class="chip"
+            onClick={() => setReconnectNonce((n) => n + 1)}
+          >
+            <LucideIcon icon={RefreshCw} size={12} />
+            <span>Retry</span>
+          </button>
+        </div>
       </Show>
 
       <Show when={popupWarning() && view() === 'chat' && isPaired()}>
@@ -1986,9 +2590,13 @@ export default function App() {
           fallback={
             <main class="setup-page">
               <div class="setup-hero">
+                <span class="setup-hero-badge">
+                  <LucideIcon icon={ShieldCheck} size={13} />
+                  <span>End-to-End Encrypted</span>
+                </span>
                 <h2>Private Device Sync</h2>
                 <p class="muted">
-                  Only devices paired together with a single-use invite can access your room.
+                  Push links, notes, and files across your devices instantly. Only devices paired with a single-use invite can access your room.
                 </p>
               </div>
 
@@ -2176,6 +2784,15 @@ export default function App() {
                 >
                   {setupBusy() ? 'Creating...' : 'Create New Room'}
                 </button>
+                <Show when={import.meta.env.DEV}>
+                  <button
+                    class="btn secondary"
+                    type="button"
+                    onClick={() => enterLocalDemo()}
+                  >
+                    Preview Local Demo Room (Dev)
+                  </button>
+                </Show>
               </section>
 
               <div class="version-footer">
@@ -2211,8 +2828,9 @@ export default function App() {
                     <For each={devices()}>
                       {(dev) => {
                         const isSelf = dev.deviceId === deviceId();
+                        const isNew = () => newlyJoinedId() === dev.deviceId;
                         return (
-                          <div class="device-row">
+                          <div class={`device-row ${isNew() ? 'device-row-new' : ''}`}>
                             <Show
                               when={editingDeviceId() !== dev.deviceId}
                               fallback={
@@ -2254,6 +2872,9 @@ export default function App() {
                                       <span class="device-name">{dev.name}</span>
                                       <Show when={isSelf}>
                                         <span class="self-tag">This device</span>
+                                      </Show>
+                                      <Show when={isNew()}>
+                                        <span class="new-tag">Just paired</span>
                                       </Show>
                                     </div>
                                     <span class="device-activity">
@@ -2374,6 +2995,15 @@ export default function App() {
                         >
                           Regenerate
                         </button>
+                        <Show when={import.meta.env.DEV && localDemo()}>
+                          <button
+                            class="btn success"
+                            type="button"
+                            onClick={simulateDemoDeviceJoin}
+                          >
+                            Simulate Device Join (Dev)
+                          </button>
+                        </Show>
                       </div>
                     </Show>
                   </Show>
@@ -2635,6 +3265,17 @@ export default function App() {
                     <span class="search-count">
                       {filteredMessages().length}/{messages().length}
                     </span>
+                    <button
+                      type="button"
+                      class="search-clear-btn"
+                      aria-label="Clear search"
+                      onClick={() => {
+                        setSearchQuery('');
+                        searchInputEl?.focus();
+                      }}
+                    >
+                      <LucideIcon icon={X} size={13} />
+                    </button>
                   </Show>
                 </div>
                 <button
@@ -2649,34 +3290,41 @@ export default function App() {
               </div>
             </Show>
 
-            <main class="chat-stream">
+            <main
+              ref={chatStreamEl}
+              class="chat-stream"
+              onScroll={handleChatScroll}
+            >
               <For
                 each={filteredMessages()}
                 fallback={
                   <div class="empty">
+                    <div class="empty-icon">
+                      <LucideIcon icon={Sparkles} size={22} />
+                    </div>
                     <Show
                       when={searchQuery().trim()}
                       fallback={
                         <>
-                          <p>Nothing pushed yet.</p>
+                          <p>Nothing pushed yet</p>
                           <p class="muted">
-                            Send a link, note, or photo below—or share straight from your phone’s Share menu.
+                            Send a link, note, or photo below — or share straight from your phone’s Share menu.
                           </p>
                         </>
                       }
                     >
-                      <p>No messages matching “{searchQuery().trim()}”.</p>
+                      <p>No messages matching “{searchQuery().trim()}”</p>
                     </Show>
                   </div>
                 }
               >
-                {(msg) => {
+                {(msg, idx) => {
                   const os = msg.senderOs ?? (msg.direction === 'out' ? localOs : 'other');
                   const label =
                     msg.senderName || (msg.direction === 'out' ? deviceName() : 'Other device');
-                  const targetLabel =
+                  const targetText =
                     msg.targetNames && msg.targetNames.length > 0
-                      ? ` → ${msg.targetNames.join(', ')}`
+                      ? msg.targetNames.join(', ')
                       : '';
                   const colorIdx = () => getDeviceColorIndex(msg.senderId, label);
                   const isLink = msg.type === 'link' && isSafeHttpUrl(msg.content);
@@ -2687,166 +3335,241 @@ export default function App() {
                     const s = swipeState();
                     return s && s.id === msg.id ? s : null;
                   };
+                  const showDayDivider = () => {
+                    const i = idx();
+                    if (i === 0) return true;
+                    const prev = filteredMessages()[i - 1];
+                    return !prev || getDayKey(prev.ts) !== getDayKey(msg.ts);
+                  };
 
                   return (
-                    <div
-                      class="swipe-row"
-                      onTouchStart={(e) => handleBubbleTouchStart(msg, e)}
-                      onTouchMove={(e) => handleBubbleTouchMove(msg, e)}
-                      onTouchEnd={() => handleBubbleTouchEnd(msg)}
-                      onTouchCancel={() => handleBubbleTouchEnd(msg)}
-                    >
+                    <>
+                      <Show when={showDayDivider()}>
+                        <div class="date-divider">
+                          <span>{formatDayLabel(msg.ts)}</span>
+                        </div>
+                      </Show>
                       <div
-                        class={`swipe-delete-bg ${swipe() && swipe()!.offset < -10 ? 'visible' : ''} ${swipe()?.armed ? 'armed' : ''}`}
+                        class="swipe-row"
+                        onTouchStart={(e) => handleBubbleTouchStart(msg, e)}
+                        onTouchMove={(e) => handleBubbleTouchMove(msg, e)}
+                        onTouchEnd={() => handleBubbleTouchEnd(msg)}
+                        onTouchCancel={() => handleBubbleTouchEnd(msg)}
                       >
-                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M3 6h18" />
-                          <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-                        </svg>
-                        <span>{swipe()?.armed ? 'Release to delete' : 'Swipe to delete'}</span>
-                      </div>
-                      <div
-                        class={`swipe-content ${msg.direction} ${swipe()?.snapping ? 'snapping' : ''}`}
-                        style={{
-                          transform: swipe() ? `translateX(${swipe()!.offset}px)` : undefined,
-                        }}
-                      >
-                        <article
-                          class={`bubble ${msg.direction} dev-c${colorIdx()} ${!isFile ? 'tappable' : ''}`}
-                          onClick={(e) => handleBubbleClick(msg, e)}
+                        <div
+                          class={`swipe-delete-bg ${swipe() && swipe()!.offset < -10 ? 'visible' : ''} ${swipe()?.armed ? 'armed' : ''}`}
                         >
-                          <div class="bubble-head">
-                            <span class="sender-tag">
-                              <OsIcon os={os} size={13} />
-                              <span>
-                                {label}
-                                {targetLabel}
-                              </span>
-                            </span>
-                            <span class="meta-right">
-                              <Show when={msg.expiresAt && nowTick() < msg.expiresAt}>
-                                <span class="burn-badge" title="Auto-expires">
-                                  🔥 {formatRemainingTime(msg.expiresAt)}
-                                </span>
-                              </Show>
-                              <time>
-                                {new Date(msg.ts).toLocaleTimeString([], {
-                                  hour: '2-digit',
-                                  minute: '2-digit',
-                                })}
-                              </time>
-                              <Show when={msg.direction === 'out'}>
-                                <span
-                                  class={`check ${msg.status === 'delivered' ? 'delivered' : ''}`}
-                                  title={msg.status === 'delivered' ? 'Delivered' : 'Queued'}
-                                >
-                                  {msg.status === 'delivered' ? '✓✓' : '✓'}
-                                </span>
-                              </Show>
-                            </span>
-                          </div>
-
-                          <Show when={msg.title}>
-                            <div class="bubble-title">{msg.title}</div>
-                          </Show>
-
-                          <div class="bubble-body">
-                            {isFile ? (
-                              <div class="file-card">
-                                <Show when={isImage && fileUrl()}>
-                                  <a href={fileUrl()} target="_blank" rel="noopener noreferrer">
-                                    <img
-                                      src={fileUrl()}
-                                      alt={msg.fileName || 'Photo'}
-                                      class="photo-preview"
-                                    />
-                                  </a>
+                          <LucideIcon icon={Trash2} size={15} />
+                          <span>{swipe()?.armed ? 'Release to delete' : 'Swipe to delete'}</span>
+                        </div>
+                        <div
+                          class={`swipe-content ${msg.direction} ${swipe()?.snapping ? 'snapping' : ''}`}
+                          style={{
+                            transform: swipe() ? `translateX(${swipe()!.offset}px)` : undefined,
+                          }}
+                        >
+                          <article
+                            class={`bubble ${msg.direction} dev-c${colorIdx()} ${!isFile ? 'tappable' : ''}`}
+                            onClick={(e) => handleBubbleClick(msg, e)}
+                          >
+                            <div class="bubble-head">
+                              <span class="sender-tag">
+                                <OsIcon os={os} size={13} />
+                                <span class="sender-name">{label}</span>
+                                <Show when={targetText}>
+                                  <span class="target-chip">→ {targetText}</span>
                                 </Show>
-                                <div class="file-meta">
-                                  <span class="file-name">{msg.fileName || msg.content}</span>
-                                  <Show when={msg.fileSize}>
-                                    <span class="muted">{formatFileSize(msg.fileSize)}</span>
-                                  </Show>
-                                </div>
-                              </div>
-                            ) : isLink ? (
-                              <a href={msg.content} target="_blank" rel="noopener noreferrer">
-                                {msg.content}
-                              </a>
-                            ) : (
-                              <pre>{msg.content}</pre>
-                            )}
-                          </div>
+                              </span>
+                              <span class="meta-right">
+                                <Show when={msg.expiresAt && nowTick() < msg.expiresAt}>
+                                  <span class="burn-badge" title="Auto-expires">
+                                    <LucideIcon icon={Flame} size={11} />
+                                    <span>{formatRemainingTime(msg.expiresAt)}</span>
+                                  </span>
+                                </Show>
+                                <time>
+                                  {new Date(msg.ts).toLocaleTimeString([], {
+                                    hour: '2-digit',
+                                    minute: '2-digit',
+                                  })}
+                                </time>
+                                <Show when={msg.direction === 'out'}>
+                                  <span
+                                    class={`check ${msg.status === 'delivered' ? 'delivered' : ''} ${msg.status === 'failed' ? 'failed' : ''}`}
+                                    title={
+                                      msg.status === 'sending'
+                                        ? 'Sending…'
+                                        : msg.status === 'failed'
+                                          ? 'Failed to send'
+                                          : msg.status === 'delivered'
+                                            ? 'Delivered'
+                                            : 'Queued'
+                                    }
+                                  >
+                                    {msg.status === 'sending'
+                                      ? '···'
+                                      : msg.status === 'failed'
+                                        ? '!'
+                                        : msg.status === 'delivered'
+                                          ? '✓✓'
+                                          : '✓'}
+                                  </span>
+                                </Show>
+                              </span>
+                            </div>
 
-                          <div class="bubble-actions">
-                            <div class="bubble-actions-left">
-                              <Show when={isLink}>
+                            <Show when={msg.title}>
+                              <div class="bubble-title">{msg.title}</div>
+                            </Show>
+
+                            <div class="bubble-body">
+                              {isFile ? (
+                                <div class="file-card">
+                                  <Show when={isImage && fileUrl()}>
+                                    <a href={fileUrl()} target="_blank" rel="noopener noreferrer">
+                                      <img
+                                        src={fileUrl()}
+                                        alt={msg.fileName || 'Photo'}
+                                        class="photo-preview"
+                                      />
+                                    </a>
+                                  </Show>
+                                  <div class="file-meta">
+                                    <div class="file-icon-box">
+                                      <LucideIcon icon={FileText} size={17} />
+                                    </div>
+                                    <div class="file-info">
+                                      <span class="file-name">{msg.fileName || msg.content}</span>
+                                      <Show when={msg.fileSize}>
+                                        <span class="file-size">{formatFileSize(msg.fileSize)}</span>
+                                      </Show>
+                                    </div>
+                                  </div>
+                                </div>
+                              ) : isLink ? (
                                 <a
-                                  class="icon-chip primary"
+                                  class="link-card"
                                   href={msg.content}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  title="Open link"
-                                  aria-label="Open link"
                                   onClick={(e) => e.stopPropagation()}
                                 >
-                                  <LucideIcon icon={ExternalLink} size={15} />
+                                  <span class="link-domain">
+                                    <LucideIcon icon={Globe} size={12} />
+                                    <span>{extractHostname(msg.content)}</span>
+                                  </span>
+                                  <span class="link-url">{msg.content}</span>
                                 </a>
-                              </Show>
-                              <Show when={isFile && fileUrl()}>
-                                <a
-                                  class="icon-chip primary"
-                                  href={fileUrl()}
-                                  download={msg.fileName || 'file'}
-                                  title="Download file"
-                                  aria-label="Download file"
-                                  onClick={(e) => e.stopPropagation()}
-                                >
-                                  <LucideIcon icon={Download} size={15} />
-                                </a>
-                              </Show>
-                              <Show when={!isFile}>
+                              ) : (
+                                <pre>{msg.content}</pre>
+                              )}
+                            </div>
+
+                            <div class="bubble-actions">
+                              <div class="bubble-actions-left">
+                                <Show when={isLink}>
+                                  <a
+                                    class="icon-chip primary"
+                                    href={msg.content}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    title="Open link"
+                                    aria-label="Open link"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <LucideIcon icon={ExternalLink} size={13} />
+                                    <span>Open</span>
+                                  </a>
+                                </Show>
+                                <Show when={isFile && fileUrl()}>
+                                  <a
+                                    class="icon-chip primary"
+                                    href={fileUrl()}
+                                    download={msg.fileName || 'file'}
+                                    title="Download file"
+                                    aria-label="Download file"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <LucideIcon icon={Download} size={13} />
+                                    <span>Download</span>
+                                  </a>
+                                </Show>
+                                <Show when={!isFile}>
+                                  <button
+                                    class={`icon-chip ${copiedId() === msg.id ? 'copied' : ''}`}
+                                    title={copiedId() === msg.id ? 'Copied' : 'Copy to clipboard'}
+                                    aria-label={copiedId() === msg.id ? 'Copied' : 'Copy to clipboard'}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      copyToClipboard(msg.content, 'Copied to clipboard', msg.id);
+                                    }}
+                                  >
+                                    <Show
+                                      when={copiedId() === msg.id}
+                                      fallback={
+                                        <>
+                                          <LucideIcon icon={Copy} size={13} />
+                                          <span>Copy</span>
+                                        </>
+                                      }
+                                    >
+                                      <LucideIcon icon={Check} size={13} />
+                                      <span>Copied</span>
+                                    </Show>
+                                  </button>
+                                </Show>
+                              </div>
+                              <div class="bubble-actions-right">
+                                <Show when={msg.status === 'failed'}>
+                                  <button
+                                    class="icon-chip primary"
+                                    title="Retry sending"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      retryFailedMessage(msg);
+                                    }}
+                                  >
+                                    <LucideIcon icon={RefreshCw} size={12} />
+                                    <span>Retry</span>
+                                  </button>
+                                </Show>
                                 <button
-                                  class="icon-chip"
-                                  title={copiedId() === msg.id ? 'Copied' : 'Copy to clipboard'}
-                                  aria-label={copiedId() === msg.id ? 'Copied' : 'Copy to clipboard'}
+                                  class="icon-chip danger"
+                                  title="Delete message"
+                                  aria-label="Delete message"
                                   onClick={(e) => {
                                     e.stopPropagation();
-                                    copyToClipboard(msg.content, 'Copied to clipboard', msg.id);
+                                    deleteMessageWithUndo(msg);
                                   }}
                                 >
-                                  <Show
-                                    when={copiedId() === msg.id}
-                                    fallback={<LucideIcon icon={Copy} size={15} />}
-                                  >
-                                    <LucideIcon icon={Check} size={15} />
-                                  </Show>
+                                  <LucideIcon icon={Trash2} size={13} />
                                 </button>
-                              </Show>
+                              </div>
                             </div>
-                            <div class="bubble-actions-right">
-                              <button
-                                class="icon-chip danger"
-                                title="Delete message"
-                                aria-label="Delete message"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setPendingDelete(msg);
-                                }}
-                              >
-                                <LucideIcon icon={Trash2} size={15} />
-                              </button>
-                            </div>
-                          </div>
-                        </article>
+                          </article>
+                        </div>
                       </div>
-                    </div>
+                    </>
                   );
                 }}
               </For>
               <div ref={chatEndEl} />
             </main>
+
+            <Show when={!isNearBottom() && filteredMessages().length > 0}>
+              <button
+                type="button"
+                class={`jump-latest-btn ${unseenIncoming() > 0 ? 'has-new' : ''}`}
+                onClick={() => scrollToBottom(true)}
+              >
+                <LucideIcon icon={ArrowDown} size={14} />
+                <span>
+                  {unseenIncoming() > 0
+                    ? `${unseenIncoming()} new ${unseenIncoming() === 1 ? 'message' : 'messages'}`
+                    : 'Jump to latest'}
+                </span>
+              </button>
+            </Show>
 
             <Show when={otherDevices().length > 1}>
               <div class="target-bar">
@@ -2863,6 +3586,7 @@ export default function App() {
                       class={`target-pill ${selectedTargets().includes(dev.deviceId) ? 'active' : ''}`}
                       onClick={() => toggleTarget(dev.deviceId)}
                     >
+                      <span class={`target-dot ${dev.online ? 'online' : ''}`} />
                       <OsIcon os={dev.os} size={12} />
                       <span>{dev.name}</span>
                     </button>
@@ -2873,8 +3597,10 @@ export default function App() {
 
             <footer class="composer-wrap">
               <div class="composer-meta-row">
+                <span class="composer-hint">Enter to push · Shift+Enter for newline</span>
                 <label class={`burn-control ${burnMs() > 0 ? 'active' : ''}`}>
-                  <span>{burnMs() > 0 ? '🔥 Auto-burn next message:' : '⏱ Auto-burn:'}</span>
+                  <LucideIcon icon={Flame} size={13} />
+                  <span>{burnMs() > 0 ? 'Auto-burn:' : 'Auto-burn:'}</span>
                   <select
                     class="burn-select"
                     value={String(burnMs())}
@@ -2888,57 +3614,63 @@ export default function App() {
                 </label>
               </div>
               <div class="composer-bar">
-              <input
-                ref={fileInputEl}
-                type="file"
-                class="hidden-file"
-                onChange={(e) => {
-                  const file = e.currentTarget.files?.[0];
-                  if (file) sendFile(file);
-                  e.currentTarget.value = '';
-                }}
-              />
-              <button
-                class="btn secondary icon-btn"
-                title="Attach photo or file"
-                disabled={sending()}
-                onClick={() => fileInputEl?.click()}
-              >
-                +
-              </button>
-              <textarea
-                rows={1}
-                placeholder="Paste a link, note, or screenshot..."
-                value={draft()}
-                onInput={(e) => setDraft(e.currentTarget.value)}
-                onPaste={(e) => {
-                  const items = e.clipboardData?.items;
-                  if (!items) return;
-                  for (const item of items) {
-                    if (item.kind === 'file') {
-                      const file = item.getAsFile();
-                      if (file) {
-                        e.preventDefault();
-                        sendFile(file);
-                        return;
+                <input
+                  ref={fileInputEl}
+                  type="file"
+                  class="hidden-file"
+                  onChange={(e) => {
+                    const file = e.currentTarget.files?.[0];
+                    if (file) sendFile(file);
+                    e.currentTarget.value = '';
+                  }}
+                />
+                <button
+                  class="attach-btn"
+                  title="Attach photo or file"
+                  aria-label="Attach photo or file"
+                  disabled={sending()}
+                  onClick={() => fileInputEl?.click()}
+                >
+                  <LucideIcon icon={Paperclip} size={17} />
+                </button>
+                <textarea
+                  ref={composerEl}
+                  rows={1}
+                  placeholder="Push a link or note..."
+                  value={draft()}
+                  onInput={(e) => {
+                    setDraft(e.currentTarget.value);
+                    syncComposerHeight();
+                  }}
+                  onPaste={(e) => {
+                    const items = e.clipboardData?.items;
+                    if (!items) return;
+                    for (const item of items) {
+                      if (item.kind === 'file') {
+                        const file = item.getAsFile();
+                        if (file) {
+                          e.preventDefault();
+                          sendFile(file);
+                          return;
+                        }
                       }
                     }
-                  }
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendText(draft());
-                  }
-                }}
-              />
-              <button
-                class="btn primary"
-                disabled={sending() || !draft().trim()}
-                onClick={() => sendText(draft())}
-              >
-                {sending() ? '...' : 'Push It'}
-              </button>
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      sendText(draft());
+                    }
+                  }}
+                />
+                <button
+                  class="send-btn"
+                  disabled={sending() || !draft().trim()}
+                  onClick={() => sendText(draft())}
+                >
+                  <LucideIcon icon={Send} size={14} />
+                  <span>{sending() ? '...' : 'Push'}</span>
+                </button>
               </div>
             </footer>
           </Show>

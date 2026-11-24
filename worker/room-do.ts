@@ -548,6 +548,41 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
+  private async buildDevicesSnapshot() {
+    const onlineIds = new Set<string>();
+    for (const ws of this.ctx.getWebSockets()) {
+      for (const tag of this.ctx.getTags(ws)) onlineIds.add(tag);
+    }
+
+    const [stored, meta] = await Promise.all([
+      this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX }),
+      this.ctx.storage.get<RoomMeta>(ROOM_META_KEY),
+    ]);
+    const devices = Array.from(stored.values())
+      .filter((d) => Boolean(d.tokenHash))
+      .map((d) => ({
+        deviceId: d.deviceId,
+        iv: d.iv,
+        ciphertext: d.ciphertext,
+        updatedAt: d.updatedAt,
+        lastSeenAt: d.lastSeenAt || d.updatedAt,
+        online: onlineIds.has(d.deviceId),
+      }))
+      .sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+
+    return { devices, pinEnabled: Boolean(meta?.roomPinHash) };
+  }
+
+  private async broadcastDevicesUpdated(joinedDeviceId?: string): Promise<void> {
+    const snapshot = await this.buildDevicesSnapshot();
+    this.broadcastJson({
+      type: 'devices_updated',
+      joinedDeviceId,
+      devices: snapshot.devices,
+      pinEnabled: snapshot.pinEnabled,
+    });
+  }
+
   private async handleInit(request: Request): Promise<Response> {
     const requiredAccessKey = this.env.ACCESS_KEY?.trim();
     if (requiredAccessKey) {
@@ -671,7 +706,7 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     await this.ctx.storage.put(ROOM_META_KEY, nextMeta);
-    this.broadcastJson({ type: 'devices_updated' });
+    await this.broadcastDevicesUpdated();
     return Response.json({ ok: true, pinEnabled: Boolean(nextMeta.roomPinHash) });
   }
 
@@ -874,7 +909,7 @@ export class RoomDO extends DurableObject<Env> {
     };
 
     await this.ctx.storage.put(`${DEV_PREFIX}${body.deviceId}`, record);
-    this.broadcastJson({ type: 'devices_updated', joinedDeviceId: body.deviceId });
+    await this.broadcastDevicesUpdated(body.deviceId);
 
     return Response.json({ ok: true, deviceToken });
   }
@@ -932,7 +967,7 @@ export class RoomDO extends DurableObject<Env> {
 
     this.ctx.acceptWebSocket(server, [stored.deviceId]);
     await this.touchDeviceLastSeen(stored.deviceId);
-    this.broadcastJson({ type: 'devices_updated' });
+    await this.broadcastDevicesUpdated();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -953,7 +988,7 @@ export class RoomDO extends DurableObject<Env> {
     for (const tag of tags) {
       await this.touchDeviceLastSeen(tag);
     }
-    this.broadcastJson({ type: 'devices_updated' });
+    await this.broadcastDevicesUpdated();
   }
 
   private async handleUploadBlob(
@@ -1095,26 +1130,9 @@ export class RoomDO extends DurableObject<Env> {
     });
   }
 
-  private async handleListDevices(auth: AuthContext): Promise<Response> {
-    const onlineIds = new Set<string>();
-    for (const ws of this.ctx.getWebSockets()) {
-      for (const tag of this.ctx.getTags(ws)) onlineIds.add(tag);
-    }
-
-    const stored = await this.ctx.storage.list<StoredDevice>({ prefix: DEV_PREFIX });
-    const devices = Array.from(stored.values())
-      .filter((d) => Boolean(d.tokenHash))
-      .map((d) => ({
-        deviceId: d.deviceId,
-        iv: d.iv,
-        ciphertext: d.ciphertext,
-        updatedAt: d.updatedAt,
-        lastSeenAt: d.lastSeenAt || d.updatedAt,
-        online: onlineIds.has(d.deviceId),
-      }))
-      .sort((a, b) => b.lastSeenAt - a.lastSeenAt);
-
-    return Response.json({ devices, pinEnabled: Boolean(auth.meta.roomPinHash) });
+  private async handleListDevices(_auth: AuthContext): Promise<Response> {
+    const snapshot = await this.buildDevicesSnapshot();
+    return Response.json(snapshot);
   }
 
   private async handleUpdateDevice(request: Request, auth: AuthContext): Promise<Response> {
@@ -1147,7 +1165,7 @@ export class RoomDO extends DurableObject<Env> {
     };
 
     await this.ctx.storage.put(`${DEV_PREFIX}${targetId}`, record);
-    this.broadcastJson({ type: 'devices_updated' });
+    await this.broadcastDevicesUpdated();
     return Response.json({ ok: true });
   }
 
@@ -1215,7 +1233,7 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
-    this.broadcastJson({ type: 'devices_updated' });
+    await this.broadcastDevicesUpdated();
     return Response.json({ ok: true });
   }
 
