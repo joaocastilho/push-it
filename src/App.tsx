@@ -237,6 +237,8 @@ export default function App() {
   const [popupWarning, setPopupWarning] = createSignal<string>('');
   const [unreadCount, setUnreadCount] = createSignal<number>(0);
   const [serverVersion, setServerVersion] = createSignal<string | null>(null);
+  const [updatingApp, setUpdatingApp] = createSignal<boolean>(false);
+  const [checkingUpdate, setCheckingUpdate] = createSignal<boolean>(false);
   const [localDemo, setLocalDemo] = createSignal<boolean>(false);
   const [newlyJoinedId, setNewlyJoinedId] = createSignal<string | null>(null);
   const [isNearBottom, setIsNearBottom] = createSignal<boolean>(true);
@@ -300,6 +302,55 @@ export default function App() {
     newlyJoinedTimer = window.setTimeout(() => {
       if (newlyJoinedId() === id) setNewlyJoinedId(null);
     }, 4500);
+  }
+
+  async function checkForAppUpdate(manual = false) {
+    if (import.meta.env.DEV && localDemo()) {
+      if (manual) notify(`Up to date (v${appVersion})`);
+      return;
+    }
+    if (manual) setCheckingUpdate(true);
+    try {
+      const r = await fetch(`/api/version?t=${Date.now()}`, { cache: 'no-store' });
+      const d = (r.ok ? await r.json() : null) as {
+        version?: string;
+        accessKeyRequired?: boolean;
+      } | null;
+      if (d?.version) setServerVersion(d.version);
+      if (typeof d?.accessKeyRequired === 'boolean') {
+        setAccessKeyRequired(d.accessKeyRequired);
+      }
+      if (manual) {
+        if (d?.version && isNewerVersion(d.version, appVersion)) {
+          notify(`Update v${d.version} available!`);
+        } else {
+          notify(`You’re on the latest version (v${appVersion})`);
+        }
+      }
+    } catch {
+      if (manual) notify('Could not check for updates');
+    } finally {
+      if (manual) setCheckingUpdate(false);
+    }
+  }
+
+  async function applyAppUpdate() {
+    setUpdatingApp(true);
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations().catch(() => []);
+        await Promise.all(regs.map((reg) => reg.update().catch(() => {})));
+      }
+      if (typeof caches !== 'undefined') {
+        const keys = await caches.keys().catch(() => [] as string[]);
+        await Promise.all(keys.map((k) => caches.delete(k).catch(() => false)));
+      }
+    } finally {
+      const targetVer = serverVersion() || String(Date.now());
+      const url = new URL(window.location.href);
+      url.searchParams.set('v', targetVer);
+      window.location.replace(url.toString());
+    }
   }
 
   function scrollToBottom(force = true) {
@@ -1077,12 +1128,15 @@ export default function App() {
       };
 
       const onVisibility = () => {
-        if (document.visibilityState === 'visible' && isPaired()) {
-          updateBadge(0);
-          syncPending();
-          refreshDevices();
-          if (wsStatus() !== 'connected') {
-            setReconnectNonce((n) => n + 1);
+        if (document.visibilityState === 'visible') {
+          checkForAppUpdate(false);
+          if (isPaired()) {
+            updateBadge(0);
+            syncPending();
+            refreshDevices();
+            if (wsStatus() !== 'connected') {
+              setReconnectNonce((n) => n + 1);
+            }
           }
         }
       };
@@ -1171,15 +1225,19 @@ export default function App() {
       (async () => {
         await registerServiceWorker().catch(() => {});
 
-        fetch('/api/version', { cache: 'no-store' })
-          .then((r) => (r.ok ? r.json() : null))
-          .then((d: { version?: string; accessKeyRequired?: boolean } | null) => {
-            if (d?.version) setServerVersion(d.version);
-            if (typeof d?.accessKeyRequired === 'boolean') {
-              setAccessKeyRequired(d.accessKeyRequired);
-            }
-          })
-          .catch(() => {});
+        // Clean up cache-busting ?v= query param after a PWA update reload
+        if (window.location.search.includes('v=')) {
+          const cleanUrl = new URL(window.location.href);
+          cleanUrl.searchParams.delete('v');
+          const cleanSearch = cleanUrl.searchParams.toString();
+          window.history.replaceState(
+            null,
+            '',
+            cleanUrl.pathname + (cleanSearch ? `?${cleanSearch}` : '') + cleanUrl.hash,
+          );
+        }
+
+        checkForAppUpdate(false);
 
         let devId = await kvGet<string>('deviceId');
         if (!devId) {
@@ -2473,6 +2531,20 @@ export default function App() {
         </div>
       </Show>
 
+      <Show when={isNewerVersion(serverVersion(), appVersion)}>
+        <div class="update-banner" role="status">
+          <span>New version v{serverVersion()} is ready</span>
+          <button
+            class="btn primary small"
+            disabled={updatingApp()}
+            onClick={applyAppUpdate}
+          >
+            <LucideIcon icon={RefreshCw} size={13} />
+            <span>{updatingApp() ? 'Updating…' : 'Update now'}</span>
+          </button>
+        </div>
+      </Show>
+
       <Show when={isPaired() && wsStatus() === 'disconnected' && !(import.meta.env.DEV && localDemo())}>
         <div class="offline-banner">
           <span class="row gap">
@@ -3213,12 +3285,24 @@ export default function App() {
 
                 <div class="version-footer">
                   <span>Version v{appVersion}</span>
-                  <Show when={isNewerVersion(serverVersion(), appVersion)}>
+                  <Show
+                    when={isNewerVersion(serverVersion(), appVersion)}
+                    fallback={
+                      <button
+                        class="chip"
+                        disabled={checkingUpdate()}
+                        onClick={() => checkForAppUpdate(true)}
+                      >
+                        {checkingUpdate() ? 'Checking…' : 'Check for updates'}
+                      </button>
+                    }
+                  >
                     <button
                       class="chip primary"
-                      onClick={() => window.location.reload()}
+                      disabled={updatingApp()}
+                      onClick={applyAppUpdate}
                     >
-                      v{serverVersion()} available · Refresh
+                      {updatingApp() ? 'Updating…' : `Update to v${serverVersion()}`}
                     </button>
                   </Show>
                 </div>

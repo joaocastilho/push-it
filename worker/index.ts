@@ -83,6 +83,13 @@ export default {
     }
 
     const assetRes = await env.ASSETS.fetch(request);
-    return withSecurityHeaders(assetRes, false);
+    const contentType = assetRes.headers.get('content-type') || '';
+    const isVolatileAsset =
+      url.pathname === '/' ||
+      url.pathname === '/index.html' ||
+      url.pathname === '/sw.js' ||
+      url.pathname === '/manifest.webmanifest' ||
+      contentType.includes('text/html');
+    return withSecurityHeaders(assetRes, isVolatileAsset);
   },
 } satisfies ExportedHandler<Env>;
