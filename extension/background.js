@@ -314,6 +314,21 @@ async function syncPending(full = false) {
     if (!res.ok) return;
     const data = await res.json();
 
+    if (typeof data.clearedAt === 'number' && data.clearedAt > 0) {
+      const storedClear = (await chrome.storage.local.get(['roomClearedAt'])).roomClearedAt || 0;
+      if (data.clearedAt > storedClear) {
+        const removed = cfg.history.filter((m) => m.ts <= data.clearedAt);
+        for (const r of removed) {
+          if (r.blobId) await deleteExtBlob(r.blobId).catch(() => {});
+        }
+        cfg.history = cfg.history.filter((m) => m.ts > data.clearedAt);
+        await chrome.storage.local.set({
+          history: cfg.history,
+          roomClearedAt: data.clearedAt,
+        });
+      }
+    }
+
     if (Array.isArray(data.deletedIds) && data.deletedIds.length > 0) {
       const delSet = new Set(data.deletedIds);
       const removed = cfg.history.filter((m) => delSet.has(m.id));
@@ -497,6 +512,14 @@ async function connect() {
         if (parsed.type === 'devices_updated') {
           await refreshDevices();
           await chrome.storage.local.set({ devicesUpdatedAt: Date.now() }).catch(() => {});
+          return;
+        }
+        if (parsed.type === 'history_cleared') {
+          await clearExtBlobs().catch(() => {});
+          await chrome.storage.local.set({
+            history: [],
+            roomClearedAt: parsed.clearedAt || Date.now(),
+          });
           return;
         }
         if (parsed.type === 'history_synced') {
@@ -1226,6 +1249,22 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'MARK_READ') {
       await chrome.storage.local.set({ unreadCount: 0 });
       await updateBadge();
+      sendResponse({ ok: true });
+      return;
+    }
+
+    if (msg.type === 'CLEAR_HISTORY') {
+      const cfg = await getConfig();
+      await clearExtBlobs().catch(() => {});
+      await chrome.storage.local.set({ history: [], roomClearedAt: Date.now() });
+      if (cfg.serverUrl && cfg.keyB64 && cfg.deviceToken) {
+        const roomId = await deriveRoomId(cfg.keyB64);
+        const base = new URL(cfg.serverUrl);
+        await fetch(`${base.origin}/api/room/${encodeURIComponent(roomId)}/clear-history`, {
+          method: 'POST',
+          headers: authHeaders(cfg),
+        }).catch(() => {});
+      }
       sendResponse({ ok: true });
       return;
     }

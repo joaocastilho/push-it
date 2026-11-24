@@ -795,7 +795,23 @@ export default function App() {
       const data = (await res.json()) as {
         messages?: EncryptedEnvelope[];
         deletedIds?: string[];
+        clearedAt?: number;
       };
+
+      // Apply room-wide history clear that happened while offline
+      if (typeof data.clearedAt === 'number' && data.clearedAt > 0) {
+        const prevCleared = (await kvGet<number>('roomClearedAt')) || 0;
+        if (data.clearedAt > prevCleared) {
+          const toWipe = messages().filter((m) => m.ts <= data.clearedAt!);
+          for (const m of toWipe) {
+            await deleteMessage(m.id, m.blobId).catch(() => {});
+          }
+          if (toWipe.length > 0) {
+            setMessages((prev) => prev.filter((m) => m.ts > data.clearedAt!));
+          }
+          await kvSet('roomClearedAt', data.clearedAt).catch(() => {});
+        }
+      }
 
       // Apply global deletions that happened while offline
       if (Array.isArray(data.deletedIds) && data.deletedIds.length > 0) {
@@ -1800,6 +1816,19 @@ export default function App() {
               } else {
                 await refreshDevices(rid, k, did, tok);
               }
+              return;
+            }
+            if (parsed.type === 'history_cleared') {
+              const clearedAt =
+                typeof (parsed as { clearedAt?: number }).clearedAt === 'number'
+                  ? (parsed as { clearedAt: number }).clearedAt
+                  : Date.now();
+              await clearMessages().catch(() => {});
+              await kvSet('roomClearedAt', clearedAt).catch(() => {});
+              setMessages([]);
+              revokeAllBlobUrls();
+              postTabSync({ type: 'msg_cleared' });
+              notify('Chat history cleared');
               return;
             }
             if (parsed.type === 'history_synced') {
@@ -3719,11 +3748,23 @@ export default function App() {
                         class="btn secondary small"
                         disabled={messages().length === 0}
                         onClick={async () => {
+                          if (!(import.meta.env.DEV && localDemo())) {
+                            const rid = roomId();
+                            const did = deviceId();
+                            const tok = deviceToken();
+                            if (rid && did && tok) {
+                              await fetch(`/api/room/${encodeURIComponent(rid)}/clear-history`, {
+                                method: 'POST',
+                                headers: authHeaders(did, tok),
+                              }).catch(() => {});
+                            }
+                            await kvSet('roomClearedAt', Date.now()).catch(() => {});
+                          }
                           await clearMessages();
                           setMessages([]);
                           revokeAllBlobUrls();
                           postTabSync({ type: 'msg_cleared' });
-                          notify('Local cache cleared');
+                          notify('History cleared for all devices');
                         }}
                       >
                         Clear

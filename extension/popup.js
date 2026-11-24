@@ -1137,9 +1137,8 @@ draftEl.addEventListener('keydown', (e) => {
 });
 
 clearBtn.addEventListener('click', async () => {
-  await chrome.storage.local.set({ history: [] });
-  await clearExtBlobs().catch(() => {});
-  showToast('History cleared');
+  await chrome.runtime.sendMessage({ type: 'CLEAR_HISTORY' });
+  showToast('History cleared for all devices');
   refresh();
 });
 

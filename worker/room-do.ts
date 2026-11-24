@@ -89,6 +89,7 @@ interface AuthContext {
 }
 
 const ROOM_META_KEY = 'room:meta';
+const ROOM_CLEARED_AT_KEY = 'room:clearedAt';
 const INVITE_KEY = 'invite:active';
 const PAIR_PREFIX = 'pair:';
 const WSTICKET_PREFIX = 'wsticket:';
@@ -316,6 +317,10 @@ export class RoomDO extends DurableObject<Env> {
 
     if (path.endsWith('/delete-message') && request.method === 'POST') {
       return this.handleDeleteMessage(request, auth);
+    }
+
+    if (path.endsWith('/clear-history') && request.method === 'POST') {
+      return this.handleClearHistory();
     }
 
     if (path.endsWith('/sync-history') && request.method === 'POST') {
@@ -1380,6 +1385,23 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
+  private async handleClearHistory(): Promise<Response> {
+    const now = Date.now();
+    const [storedMsgs, storedDels] = await Promise.all([
+      this.ctx.storage.list({ prefix: MSG_PREFIX }),
+      this.ctx.storage.list({ prefix: DEL_PREFIX }),
+    ]);
+    const keys = [...storedMsgs.keys(), ...storedDels.keys()];
+    if (keys.length > 0) {
+      await this.ctx.storage.delete(keys);
+    }
+    this.ensureBlobTable();
+    this.ctx.storage.sql.exec('DELETE FROM blobs');
+    await this.ctx.storage.put<number>(ROOM_CLEARED_AT_KEY, now);
+    this.broadcastJson({ type: 'history_cleared', clearedAt: now });
+    return Response.json({ ok: true, clearedAt: now });
+  }
+
   private async handleSyncHistory(request: Request, _auth: AuthContext): Promise<Response> {
     const body = (await request.json().catch(() => ({}))) as {
       envelopes?: EncryptedEnvelope[];
@@ -1390,9 +1412,10 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     const now = Date.now();
-    const [existingMsgs, deletions] = await Promise.all([
+    const [existingMsgs, deletions, clearedAt] = await Promise.all([
       this.ctx.storage.list<StoredMessage | EncryptedEnvelope>({ prefix: MSG_PREFIX }),
       this.ctx.storage.list<number>({ prefix: DEL_PREFIX }),
+      this.ctx.storage.get<number>(ROOM_CLEARED_AT_KEY),
     ]);
 
     const existingIds = new Set<string>();
@@ -1411,6 +1434,7 @@ export class RoomDO extends DurableObject<Env> {
       if (env.ciphertext.length > 3500) continue;
       if (existingIds.has(env.id) || deletedIds.has(env.id)) continue;
       const ts = typeof env.ts === 'number' && Number.isFinite(env.ts) ? env.ts : now;
+      if (clearedAt && ts <= clearedAt) continue;
       if (now - ts > MESSAGE_TTL_MS) continue;
       if (typeof env.expiresAt === 'number' && env.expiresAt <= now) continue;
 
@@ -1445,9 +1469,10 @@ export class RoomDO extends DurableObject<Env> {
     const since = full ? 0 : Number(url.searchParams.get('since') || '0');
     const now = Date.now();
 
-    const [stored, deletions] = await Promise.all([
+    const [stored, deletions, clearedAt] = await Promise.all([
       this.ctx.storage.list<StoredMessage | EncryptedEnvelope>({ prefix: MSG_PREFIX }),
       this.ctx.storage.list<number>({ prefix: DEL_PREFIX }),
+      this.ctx.storage.get<number>(ROOM_CLEARED_AT_KEY),
     ]);
 
     const toDelete: string[] = [];
@@ -1501,7 +1526,7 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     messages.sort((a, b) => a.ts - b.ts);
-    return Response.json({ messages, deletedIds });
+    return Response.json({ messages, deletedIds, clearedAt: clearedAt || 0 });
   }
 
   private async handleSend(request: Request, auth: AuthContext): Promise<Response> {

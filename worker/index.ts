@@ -59,7 +59,7 @@ export default {
     }
 
     const roomMatch = url.pathname.match(
-      /^\/api\/room\/([^/]+)\/(init|join|invites|pin|ws-ticket|ws|send|delete-message|sync-history|ack|pending|devices|subscribe|status|vapid-public-key|blob\/[A-Za-z0-9_-]{8,64})$/,
+      /^\/api\/room\/([^/]+)\/(init|join|invites|pin|ws-ticket|ws|send|delete-message|clear-history|sync-history|ack|pending|devices|subscribe|status|vapid-public-key|blob\/[A-Za-z0-9_-]{8,64})$/,
     );
     if (roomMatch) {
       const roomId = roomMatch[1];
