@@ -132,7 +132,7 @@ function setStatus(status) {
 async function appendHistory(item) {
   const { history } = await getConfig();
   if (history.some((m) => m.id === item.id)) return false;
-  const next = [...history, item].slice(-MAX_HISTORY);
+  const next = [...history, item].sort((a, b) => a.ts - b.ts).slice(-MAX_HISTORY);
   await chrome.storage.local.set({ history: next });
   return true;
 }
@@ -295,14 +295,15 @@ async function hydrateLongTextIfNeeded(item, cfg) {
   }
 }
 
-async function syncPending() {
+async function syncPending(full = false) {
   const cfg = await getConfig();
   if (!cfg.serverUrl || !cfg.keyB64 || !cfg.deviceToken) return;
   try {
     const roomId = await deriveRoomId(cfg.keyB64);
     const base = new URL(cfg.serverUrl);
+    const qs = full || cfg.lastSeenTs === 0 ? 'full=1' : `since=${cfg.lastSeenTs}`;
     const res = await fetch(
-      `${base.origin}/api/room/${encodeURIComponent(roomId)}/pending?since=${cfg.lastSeenTs}`,
+      `${base.origin}/api/room/${encodeURIComponent(roomId)}/pending?${qs}`,
       { headers: authHeaders(cfg) },
     );
     if (res.status === 401) {
@@ -461,7 +462,7 @@ async function connect() {
       reconnectDelay = 3000;
       setStatus('connected');
       await refreshDevices();
-      await syncPending();
+      await syncPending(true);
       pingTimer = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send('ping');
@@ -476,6 +477,10 @@ async function connect() {
         if (parsed.type === 'devices_updated') {
           await refreshDevices();
           await chrome.storage.local.set({ devicesUpdatedAt: Date.now() }).catch(() => {});
+          return;
+        }
+        if (parsed.type === 'history_synced') {
+          await syncPending(true);
           return;
         }
         if (parsed.type === 'message_deleted' && parsed.id) {

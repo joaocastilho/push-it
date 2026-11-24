@@ -690,13 +690,15 @@ export default function App() {
     k = keyB64(),
     myId = deviceId(),
     tok = deviceToken(),
+    full = false,
   ) {
     if (!rid || !k || !myId || !tok) return;
     if (import.meta.env.DEV && localDemo()) return;
     try {
-      const since = (await kvGet<number>('lastSeenTs')) || 0;
+      const since = full ? 0 : (await kvGet<number>('lastSeenTs')) || 0;
+      const qs = full ? 'full=1' : `since=${since}`;
       const res = await fetch(
-        `/api/room/${encodeURIComponent(rid)}/pending?since=${since}`,
+        `/api/room/${encodeURIComponent(rid)}/pending?${qs}`,
         { headers: authHeaders(myId, tok) },
       );
       if (res.status === 401) {
@@ -766,6 +768,77 @@ export default function App() {
       }
     } catch {
       // ignore
+    }
+  }
+
+  async function syncFullRoomHistory(
+    rid = roomId(),
+    k = keyB64(),
+    myId = deviceId(),
+    tok = deviceToken(),
+    manual = false,
+  ) {
+    if (!rid || !k || !myId || !tok) return;
+    if (import.meta.env.DEV && localDemo()) {
+      if (manual) notify('History is synced');
+      return;
+    }
+    try {
+      const now = Date.now();
+      const localList = messages().filter(
+        (m) =>
+          !m.id.startsWith('opt-') &&
+          m.status !== 'sending' &&
+          m.status !== 'failed' &&
+          (!m.expiresAt || m.expiresAt > now) &&
+          m.content.length <= LONG_TEXT_THRESHOLD,
+      );
+
+      if (localList.length > 0) {
+        const envelopes: EncryptedEnvelope[] = [];
+        for (const m of localList.slice(-200)) {
+          try {
+            const env = await encryptPayload(
+              k,
+              rid,
+              m.senderId || myId,
+              {
+                type: m.type,
+                content: m.content,
+                title: m.title,
+                senderName: m.senderName,
+                senderOs: m.senderOs,
+                targetNames: m.targetNames,
+                blobId: m.blobId,
+                blobIv: m.blobIv,
+                fileName: m.fileName,
+                mimeType: m.mimeType,
+                fileSize: m.fileSize,
+                expiresAt: m.expiresAt,
+              },
+              undefined,
+              { id: m.id, ts: m.ts },
+            );
+            envelopes.push(env);
+          } catch {
+            // skip unencryptable item
+          }
+        }
+
+        if (envelopes.length > 0) {
+          await fetch(`/api/room/${encodeURIComponent(rid)}/sync-history`, {
+            method: 'POST',
+            headers: authHeaders(myId, tok, { 'content-type': 'application/json' }),
+            body: JSON.stringify({ envelopes }),
+          }).catch(() => {});
+        }
+      }
+
+      await syncPending(rid, k, myId, tok, true);
+      await kvSet('historyBackfilledRoom', rid).catch(() => {});
+      if (manual) notify('Room history synced!');
+    } catch {
+      if (manual) notify('Could not sync history');
     }
   }
 
@@ -1580,7 +1653,14 @@ export default function App() {
           retryDelay = 1200;
           setWsStatus('connected');
           refreshDevices(rid, k, did, tok);
-          syncPending(rid, k, did, tok);
+          syncPending(rid, k, did, tok, true);
+          kvGet<string>('historyBackfilledRoom')
+            .then((doneRid) => {
+              if (doneRid !== rid) {
+                syncFullRoomHistory(rid, k, did, tok, false);
+              }
+            })
+            .catch(() => {});
           pingTimer = window.setInterval(() => {
             if (!ws || ws.readyState !== WebSocket.OPEN) return;
             ws.send('ping');
@@ -1634,6 +1714,10 @@ export default function App() {
               } else {
                 await refreshDevices(rid, k, did, tok);
               }
+              return;
+            }
+            if (parsed.type === 'history_synced') {
+              await syncPending(rid, k, did, tok, true);
               return;
             }
             if (parsed.type === 'message_deleted' && typeof (parsed as { id?: string }).id === 'string') {
@@ -1738,7 +1822,9 @@ export default function App() {
         return next;
       }
       added = true;
-      return [...prev, item].slice(-500);
+      const merged = [...prev, item];
+      merged.sort((a, b) => a.ts - b.ts);
+      return merged.slice(-500);
     });
     if (added) {
       if (item.direction === 'out' || isNearBottom()) {
@@ -3414,18 +3500,26 @@ export default function App() {
                       <strong>Chat History</strong>
                       <span class="muted">Stored only on this device</span>
                     </div>
-                    <button
-                      class="btn secondary small"
-                      disabled={messages().length === 0}
-                      onClick={async () => {
-                        await clearMessages();
-                        setMessages([]);
-                        setBlobUrls({});
-                        notify('History cleared');
-                      }}
-                    >
-                      Clear
-                    </button>
+                    <div class="row gap">
+                      <button
+                        class="btn secondary small"
+                        onClick={() => syncFullRoomHistory(roomId(), keyB64(), deviceId(), deviceToken(), true)}
+                      >
+                        Sync
+                      </button>
+                      <button
+                        class="btn secondary small"
+                        disabled={messages().length === 0}
+                        onClick={async () => {
+                          await clearMessages();
+                          setMessages([]);
+                          setBlobUrls({});
+                          notify('History cleared');
+                        }}
+                      >
+                        Clear
+                      </button>
+                    </div>
                   </div>
 
                   <div class="divider" />

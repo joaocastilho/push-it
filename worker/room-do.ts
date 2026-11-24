@@ -318,6 +318,10 @@ export class RoomDO extends DurableObject<Env> {
       return this.handleDeleteMessage(request, auth);
     }
 
+    if (path.endsWith('/sync-history') && request.method === 'POST') {
+      return this.handleSyncHistory(request, auth);
+    }
+
     if (path.endsWith('/ack') && request.method === 'POST') {
       return this.handleAck(request, auth);
     }
@@ -1384,9 +1388,69 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
+  private async handleSyncHistory(request: Request, _auth: AuthContext): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as {
+      envelopes?: EncryptedEnvelope[];
+    };
+    const envelopes = Array.isArray(body.envelopes) ? body.envelopes.slice(-MAX_PENDING_MESSAGES) : [];
+    if (envelopes.length === 0) {
+      return Response.json({ ok: true, added: 0 });
+    }
+
+    const now = Date.now();
+    const [existingMsgs, deletions] = await Promise.all([
+      this.ctx.storage.list<StoredMessage | EncryptedEnvelope>({ prefix: MSG_PREFIX }),
+      this.ctx.storage.list<number>({ prefix: DEL_PREFIX }),
+    ]);
+
+    const existingIds = new Set<string>();
+    for (const entry of existingMsgs.values()) {
+      const env = 'envelope' in entry ? entry.envelope : entry;
+      existingIds.add(env.id);
+    }
+    const deletedIds = new Set<string>();
+    for (const delKey of deletions.keys()) {
+      deletedIds.add(delKey.slice(DEL_PREFIX.length));
+    }
+
+    let added = 0;
+    for (const env of envelopes) {
+      if (!env || !env.id || !env.iv || !env.ciphertext || !env.senderId) continue;
+      if (env.ciphertext.length > 3500) continue;
+      if (existingIds.has(env.id) || deletedIds.has(env.id)) continue;
+      const ts = typeof env.ts === 'number' && Number.isFinite(env.ts) ? env.ts : now;
+      if (now - ts > MESSAGE_TTL_MS) continue;
+      if (typeof env.expiresAt === 'number' && env.expiresAt <= now) continue;
+
+      const cleanEnv: EncryptedEnvelope = {
+        id: env.id,
+        senderId: env.senderId,
+        iv: env.iv,
+        ciphertext: env.ciphertext,
+        ts,
+        expiresAt: env.expiresAt,
+      };
+      const paddedTs = String(ts).padStart(15, '0');
+      await this.ctx.storage.put<StoredMessage>(`${MSG_PREFIX}${paddedTs}:${env.id}`, {
+        envelope: cleanEnv,
+        remaining: [],
+      });
+      existingIds.add(env.id);
+      added++;
+    }
+
+    if (added > 0) {
+      await this.pruneOldMessages(now);
+      this.broadcastJson({ type: 'history_synced', added });
+    }
+
+    return Response.json({ ok: true, added });
+  }
+
   private async handlePending(url: URL, auth: AuthContext): Promise<Response> {
     const deviceId = auth.deviceId;
-    const since = Number(url.searchParams.get('since') || '0');
+    const full = url.searchParams.get('full') === '1';
+    const since = full ? 0 : Number(url.searchParams.get('since') || '0');
     const now = Date.now();
 
     const [stored, deletions] = await Promise.all([
@@ -1409,14 +1473,6 @@ export class RoomDO extends DurableObject<Env> {
         continue;
       }
 
-      const targetedToDevice =
-        env.senderId === deviceId ||
-        !Array.isArray(env.targetIds) ||
-        env.targetIds.length === 0 ||
-        env.targetIds.includes(deviceId);
-
-      if (!targetedToDevice) continue;
-
       if (isWrapped && remaining.includes(deviceId)) {
         const nextRemaining = remaining.filter((id) => id !== deviceId);
         if (nextRemaining.length === 0) {
@@ -1425,8 +1481,8 @@ export class RoomDO extends DurableObject<Env> {
         toUpdate.push([key, { envelope: env, remaining: nextRemaining }]);
       }
 
-      // Return all room messages newer than `since` (or undelivered) so every device shares the same room chat
-      if (env.ts > since || (isWrapped && remaining.includes(deviceId))) {
+      // Every device in the room has equal access to the full room chat history
+      if (full || env.ts > since || (isWrapped && remaining.includes(deviceId))) {
         messages.push(env);
       }
     }

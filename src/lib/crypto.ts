@@ -212,8 +212,9 @@ export async function encryptPayload(
   senderId: string,
   payload: DecryptedPayload,
   targetIds?: string[],
+  opts?: { id?: string; ts?: number },
 ): Promise<EncryptedEnvelope> {
-  const id = crypto.randomUUID();
+  const id = opts?.id || crypto.randomUUID();
   const { iv, ciphertext } = await encryptJson(
     keyB64,
     payload,
@@ -225,7 +226,7 @@ export async function encryptPayload(
     targetIds: targetIds && targetIds.length > 0 ? targetIds : undefined,
     iv,
     ciphertext,
-    ts: Date.now(),
+    ts: opts?.ts || Date.now(),
     expiresAt: payload.expiresAt,
   };
 }
