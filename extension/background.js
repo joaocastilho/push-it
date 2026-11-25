@@ -37,9 +37,11 @@ let ws = null;
 let pingTimer = null;
 let pongTimer = null;
 let reconnectTimer = null;
-let reconnectDelay = 3000;
+let reconnectDelay = 2000;
 let wsStatus = 'disconnected';
 let cachedDevices = [];
+let lastPongAt = 0;
+let lastWakeSyncAt = 0;
 const notifUrls = new Map();
 
 async function getConfig() {
@@ -344,6 +346,7 @@ async function syncPending(full = false) {
 
     if (!data.messages?.length) return;
 
+    const undeliveredSet = new Set(Array.isArray(data.undeliveredIds) ? data.undeliveredIds : []);
     let maxTs = cfg.lastSeenTs;
     for (const env of data.messages) {
       try {
@@ -372,7 +375,10 @@ async function syncPending(full = false) {
         if (item.ts > maxTs) maxTs = item.ts;
         item = await hydrateLongTextIfNeeded(item, cfg);
         const added = await appendHistory(item);
-        if (added && !isSelf && cfg.lastSeenTs > 0) {
+        const shouldTriggerIncoming =
+          !isSelf &&
+          (undeliveredSet.has(item.id) || (added && cfg.lastSeenTs > 0 && item.ts > cfg.lastSeenTs));
+        if (shouldTriggerIncoming) {
           await handleIncoming(item, cfg.autoOpen);
         }
       } catch {
@@ -479,7 +485,8 @@ async function connect() {
     ws = new WebSocket(wsUrl);
 
     ws.onopen = async () => {
-      reconnectDelay = 3000;
+      reconnectDelay = 2000;
+      lastPongAt = Date.now();
       setStatus('connected');
       await refreshDevices();
       await syncPending(true);
@@ -501,6 +508,7 @@ async function connect() {
     ws.onmessage = async (event) => {
       if (typeof event.data !== 'string') return;
       if (event.data === 'pong') {
+        lastPongAt = Date.now();
         if (pongTimer) {
           clearTimeout(pongTimer);
           pongTimer = null;
@@ -1078,22 +1086,87 @@ async function joinRoomWithCode(rawServerUrl, rawCode, roomPin) {
   return completeRoomJoin(parsed.origin, keyB64, data.inviteToken, roomPin);
 }
 
+async function wakeAndSync(forceReconnect = false) {
+  const now = Date.now();
+  if (!forceReconnect && now - lastWakeSyncAt < 3000) return;
+  lastWakeSyncAt = now;
+
+  // Immediately pull any queued messages over HTTP so links open right away on wake
+  syncPending(false).catch(() => {});
+
+  const isZombie =
+    !ws ||
+    ws.readyState !== WebSocket.OPEN ||
+    (lastPongAt > 0 && now - lastPongAt > 25000);
+
+  if (forceReconnect || isZombie) {
+    reconnectDelay = 2000;
+    stopSocket();
+    connect();
+  } else {
+    try {
+      ws.send('ping');
+      if (pongTimer) clearTimeout(pongTimer);
+      pongTimer = setTimeout(() => {
+        try {
+          ws?.close();
+        } catch {
+          // ignore
+        }
+      }, 4500);
+    } catch {
+      stopSocket();
+      connect();
+    }
+  }
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   setupContextMenus();
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
-  connect();
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+  wakeAndSync(true);
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 1 });
-  connect();
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+  wakeAndSync(true);
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === KEEPALIVE_ALARM) {
-    connect();
+    wakeAndSync(false);
   }
 });
+
+// Immediately wake, sync, and auto-open pending links when PC unlocks or wakes from sleep
+if (chrome.idle?.onStateChanged) {
+  chrome.idle.onStateChanged.addListener((newState) => {
+    if (newState === 'active') {
+      wakeAndSync(true);
+    }
+  });
+}
+
+// Immediately wake & sync when the user opens or focuses the browser window
+if (chrome.windows?.onFocusChanged) {
+  chrome.windows.onFocusChanged.addListener((windowId) => {
+    if (windowId !== chrome.windows.WINDOW_ID_NONE) {
+      wakeAndSync(false);
+    }
+  });
+}
+
+if (chrome.tabs?.onActivated) {
+  chrome.tabs.onActivated.addListener(() => {
+    wakeAndSync(false);
+  });
+}
+
+if (chrome.tabs?.onCreated) {
+  chrome.tabs.onCreated.addListener(() => {
+    wakeAndSync(false);
+  });
+}
 
 chrome.notifications.onClicked.addListener(async (notifId) => {
   chrome.notifications.clear(notifId);
@@ -1364,8 +1437,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 self.addEventListener('online', () => {
-  reconnectDelay = 3000;
-  connect();
+  wakeAndSync(true);
 });
 
 self.addEventListener('offline', () => {

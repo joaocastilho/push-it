@@ -1478,6 +1478,7 @@ export class RoomDO extends DurableObject<Env> {
     const toDelete: string[] = [];
     const toUpdate: Array<[string, StoredMessage]> = [];
     const fullyDeliveredIds: string[] = [];
+    const undeliveredIds: string[] = [];
     const messages: EncryptedEnvelope[] = [];
 
     for (const [key, entry] of stored) {
@@ -1491,6 +1492,7 @@ export class RoomDO extends DurableObject<Env> {
       }
 
       if (isWrapped && remaining.includes(deviceId)) {
+        undeliveredIds.push(env.id);
         const nextRemaining = remaining.filter((id) => id !== deviceId);
         if (nextRemaining.length === 0) {
           fullyDeliveredIds.push(env.id);
@@ -1526,7 +1528,7 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     messages.sort((a, b) => a.ts - b.ts);
-    return Response.json({ messages, deletedIds, clearedAt: clearedAt || 0 });
+    return Response.json({ messages, deletedIds, undeliveredIds, clearedAt: clearedAt || 0 });
   }
 
   private async handleSend(request: Request, auth: AuthContext): Promise<Response> {

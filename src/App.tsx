@@ -238,6 +238,7 @@ export default function App() {
   const [importInput, setImportInput] = createSignal<string>('');
   const [toast, setToast] = createSignal<string>('');
   const [popupWarning, setPopupWarning] = createSignal<string>('');
+  const [blockedAutoOpenUrl, setBlockedAutoOpenUrl] = createSignal<string>('');
   const [unreadCount, setUnreadCount] = createSignal<number>(0);
   const [serverVersion, setServerVersion] = createSignal<string | null>(null);
   const [updatingApp, setUpdatingApp] = createSignal<boolean>(false);
@@ -781,8 +782,8 @@ export default function App() {
     if (!rid || !k || !myId || !tok) return;
     if (import.meta.env.DEV && localDemo()) return;
     try {
-      const since = full ? 0 : (await kvGet<number>('lastSeenTs')) || 0;
-      const qs = full ? 'full=1' : `since=${since}`;
+      const prevLastSeen = (await kvGet<number>('lastSeenTs')) || 0;
+      const qs = full ? 'full=1' : `since=${prevLastSeen}`;
       const res = await fetch(
         `/api/room/${encodeURIComponent(rid)}/pending?${qs}`,
         { headers: authHeaders(myId, tok) },
@@ -795,6 +796,7 @@ export default function App() {
       const data = (await res.json()) as {
         messages?: EncryptedEnvelope[];
         deletedIds?: string[];
+        undeliveredIds?: string[];
         clearedAt?: number;
       };
 
@@ -827,7 +829,8 @@ export default function App() {
 
       if (!data.messages?.length) return;
 
-      let maxTs = since;
+      const undeliveredSet = new Set(data.undeliveredIds || []);
+      let maxTs = prevLastSeen;
       for (const env of data.messages) {
         try {
           const decrypted = await decryptEnvelope(k, rid, env);
@@ -857,7 +860,10 @@ export default function App() {
           await saveMessage(item);
           addOrUpdateMessage(item);
           item = await ensureBlobHydrated(item, rid, k, myId, tok);
-          if (!existed && !isSelf && since > 0) {
+          const shouldTriggerIncoming =
+            !isSelf &&
+            (undeliveredSet.has(item.id) || (!existed && prevLastSeen > 0 && item.ts > prevLastSeen));
+          if (shouldTriggerIncoming) {
             handleIncomingAction(item);
           }
         } catch {
@@ -865,7 +871,7 @@ export default function App() {
         }
       }
 
-      if (maxTs > since) {
+      if (maxTs > prevLastSeen) {
         await kvSet('lastSeenTs', maxTs);
       }
     } catch {
@@ -1463,6 +1469,7 @@ export default function App() {
         navigator.serviceWorker.addEventListener('message', onSwMessage);
       }
       document.addEventListener('visibilitychange', onVisibility);
+      window.addEventListener('pageshow', onOnlineOrFocus);
       window.addEventListener('online', onOnlineOrFocus);
       window.addEventListener('focus', onOnlineOrFocus);
       window.addEventListener('keydown', onGlobalKeyDown);
@@ -1616,6 +1623,7 @@ export default function App() {
           navigator.serviceWorker.removeEventListener('message', onSwMessage);
         }
         document.removeEventListener('visibilitychange', onVisibility);
+        window.removeEventListener('pageshow', onOnlineOrFocus);
         window.removeEventListener('online', onOnlineOrFocus);
         window.removeEventListener('focus', onOnlineOrFocus);
         window.removeEventListener('keydown', onGlobalKeyDown);
@@ -1956,9 +1964,11 @@ export default function App() {
       if (autoOpen()) {
         const win = window.open(item.content, '_blank', 'noopener,noreferrer');
         if (!win) {
-          setPopupWarning('Allow pop-ups for this site to open incoming links automatically.');
+          setBlockedAutoOpenUrl(item.content);
+          setPopupWarning(`Link from ${from} is ready — tap Open (or allow pop-ups for automatic opening).`);
           notify(`Link from ${from}`);
         } else {
+          setBlockedAutoOpenUrl('');
           setPopupWarning('');
           notify(`Opened link from ${from}`);
         }
@@ -2955,7 +2965,24 @@ export default function App() {
       </Show>
 
       <Show when={popupWarning() && view() === 'chat' && isPaired()}>
-        <div class="banner warning">{popupWarning()}</div>
+        <div class="banner warning row between">
+          <span>{popupWarning()}</span>
+          <Show when={blockedAutoOpenUrl()}>
+            <a
+              class="btn primary small"
+              href={blockedAutoOpenUrl()}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={() => {
+                setBlockedAutoOpenUrl('');
+                setPopupWarning('');
+              }}
+            >
+              <LucideIcon icon={ExternalLink} size={13} />
+              <span>Open</span>
+            </a>
+          </Show>
+        </div>
       </Show>
 
       <Show when={showNameConflict()}>

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Push It",
-  "version": "2.2.12",
+  "version": "2.2.13",
   "description": "Send links and notes privately between your devices.",
   "icons": {
     "128": "icon128.png"
@@ -21,6 +21,7 @@
     "tabs",
     "activeTab",
     "alarms",
+    "idle",
     "contextMenus"
   ],
   "host_permissions": [
