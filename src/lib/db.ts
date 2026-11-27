@@ -31,8 +31,11 @@ export interface StoredBlob {
 const DB_NAME = 'push-it-db';
 const DB_VERSION = 2;
 
+let cachedDbPromise: Promise<IDBDatabase> | null = null;
+
 function openDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (cachedDbPromise) return cachedDbPromise;
+  cachedDbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -46,9 +49,23 @@ function openDb(): Promise<IDBDatabase> {
         db.createObjectStore('blobs', { keyPath: 'id' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = () => {
+        cachedDbPromise = null;
+      };
+      db.onversionchange = () => {
+        db.close();
+        cachedDbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      cachedDbPromise = null;
+      reject(req.error);
+    };
   });
+  return cachedDbPromise;
 }
 
 export async function kvGet<T = string>(key: string): Promise<T | undefined> {
@@ -86,6 +103,20 @@ export async function saveMessage(msg: StoredMessage): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction('messages', 'readwrite');
     tx.objectStore('messages').put(msg);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function saveMessages(msgs: StoredMessage[]): Promise<void> {
+  if (!msgs.length) return;
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('messages', 'readwrite');
+    const store = tx.objectStore('messages');
+    for (const msg of msgs) {
+      store.put(msg);
+    }
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

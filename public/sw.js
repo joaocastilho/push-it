@@ -13,8 +13,14 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 
+let cachedDbPromise = null;
+const swTextEncoder = new TextEncoder();
+const swTextDecoder = new TextDecoder();
+const swAesKeyCache = new Map();
+
 function openDb() {
-  return new Promise((resolve, reject) => {
+  if (cachedDbPromise) return cachedDbPromise;
+  cachedDbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -28,9 +34,23 @@ function openDb() {
         db.createObjectStore('blobs', { keyPath: 'id' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = () => {
+        cachedDbPromise = null;
+      };
+      db.onversionchange = () => {
+        db.close();
+        cachedDbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      cachedDbPromise = null;
+      reject(req.error);
+    };
   });
+  return cachedDbPromise;
 }
 
 async function kvGet(key) {
@@ -104,9 +124,12 @@ async function deleteBlob(id) {
 }
 
 function toBase64Url(bytes) {
-  let bin = '';
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const chunks = [];
+  const CHUNK_SIZE = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    chunks.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK_SIZE)));
+  }
+  return btoa(chunks.join('')).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function fromBase64Url(b64) {
@@ -140,13 +163,31 @@ async function deriveRoomId(keyB64) {
   return toBase64Url(hash).slice(0, 24);
 }
 
+async function importSwAesKey(keyB64) {
+  const cached = swAesKeyCache.get(keyB64);
+  if (cached) return cached;
+  const promise = crypto.subtle.importKey(
+    'raw',
+    fromBase64Url(keyB64),
+    { name: 'AES-GCM' },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+  if (swAesKeyCache.size >= 4) {
+    const oldest = swAesKeyCache.keys().next().value;
+    if (oldest !== undefined) swAesKeyCache.delete(oldest);
+  }
+  swAesKeyCache.set(keyB64, promise);
+  promise.catch(() => swAesKeyCache.delete(keyB64));
+  return promise;
+}
+
 async function encryptBytes(keyB64, plainBytes, aad) {
-  const rawKey = fromBase64Url(keyB64);
-  const key = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['encrypt']);
+  const key = await importSwAesKey(keyB64);
   const iv = new Uint8Array(12);
   crypto.getRandomValues(iv);
   const algo = aad
-    ? { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad) }
+    ? { name: 'AES-GCM', iv, additionalData: swTextEncoder.encode(aad) }
     : { name: 'AES-GCM', iv };
   const cipherBuf = await crypto.subtle.encrypt(algo, key, plainBytes);
   return {
@@ -156,15 +197,14 @@ async function encryptBytes(keyB64, plainBytes, aad) {
 }
 
 async function decryptJson(keyB64, ivB64, ciphertextB64, aad) {
-  const rawKey = fromBase64Url(keyB64);
-  const key = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt']);
+  const key = await importSwAesKey(keyB64);
   const iv = fromBase64Url(ivB64);
   const ciphertext = fromBase64Url(ciphertextB64);
   const algo = aad
-    ? { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad) }
+    ? { name: 'AES-GCM', iv, additionalData: swTextEncoder.encode(aad) }
     : { name: 'AES-GCM', iv };
   const plainBuf = await crypto.subtle.decrypt(algo, key, ciphertext);
-  return JSON.parse(new TextDecoder().decode(plainBuf));
+  return JSON.parse(swTextDecoder.decode(plainBuf));
 }
 
 async function encryptPayload(keyB64, roomId, senderId, payload, targetIds) {
