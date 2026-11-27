@@ -912,9 +912,7 @@ export default function App() {
 
       if (toPersist.length > 0) {
         await saveMessages(toPersist);
-        for (const item of toPersist) {
-          addOrUpdateMessage(item);
-        }
+        mergeMessages(toPersist);
         for (const item of toHydrate) {
           await ensureBlobHydrated(item, rid, k, myId, tok);
         }
@@ -2041,6 +2039,33 @@ export default function App() {
     },
   );
 
+  function mergeMessages(items: StoredMessage[]) {
+    if (!items.length) return;
+    let addedCount = 0;
+    let hasOutgoing = false;
+    setMessages((prev) => {
+      const map = new Map<string, StoredMessage>();
+      for (const m of prev) map.set(m.id, m);
+      for (const item of items) {
+        if (!map.has(item.id)) {
+          addedCount++;
+          if (item.direction === 'out') hasOutgoing = true;
+        }
+        map.set(item.id, item);
+      }
+      const merged = Array.from(map.values());
+      merged.sort((a, b) => a.ts - b.ts);
+      return merged.slice(-500);
+    });
+    if (addedCount > 0) {
+      if (hasOutgoing || isNearBottom()) {
+        scrollToBottom(true);
+      } else {
+        setUnseenIncoming((c) => c + addedCount);
+      }
+    }
+  }
+
   function addOrUpdateMessage(item: StoredMessage) {
     let added = false;
     setMessages((prev) => {
@@ -2142,7 +2167,11 @@ export default function App() {
       throw new Error('This device was removed from the room');
     }
     if (!res.ok) {
-      throw new Error('File too large (max 8 MB)');
+      throw new Error(
+        res.status === 413
+          ? 'File too large (max 7.5 MB)'
+          : `Could not upload file (${res.status})`,
+      );
     }
     return { blobId, blobIv };
   }
@@ -4466,7 +4495,11 @@ export default function App() {
 
             <footer class="composer-wrap">
               <div class="composer-meta-row">
-                <span class="composer-hint">Enter to push · Shift+Enter for newline</span>
+                <span class="composer-hint">
+                  {localOs === 'android' || localOs === 'ios'
+                    ? 'Paste or attach links, notes & files'
+                    : 'Enter to push · Shift+Enter for newline'}
+                </span>
                 <label class={`burn-control ${burnMs() > 0 ? 'active' : ''}`}>
                   <LucideIcon icon={Flame} size={13} />
                   <span>{burnMs() > 0 ? 'Auto-burn:' : 'Auto-burn:'}</span>
