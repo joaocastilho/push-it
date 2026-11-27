@@ -1090,42 +1090,60 @@ draftEl.addEventListener('paste', (e) => {
   }
 });
 
+let sendingBusy = false;
+
 sendTabBtn.addEventListener('click', async () => {
+  if (sendingBusy) return;
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.url || !isSafeHttpUrl(tab.url)) {
     showToast('Open a website tab first');
     return;
   }
-  const res = await chrome.runtime.sendMessage({
-    type: 'SEND',
-    content: tab.url,
-    title: tab.title,
-    ...getSelectedTargetsPayload(),
-  });
-  if (!res.ok) {
-    showToast(res.error || 'Could not send right now');
-    return;
+  sendingBusy = true;
+  sendTabBtn.disabled = true;
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: 'SEND',
+      content: tab.url,
+      title: tab.title,
+      ...getSelectedTargetsPayload(),
+    });
+    if (!res.ok) {
+      showToast(res.error || 'Could not send right now');
+      return;
+    }
+    showToast('Pushed!');
+    refresh();
+  } finally {
+    sendingBusy = false;
+    sendTabBtn.disabled = false;
   }
-  showToast('Pushed!');
-  refresh();
 });
 
 async function submitDraft() {
+  if (sendingBusy) return;
   const content = draftEl.value.trim();
   if (!content) return;
-  const res = await chrome.runtime.sendMessage({
-    type: 'SEND',
-    content,
-    ...getSelectedTargetsPayload(),
-  });
-  if (!res.ok) {
-    showToast(res.error || 'Could not send right now');
-    return;
+  sendingBusy = true;
+  sendDraftBtn.disabled = true;
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: 'SEND',
+      content,
+      ...getSelectedTargetsPayload(),
+    });
+    if (!res.ok) {
+      showToast(res.error || 'Could not send right now');
+      return;
+    }
+    draftEl.value = '';
+    autoResizeDraft();
+    showToast('Pushed!');
+    refresh();
+  } finally {
+    sendingBusy = false;
+    sendDraftBtn.disabled = false;
   }
-  draftEl.value = '';
-  autoResizeDraft();
-  showToast('Pushed!');
-  refresh();
 }
 
 sendDraftBtn.addEventListener('click', submitDraft);
@@ -1134,6 +1152,24 @@ draftEl.addEventListener('keydown', (e) => {
     e.preventDefault();
     submitDraft();
   }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && showingSettings) {
+    showingSettings = false;
+    refresh();
+  }
+});
+
+window.addEventListener('unload', () => {
+  for (const url of blobObjectUrls.values()) {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      // ignore
+    }
+  }
+  blobObjectUrls.clear();
 });
 
 clearBtn.addEventListener('click', async () => {

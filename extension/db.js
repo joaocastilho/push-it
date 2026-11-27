@@ -1,8 +1,11 @@
 const DB_NAME = 'push-it-ext-blobs';
 const DB_VERSION = 1;
 
+let cachedBlobDbPromise = null;
+
 function openBlobDb() {
-  return new Promise((resolve, reject) => {
+  if (cachedBlobDbPromise) return cachedBlobDbPromise;
+  cachedBlobDbPromise = new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
@@ -10,9 +13,23 @@ function openBlobDb() {
         db.createObjectStore('blobs', { keyPath: 'id' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = () => {
+        cachedBlobDbPromise = null;
+      };
+      db.onversionchange = () => {
+        db.close();
+        cachedBlobDbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      cachedBlobDbPromise = null;
+      reject(req.error);
+    };
   });
+  return cachedBlobDbPromise;
 }
 
 export async function saveExtBlob(blob) {

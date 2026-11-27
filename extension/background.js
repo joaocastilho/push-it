@@ -1170,8 +1170,16 @@ if (chrome.tabs?.onCreated) {
 
 chrome.notifications.onClicked.addListener(async (notifId) => {
   chrome.notifications.clear(notifId);
-  const url = notifUrls.get(notifId);
+  let url = notifUrls.get(notifId);
   notifUrls.delete(notifId);
+  if (!url && notifId.startsWith('push-it-')) {
+    const msgId = notifId.slice('push-it-'.length);
+    const { history } = await chrome.storage.local.get({ history: [] });
+    const match = Array.isArray(history) ? history.find((m) => m.id === msgId) : null;
+    if (match && match.type === 'link' && isSafeHttpUrl(match.content)) {
+      url = match.content;
+    }
+  }
   if (url && isSafeHttpUrl(url)) {
     await chrome.tabs.create({ url, active: true });
   }

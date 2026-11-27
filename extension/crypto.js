@@ -1,4 +1,7 @@
 const TOKEN_RE = /^[A-Za-z0-9_-]{24,128}$/;
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+const aesKeyCache = new Map();
 
 export function detectOs() {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
@@ -73,9 +76,12 @@ export function deviceColorIndex(deviceId) {
 }
 
 export function toBase64Url(bytes) {
-  let bin = '';
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const chunks = [];
+  const CHUNK_SIZE = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+    chunks.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK_SIZE)));
+  }
+  return btoa(chunks.join('')).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 export function fromBase64Url(b64) {
@@ -138,21 +144,32 @@ export function blobAad(roomId, blobId) {
 }
 
 export async function deriveRoomId(keyB64) {
-  const data = new TextEncoder().encode(`push-it-room-v1:${keyB64}`);
+  const data = textEncoder.encode(`push-it-room-v1:${keyB64}`);
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
   return toBase64Url(hash).slice(0, 24);
 }
 
 export async function deriveRoomAuth(keyB64) {
-  const data = new TextEncoder().encode(`push-it-auth-v1:${keyB64}`);
+  const data = textEncoder.encode(`push-it-auth-v1:${keyB64}`);
   const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
   return toBase64Url(hash);
 }
 
 export async function importAesKey(keyB64) {
-  const raw = fromBase64Url(keyB64);
-  if (raw.length !== 32) throw new Error('Key must be 256 bits');
-  return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  const cached = aesKeyCache.get(keyB64);
+  if (cached) return cached;
+  const promise = (async () => {
+    const raw = fromBase64Url(keyB64);
+    if (raw.length !== 32) throw new Error('Key must be 256 bits');
+    return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  })();
+  if (aesKeyCache.size >= 4) {
+    const oldest = aesKeyCache.keys().next().value;
+    if (oldest !== undefined) aesKeyCache.delete(oldest);
+  }
+  aesKeyCache.set(keyB64, promise);
+  promise.catch(() => aesKeyCache.delete(keyB64));
+  return promise;
 }
 
 export async function encryptBytes(keyB64, plainBytes, aad) {
@@ -160,7 +177,7 @@ export async function encryptBytes(keyB64, plainBytes, aad) {
   const iv = new Uint8Array(12);
   crypto.getRandomValues(iv);
   const algo = aad
-    ? { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad) }
+    ? { name: 'AES-GCM', iv, additionalData: textEncoder.encode(aad) }
     : { name: 'AES-GCM', iv };
   const cipherBuf = await crypto.subtle.encrypt(algo, key, plainBytes);
   return {
@@ -173,21 +190,21 @@ export async function decryptBytes(keyB64, ivB64, cipherBytes, aad) {
   const key = await importAesKey(keyB64);
   const iv = fromBase64Url(ivB64);
   const algo = aad
-    ? { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(aad) }
+    ? { name: 'AES-GCM', iv, additionalData: textEncoder.encode(aad) }
     : { name: 'AES-GCM', iv };
   const plainBuf = await crypto.subtle.decrypt(algo, key, cipherBytes);
   return new Uint8Array(plainBuf);
 }
 
 export async function encryptJson(keyB64, value, aad) {
-  const plain = new TextEncoder().encode(JSON.stringify(value));
+  const plain = textEncoder.encode(JSON.stringify(value));
   const { iv, ciphertext } = await encryptBytes(keyB64, plain, aad);
   return { iv, ciphertext: toBase64Url(ciphertext) };
 }
 
 export async function decryptJson(keyB64, ivB64, ciphertextB64, aad) {
   const plain = await decryptBytes(keyB64, ivB64, fromBase64Url(ciphertextB64), aad);
-  return JSON.parse(new TextDecoder().decode(plain));
+  return JSON.parse(textDecoder.decode(plain));
 }
 
 export async function encryptPayload(keyB64, roomId, senderId, payload, targetIds) {
