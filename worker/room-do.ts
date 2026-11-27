@@ -367,7 +367,7 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     if (path.endsWith('/status') && request.method === 'GET') {
-      return this.handleStatus();
+      return this.handleStatus(auth);
     }
 
     return new Response('Not Found', { status: 404 });
@@ -1263,7 +1263,11 @@ export class RoomDO extends DurableObject<Env> {
       subscription?: PushSubscription;
     };
 
-    if (!body.subscription?.endpoint || !body.subscription?.keys?.p256dh) {
+    if (
+      !body.subscription?.endpoint ||
+      !body.subscription?.keys?.p256dh ||
+      !body.subscription?.keys?.auth
+    ) {
       return Response.json({ error: 'Invalid subscription payload' }, { status: 400 });
     }
 
@@ -1282,12 +1286,16 @@ export class RoomDO extends DurableObject<Env> {
     return Response.json({ ok: true });
   }
 
-  private async handleStatus(): Promise<Response> {
+  private async handleStatus(auth: AuthContext): Promise<Response> {
     const sockets = this.ctx.getWebSockets();
-    const subs = await this.ctx.storage.list<StoredSubscription>({ prefix: SUB_PREFIX });
+    const [subs, ownSub] = await Promise.all([
+      this.ctx.storage.list<StoredSubscription>({ prefix: SUB_PREFIX }),
+      this.ctx.storage.get<StoredSubscription>(`${SUB_PREFIX}${auth.deviceId}`),
+    ]);
     return Response.json({
       onlineSockets: sockets.length,
       pushDevices: subs.size,
+      devicePushSubscribed: Boolean(ownSub),
     });
   }
 

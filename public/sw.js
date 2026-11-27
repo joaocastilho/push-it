@@ -1330,8 +1330,10 @@ async function handlePush(event) {
     client.postMessage({ type: 'PUSH_RECEIVED', item });
   }
 
-  const hasVisibleClient = windowClients.some((c) => c.visibilityState === 'visible');
-  if (hasVisibleClient) return;
+  const hasFocusedClient = windowClients.some(
+    (c) => c.visibilityState === 'visible' && c.focused,
+  );
+  if (hasFocusedClient) return;
 
   const nextUnread = ((await kvGet('unreadCount')) || 0) + 1;
   await kvSet('unreadCount', nextUnread);
@@ -1358,6 +1360,7 @@ async function handlePush(event) {
     icon: '/icon-192.png',
     badge: '/icon-192.png',
     tag: item.id,
+    renotify: false,
     data: {
       id: item.id,
       type: isLink ? 'link' : 'text',
@@ -1365,6 +1368,47 @@ async function handlePush(event) {
     },
   });
 }
+
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil(
+    (async () => {
+      try {
+        const [keyB64, myDeviceId, deviceToken, pushOptOut] = await Promise.all([
+          kvGet('keyB64'),
+          kvGet('deviceId'),
+          kvGet('deviceToken'),
+          kvGet('pushOptOut'),
+        ]);
+        if (!keyB64 || !myDeviceId || !deviceToken || pushOptOut) return;
+
+        const rid = await deriveRoomId(keyB64);
+        const auth = makeAuthHeader(myDeviceId, deviceToken);
+        const vapidRes = await fetch(`/api/room/${encodeURIComponent(rid)}/vapid-public-key`, {
+          headers: { authorization: auth },
+        });
+        if (!vapidRes.ok) return;
+        const { publicKey } = await vapidRes.json();
+        if (!publicKey) return;
+
+        const sub = await self.registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: fromBase64Url(publicKey),
+        });
+
+        await fetch(`/api/room/${encodeURIComponent(rid)}/subscribe`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: auth,
+          },
+          body: JSON.stringify({ subscription: sub.toJSON() }),
+        });
+      } catch {
+        // ignore background resubscribe failures
+      }
+    })(),
+  );
+});
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();

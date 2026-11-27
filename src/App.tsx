@@ -2,6 +2,7 @@ import { createEffect, createMemo, createSignal, For, Show } from 'solid-js';
 import {
   ArrowDown,
   ArrowLeft,
+  Bell,
   Check,
   Copy,
   Download,
@@ -79,10 +80,13 @@ import {
   type DeviceOs,
 } from './lib/device';
 import {
-  getCurrentPushSubscription,
+  getNotificationPermission,
   isPushSupported,
   registerServiceWorker,
+  showLocalNotification,
+  showTestNotification,
   subscribePush,
+  syncPushSubscription,
   unsubscribePush,
 } from './lib/push';
 import { createLocalDemoData } from './lib/devDemo';
@@ -234,6 +238,10 @@ export default function App() {
   const [autoOpen, setAutoOpen] = createSignal<boolean>(true);
   const [pushEnabled, setPushEnabled] = createSignal<boolean>(false);
   const [pushBusy, setPushBusy] = createSignal<boolean>(false);
+  const [pushPermission, setPushPermission] = createSignal<NotificationPermission | 'unsupported'>(
+    getNotificationPermission(),
+  );
+  const [pushBannerDismissed, setPushBannerDismissed] = createSignal<boolean>(false);
   const [qrDataUrl, setQrDataUrl] = createSignal<string>('');
   const [importInput, setImportInput] = createSignal<string>('');
   const [toast, setToast] = createSignal<string>('');
@@ -1021,6 +1029,7 @@ export default function App() {
       setSetupNotice('');
       setView('chat');
       await refreshDevices(rid, freshKey, devId, data.deviceToken);
+      ensurePushSynced(rid, devId, data.deviceToken);
       notify(pin ? 'PIN-protected room created!' : 'New private room created!');
       return true;
     } catch {
@@ -1125,6 +1134,7 @@ export default function App() {
       }
 
       await syncPending(rid, targetKeyB64, devId, data.deviceToken);
+      ensurePushSynced(rid, devId, data.deviceToken);
       notify('Devices paired!');
       return true;
     } catch {
@@ -1397,6 +1407,7 @@ export default function App() {
             updateBadge(0);
             syncPending();
             refreshDevices();
+            ensurePushSynced();
             if (wsStatus() !== 'connected') {
               setReconnectNonce((n) => n + 1);
             }
@@ -1523,14 +1534,15 @@ export default function App() {
         }
 
         const existingMsgs = await listMessages();
-        const currentSub = await getCurrentPushSubscription().catch(() => null);
+        const dismissedPushBanner = Boolean(await kvGet<boolean>('pushBannerDismissed'));
 
         if (cancelled) return;
 
         setDeviceId(devId);
         setDeviceName(devName);
         setMessages(existingMsgs);
-        setPushEnabled(Boolean(currentSub));
+        setPushPermission(getNotificationPermission());
+        setPushBannerDismissed(dismissedPushBanner);
         await updateBadge(0);
 
         if (import.meta.env.DEV && new URLSearchParams(window.location.search).get('demo') === '1') {
@@ -1567,6 +1579,7 @@ export default function App() {
 
           const currentDevices = await refreshDevices(rid, storedKey, devId, storedToken);
           if (!deviceToken()) return; // revoked during refreshDevices
+          ensurePushSynced(rid, devId, storedToken);
           await hydrateExistingBlobs(existingMsgs, rid, storedKey, devId, storedToken);
           await syncPending(rid, storedKey, devId, storedToken);
 
@@ -1901,6 +1914,13 @@ export default function App() {
 
             if (document.visibilityState !== 'visible') {
               await updateBadge(unreadCount() + 1);
+            }
+            if (
+              (document.visibilityState !== 'visible' || !document.hasFocus()) &&
+              pushEnabled() &&
+              getNotificationPermission() === 'granted'
+            ) {
+              showLocalNotification(item);
             }
 
             handleIncomingAction(item);
@@ -2479,6 +2499,32 @@ export default function App() {
     await kvSet('autoOpen', next);
   }
 
+  async function ensurePushSynced(
+    rid = roomId(),
+    did = deviceId(),
+    tok = deviceToken(),
+  ): Promise<boolean> {
+    setPushPermission(getNotificationPermission());
+    if (!rid || !did || !tok) return false;
+    if (import.meta.env.DEV && localDemo()) return false;
+    if (!isPushSupported()) {
+      setPushEnabled(false);
+      return false;
+    }
+    const optedOut = Boolean(await kvGet<boolean>('pushOptOut'));
+    if (optedOut) {
+      setPushEnabled(false);
+      return false;
+    }
+    try {
+      const ok = await syncPushSubscription(rid, did, tok);
+      setPushEnabled(ok);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
   async function handleTogglePush() {
     const rid = roomId();
     const did = deviceId();
@@ -2489,17 +2535,37 @@ export default function App() {
     try {
       if (pushEnabled()) {
         await unsubscribePush(rid, did, tok);
+        await kvSet('pushOptOut', true);
         setPushEnabled(false);
         notify('Notifications turned off');
       } else {
         await subscribePush(rid, did, tok);
+        await kvDelete('pushOptOut');
         setPushEnabled(true);
+        setPushPermission(getNotificationPermission());
+        setPushBannerDismissed(true);
         notify('Notifications turned on');
       }
-    } catch {
-      notify('Notifications are not supported in this browser');
+    } catch (err) {
+      setPushPermission(getNotificationPermission());
+      const msg =
+        err instanceof Error && err.message
+          ? err.message
+          : 'Could not enable notifications in this browser';
+      notify(msg, 4000);
     } finally {
       setPushBusy(false);
+    }
+  }
+
+  async function handleTestNotification() {
+    try {
+      await showTestNotification();
+      notify('Test notification sent');
+    } catch (err) {
+      const msg =
+        err instanceof Error && err.message ? err.message : 'Could not show test notification';
+      notify(msg, 3500);
     }
   }
 
@@ -2961,6 +3027,45 @@ export default function App() {
             <LucideIcon icon={RefreshCw} size={12} />
             <span>Retry</span>
           </button>
+        </div>
+      </Show>
+
+      <Show
+        when={
+          isPaired() &&
+          view() === 'chat' &&
+          isPushSupported() &&
+          !pushEnabled() &&
+          !pushBannerDismissed() &&
+          pushPermission() !== 'denied' &&
+          !(import.meta.env.DEV && localDemo())
+        }
+      >
+        <div class="update-banner">
+          <span class="row gap">
+            <LucideIcon icon={Bell} size={14} />
+            <span>Turn on notifications to get alerts when messages arrive</span>
+          </span>
+          <div class="row gap">
+            <button
+              class="btn primary small"
+              disabled={pushBusy()}
+              onClick={handleTogglePush}
+            >
+              <span>{pushBusy() ? 'Enabling…' : 'Turn On'}</span>
+            </button>
+            <button
+              class="icon-btn"
+              title="Dismiss"
+              aria-label="Dismiss"
+              onClick={() => {
+                setPushBannerDismissed(true);
+                kvSet('pushBannerDismissed', true).catch(() => {});
+              }}
+            >
+              <LucideIcon icon={X} size={14} />
+            </button>
+          </div>
         </div>
       </Show>
 
@@ -3689,20 +3794,35 @@ export default function App() {
                     <div>
                       <strong>Notifications</strong>
                       <span class="muted">
-                        {isPushSupported()
-                          ? 'Notify me when the app is closed'
-                          : isIos && !standalone()
+                        {!isPushSupported()
+                          ? isIos && !standalone()
                             ? 'Add to Home Screen first to enable notifications'
-                            : 'Not available in this browser'}
+                            : 'Not available in this browser'
+                          : pushPermission() === 'denied'
+                            ? 'Blocked in browser settings — allow notifications for this site to turn on'
+                            : pushEnabled()
+                              ? 'Active — alerts you when new messages or links arrive'
+                              : 'Notify me when new messages or links arrive'}
                       </span>
                     </div>
-                    <button
-                      class={`btn small ${pushEnabled() ? 'success' : 'secondary'}`}
-                      disabled={!isPushSupported() || pushBusy()}
-                      onClick={handleTogglePush}
-                    >
-                      {pushBusy() ? '...' : pushEnabled() ? 'On' : 'Turn On'}
-                    </button>
+                    <div class="row gap">
+                      <Show when={pushEnabled()}>
+                        <button
+                          class="btn small secondary"
+                          disabled={pushBusy()}
+                          onClick={handleTestNotification}
+                        >
+                          Test
+                        </button>
+                      </Show>
+                      <button
+                        class={`btn small ${pushEnabled() ? 'success' : 'secondary'}`}
+                        disabled={!isPushSupported() || pushBusy()}
+                        onClick={handleTogglePush}
+                      >
+                        {pushBusy() ? '...' : pushEnabled() ? 'On' : 'Turn On'}
+                      </button>
+                    </div>
                   </div>
 
                   <div class="divider" />
