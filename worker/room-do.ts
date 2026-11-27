@@ -212,7 +212,22 @@ export class RoomDO extends DurableObject<Env> {
     } catch {
       // Column already exists
     }
+    this.ctx.storage.sql.exec(
+      'CREATE INDEX IF NOT EXISTS idx_blobs_ts ON blobs(ts)',
+    );
+    this.ctx.storage.sql.exec(
+      'CREATE INDEX IF NOT EXISTS idx_blobs_expires ON blobs(expires_at) WHERE expires_at > 0',
+    );
     this.sqlReady = true;
+  }
+
+  private async putBatch<T>(entries: Array<[string, T]>): Promise<void> {
+    if (entries.length === 0) return;
+    const CHUNK = 128;
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      const slice = entries.slice(i, i + CHUNK);
+      await this.ctx.storage.put(Object.fromEntries(slice));
+    }
   }
 
   private async touchDeviceLastSeen(deviceId: string, now = Date.now()): Promise<void> {
@@ -457,6 +472,14 @@ export class RoomDO extends DurableObject<Env> {
     const ipList = (this.pairIpFails.get(ip) || []).filter((t) => now - t < PAIR_IP_WINDOW_MS);
     ipList.push(now);
     this.pairIpFails.set(ip, ipList);
+
+    if (this.pairIpFails.size > 500) {
+      for (const [k, list] of this.pairIpFails) {
+        const fresh = list.filter((t) => now - t < PAIR_IP_WINDOW_MS);
+        if (fresh.length === 0) this.pairIpFails.delete(k);
+        else this.pairIpFails.set(k, fresh);
+      }
+    }
   }
 
   private async handleResolvePairCode(request: Request): Promise<Response> {
@@ -1229,14 +1252,14 @@ export class RoomDO extends DurableObject<Env> {
       }
       msgUpdates.push([key, { envelope: entry.envelope, remaining: next }]);
     }
-    for (const [k, v] of msgUpdates) await this.ctx.storage.put(k, v);
+    await this.putBatch(msgUpdates);
     if (deliveredIds.length > 0) {
       this.broadcastJson({ type: 'delivered', ids: deliveredIds });
     }
 
     this.ensureBlobTable();
     const blobRows = this.ctx.storage.sql
-      .exec('SELECT DISTINCT id, remaining FROM blobs')
+      .exec('SELECT id, remaining FROM blobs WHERE chunk_index = 0')
       .toArray();
     for (const row of blobRows) {
       const id = String(row.id);
@@ -1382,14 +1405,15 @@ export class RoomDO extends DurableObject<Env> {
           deliveredIds.push(body.messageId);
         }
         await this.ctx.storage.put(key, { envelope: entry.envelope, remaining: next });
+      } else if (entry.remaining.length === 0) {
+        deliveredIds.push(body.messageId);
       }
       break;
     }
 
-    if (deliveredIds.length === 0) {
-      deliveredIds.push(body.messageId);
+    if (deliveredIds.length > 0) {
+      this.broadcastJson({ type: 'delivered', ids: deliveredIds });
     }
-    this.broadcastJson({ type: 'delivered', ids: deliveredIds });
     return Response.json({ ok: true });
   }
 
@@ -1436,7 +1460,7 @@ export class RoomDO extends DurableObject<Env> {
       deletedIds.add(delKey.slice(DEL_PREFIX.length));
     }
 
-    let added = 0;
+    const toPut: Array<[string, StoredMessage]> = [];
     for (const env of envelopes) {
       if (!env || !env.id || !env.iv || !env.ciphertext || !env.senderId) continue;
       if (env.ciphertext.length > 3500) continue;
@@ -1455,15 +1479,19 @@ export class RoomDO extends DurableObject<Env> {
         expiresAt: env.expiresAt,
       };
       const paddedTs = String(ts).padStart(15, '0');
-      await this.ctx.storage.put<StoredMessage>(`${MSG_PREFIX}${paddedTs}:${env.id}`, {
-        envelope: cleanEnv,
-        remaining: [],
-      });
+      toPut.push([
+        `${MSG_PREFIX}${paddedTs}:${env.id}`,
+        {
+          envelope: cleanEnv,
+          remaining: [],
+        },
+      ]);
       existingIds.add(env.id);
-      added++;
     }
 
+    const added = toPut.length;
     if (added > 0) {
+      await this.putBatch(toPut);
       await this.pruneOldMessages(now);
       this.broadcastJson({ type: 'history_synced', added });
     }
@@ -1527,9 +1555,7 @@ export class RoomDO extends DurableObject<Env> {
     if (toDelete.length > 0 || expiredDels.length > 0) {
       await this.ctx.storage.delete([...toDelete, ...expiredDels]);
     }
-    for (const [k, v] of toUpdate) {
-      await this.ctx.storage.put(k, v);
-    }
+    await this.putBatch(toUpdate);
 
     if (fullyDeliveredIds.length > 0) {
       this.broadcastJson({ type: 'delivered', ids: fullyDeliveredIds });
@@ -1619,12 +1645,12 @@ export class RoomDO extends DurableObject<Env> {
     const paddedTs = String(envelope.ts).padStart(15, '0');
     const record: StoredMessage = { envelope, remaining };
     await this.ctx.storage.put(`${MSG_PREFIX}${paddedTs}:${envelope.id}`, record);
-    await this.pruneOldMessages(now);
 
     let pushSent = 0;
     let pushFailed = 0;
 
     const vapid = await this.resolveVapidKeys();
+    const pruneTask = this.pruneOldMessages(now);
 
     if (vapid.publicKey && vapid.privateKey) {
       const subs = await this.ctx.storage.list<StoredSubscription>({ prefix: SUB_PREFIX });
@@ -1671,7 +1697,9 @@ export class RoomDO extends DurableObject<Env> {
         );
       }
 
-      await Promise.all(pushTasks);
+      await Promise.all([pruneTask, ...pushTasks]);
+    } else {
+      await pruneTask;
     }
 
     return Response.json({
