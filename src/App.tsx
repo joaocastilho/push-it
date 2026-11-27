@@ -66,6 +66,7 @@ import {
   pruneExpiredMessages,
   saveBlob,
   saveMessage,
+  saveMessages,
   type StoredMessage,
 } from './lib/db';
 import {
@@ -262,6 +263,7 @@ export default function App() {
   );
   const [nameConflictDraft, setNameConflictDraft] = createSignal<string>('');
   const [showNameConflict, setShowNameConflict] = createSignal<boolean>(false);
+  const [focusedMessageId, setFocusedMessageId] = createSignal<string | null>(null);
   const appVersion = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0';
 
   let chatStreamEl: HTMLElement | undefined;
@@ -275,6 +277,8 @@ export default function App() {
   let dragDepth = 0;
   let undoTimer: number | undefined;
   let newlyJoinedTimer: number | undefined;
+  let focusedMsgTimer: number | undefined;
+  let lastForegroundSyncAt = 0;
   let syncChannel: BroadcastChannel | null = null;
 
   function syncComposerHeight() {
@@ -319,6 +323,26 @@ export default function App() {
     newlyJoinedTimer = window.setTimeout(() => {
       if (newlyJoinedId() === id) setNewlyJoinedId(null);
     }, 4500);
+  }
+
+  function focusMessageById(id: string) {
+    if (!id) return;
+    setView('chat');
+    if (searchQuery().trim()) {
+      setSearchQuery('');
+      setSearchOpen(false);
+    }
+    setFocusedMessageId(id);
+    if (focusedMsgTimer) window.clearTimeout(focusedMsgTimer);
+    focusedMsgTimer = window.setTimeout(() => {
+      if (focusedMessageId() === id) setFocusedMessageId(null);
+    }, 2400);
+    requestAnimationFrame(() => {
+      const el = chatStreamEl?.querySelector(`[data-msg-id="${CSS.escape(id)}"]`);
+      if (el instanceof HTMLElement) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
   }
 
   async function checkForAppUpdate(manual = false) {
@@ -838,18 +862,24 @@ export default function App() {
       if (!data.messages?.length) return;
 
       const undeliveredSet = new Set(data.undeliveredIds || []);
+      const existingIds = new Set(messages().map((m) => m.id));
       let maxTs = prevLastSeen;
+      const toPersist: StoredMessage[] = [];
+      const toHydrate: StoredMessage[] = [];
+      const toTrigger: StoredMessage[] = [];
+      const now = Date.now();
+
       for (const env of data.messages) {
         try {
           const decrypted = await decryptEnvelope(k, rid, env);
           const isSelf = env.senderId === myId;
-          let item: StoredMessage = {
+          const item: StoredMessage = {
             id: env.id,
             senderId: env.senderId,
             senderName: decrypted.senderName,
             senderOs: decrypted.senderOs,
             targetNames: decrypted.targetNames,
-            ts: env.ts || Date.now(),
+            ts: env.ts || now,
             type: decrypted.type,
             content: decrypted.content,
             title: decrypted.title,
@@ -862,20 +892,34 @@ export default function App() {
             direction: isSelf ? 'out' : 'in',
             status: isSelf ? 'delivered' : undefined,
           };
-          if (item.expiresAt && item.expiresAt <= Date.now()) continue;
+          if (item.expiresAt && item.expiresAt <= now) continue;
           if (item.ts > maxTs) maxTs = item.ts;
-          const existed = messages().some((m) => m.id === item.id);
-          await saveMessage(item);
-          addOrUpdateMessage(item);
-          item = await ensureBlobHydrated(item, rid, k, myId, tok);
+          const existed = existingIds.has(item.id);
+          toPersist.push(item);
+          if (item.blobId && item.blobIv) {
+            toHydrate.push(item);
+          }
           const shouldTriggerIncoming =
             !isSelf &&
             (undeliveredSet.has(item.id) || (!existed && prevLastSeen > 0 && item.ts > prevLastSeen));
           if (shouldTriggerIncoming) {
-            handleIncomingAction(item);
+            toTrigger.push(item);
           }
         } catch {
           // ignore
+        }
+      }
+
+      if (toPersist.length > 0) {
+        await saveMessages(toPersist);
+        for (const item of toPersist) {
+          addOrUpdateMessage(item);
+        }
+        for (const item of toHydrate) {
+          await ensureBlobHydrated(item, rid, k, myId, tok);
+        }
+        for (const item of toTrigger) {
+          handleIncomingAction(item);
         }
       }
 
@@ -1393,35 +1437,38 @@ export default function App() {
       let cancelled = false;
 
       const onSwMessage = (event: MessageEvent) => {
-        const data = event.data as { type?: string; item?: StoredMessage } | undefined;
+        const data = event.data as { type?: string; item?: StoredMessage; id?: string } | undefined;
         if (data?.type === 'PUSH_RECEIVED' && data.item) {
           addOrUpdateMessage(data.item);
           ensureBlobHydrated(data.item);
+        } else if (data?.type === 'FOCUS_MESSAGE' && data.id) {
+          focusMessageById(data.id);
+        }
+      };
+
+      const runForegroundSync = (force = false) => {
+        if (!isPaired()) return;
+        const now = Date.now();
+        if (!force && now - lastForegroundSyncAt < 1500) return;
+        lastForegroundSyncAt = now;
+        updateBadge(0);
+        syncPending();
+        refreshDevices();
+        ensurePushSynced();
+        if (wsStatus() !== 'connected') {
+          setReconnectNonce((n) => n + 1);
         }
       };
 
       const onVisibility = () => {
         if (document.visibilityState === 'visible') {
           checkForAppUpdate(false);
-          if (isPaired()) {
-            updateBadge(0);
-            syncPending();
-            refreshDevices();
-            ensurePushSynced();
-            if (wsStatus() !== 'connected') {
-              setReconnectNonce((n) => n + 1);
-            }
-          }
+          runForegroundSync();
         }
       };
 
       const onOnlineOrFocus = () => {
-        if (!isPaired()) return;
-        syncPending();
-        refreshDevices();
-        if (wsStatus() !== 'connected') {
-          setReconnectNonce((n) => n + 1);
-        }
+        runForegroundSync();
       };
 
       const onGlobalKeyDown = (e: KeyboardEvent) => {
@@ -1435,9 +1482,15 @@ export default function App() {
           }
         } else if (e.key === 'Escape') {
           if (pendingDelete()) setPendingDelete(null);
-          else if (searchOpen()) {
+          else if (confirmLeave()) setConfirmLeave(false);
+          else if (pendingShare()) {
+            setPendingShare(null);
+            setShareSelectedIds([]);
+          } else if (searchOpen()) {
             setSearchQuery('');
             setSearchOpen(false);
+          } else if (view() === 'settings' && !editingDeviceId() && !editingRoomPin()) {
+            setView('chat');
           }
         }
       };
@@ -1488,14 +1541,34 @@ export default function App() {
       window.addEventListener('appinstalled', onAppInstalled);
 
       const expiryTimer = window.setInterval(async () => {
+        const current = messages();
+        const hasExpiring = current.some((m) => Boolean(m.expiresAt));
+        if (!hasExpiring) return;
         const now = Date.now();
         setNowTick(now);
-        const expiredInMem = messages().filter((m) => m.expiresAt && m.expiresAt <= now);
+        const expiredInMem = current.filter((m) => m.expiresAt && m.expiresAt <= now);
+        if (expiredInMem.length === 0) return;
         const removed = await pruneExpiredMessages().catch(() => [] as string[]);
-        if (removed.length > 0 || expiredInMem.length > 0) {
-          const removedSet = new Set([...removed, ...expiredInMem.map((m) => m.id)]);
-          setMessages((prev) => prev.filter((m) => !removedSet.has(m.id)));
+        const removedSet = new Set([...removed, ...expiredInMem.map((m) => m.id)]);
+        const urls = blobUrls();
+        const expiredBlobs = expiredInMem
+          .map((m) => m.blobId)
+          .filter((b): b is string => Boolean(b && urls[b]));
+        if (expiredBlobs.length > 0) {
+          for (const b of expiredBlobs) {
+            try {
+              URL.revokeObjectURL(urls[b]);
+            } catch {
+              // ignore
+            }
+          }
+          setBlobUrls((prev) => {
+            const next = { ...prev };
+            for (const b of expiredBlobs) delete next[b];
+            return next;
+          });
         }
+        setMessages((prev) => prev.filter((m) => !removedSet.has(m.id)));
       }, 2000);
 
       (async () => {
@@ -1582,6 +1655,19 @@ export default function App() {
           ensurePushSynced(rid, devId, storedToken);
           await hydrateExistingBlobs(existingMsgs, rid, storedKey, devId, storedToken);
           await syncPending(rid, storedKey, devId, storedToken);
+
+          const focusMsgParam = new URLSearchParams(window.location.search).get('msg')?.trim();
+          if (focusMsgParam) {
+            const cleanUrl = new URL(window.location.href);
+            cleanUrl.searchParams.delete('msg');
+            const cleanSearch = cleanUrl.searchParams.toString();
+            window.history.replaceState(
+              null,
+              '',
+              cleanUrl.pathname + (cleanSearch ? `?${cleanSearch}` : '') + cleanUrl.hash,
+            );
+            focusMessageById(focusMsgParam);
+          }
 
           // Fallback Android Share Target handler (if SW wasn't controlling yet)
           if (
@@ -3137,7 +3223,7 @@ export default function App() {
                     : target().content.slice(0, 160)}
                 </div>
               </div>
-              <p class="muted">This removes the message from this device.</p>
+              <p class="muted">This removes the message from all devices in this room.</p>
               <div class="row gap">
                 <button class="btn danger" onClick={confirmDeleteMessage}>
                   Delete
@@ -4149,7 +4235,8 @@ export default function App() {
                           }}
                         >
                           <article
-                            class={`bubble ${msg.direction} dev-c${colorIdx()} ${!isFile ? 'tappable' : ''}`}
+                            data-msg-id={msg.id}
+                            class={`bubble ${msg.direction} dev-c${colorIdx()} ${!isFile ? 'tappable' : ''} ${focusedMessageId() === msg.id ? 'bubble-highlight' : ''}`}
                             onClick={(e) => handleBubbleClick(msg, e)}
                           >
                             <div class="bubble-head">
@@ -4211,6 +4298,8 @@ export default function App() {
                                         src={fileUrl()}
                                         alt={msg.fileName || 'Photo'}
                                         class="photo-preview"
+                                        loading="lazy"
+                                        decoding="async"
                                       />
                                     </a>
                                   </Show>
